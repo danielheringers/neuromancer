@@ -1,3 +1,18 @@
+# Repository Sync (neuromancer)
+
+- Keep `upstream` pointed to `https://github.com/openai/codex.git`.
+- Keep `origin` pointed to `https://github.com/danielheringers/neuromancer.git`.
+- Treat `main` as an upstream mirror branch (do not put project-specific work directly on `main`).
+- Do project-specific work on the `neuromancer` branch (or feature branches based on it).
+- Standard update flow:
+  1. `git fetch upstream`
+  2. `git checkout main`
+  3. `git merge --ff-only upstream/main`
+  4. `git push origin main`
+  5. `git checkout neuromancer`
+  6. `git merge main`
+  7. `git push origin neuromancer`
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
