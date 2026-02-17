@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "alicia-adapters",
+    "alicia-core",
+    "alicia-ui",
     "backend-client",
     "ansi-escape",
     "async-utils",
@@ -77,6 +80,9 @@ license = "Apache-2.0"
 # Internal
 app_test_support = { path = "app-server/tests/common" }
 codex-ansi-escape = { path = "ansi-escape" }
+codex-alicia-adapters = { path = "alicia-adapters" }
+codex-alicia-core = { path = "alicia-core" }
+codex-alicia-ui = { path = "alicia-ui" }
 codex-api = { path = "codex-api" }
 codex-app-server = { path = "app-server" }
 codex-app-server-protocol = { path = "app-server-protocol" }
@@ -166,6 +172,7 @@ diffy = "0.4.2"
 dirs = "6"
 dotenvy = "0.15.7"
 dunce = "1.0.4"
+egui = "0.31.1"
 encoding_rs = "0.8.35"
 env-flags = "0.1.1"
 env_logger = "0.11.5"

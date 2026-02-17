@@ -1,0 +1,135 @@
+name: alicia-ci
+
+on:
+  pull_request:
+    paths:
+      - "codex-rs/alicia-core/**"
+      - "codex-rs/alicia-adapters/**"
+      - "codex-rs/alicia-ui/**"
+      - "codex-rs/Cargo.toml"
+      - "codex-rs/Cargo.lock"
+      - ".github/workflows/alicia-ci.yml"
+  push:
+    branches:
+      - main
+      - neuromancer
+    paths:
+      - "codex-rs/alicia-core/**"
+      - "codex-rs/alicia-adapters/**"
+      - "codex-rs/alicia-ui/**"
+      - "codex-rs/Cargo.toml"
+      - "codex-rs/Cargo.lock"
+      - ".github/workflows/alicia-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  suite_minima:
+    name: Alicia Suite Minima - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.93.0
+
+      - name: Test alicia-core
+        run: cargo test -p codex-alicia-core
+
+      - name: Test alicia-adapters
+        run: cargo test -p codex-alicia-adapters
+
+      - name: Test alicia-ui
+        run: cargo test -p codex-alicia-ui
+
+      - name: Suite summary
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Alicia Suite Minima - ${{ matrix.os }}"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Crates: codex-alicia-core, codex-alicia-adapters, codex-alicia-ui"
+
+  policy_approval_scenarios:
+    name: Alicia Policy and Approval Scenarios - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.93.0
+
+      - name: Scenario policy read_write_with_approval
+        run: cargo test -p codex-alicia-core read_write_with_approval_profile_matches_contract -- --exact
+
+      - name: Scenario approval resolved
+        run: cargo test -p codex-alicia-ui approval_prompt_contains_context_and_decision_updates_state -- --exact
+
+      - name: Scenario approval expired
+        run: cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --exact
+
+      - name: Scenario summary
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Alicia Policy and Approval Scenarios - ${{ matrix.os }}"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Policy: read_write_with_approval_profile_matches_contract"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Approval: approval_prompt_contains_context_and_decision_updates_state"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Approval: expire_pending_approvals_marks_final_state"
+
+  e2e_flow:
+    name: Alicia E2E Flow - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.93.0
+
+      - name: E2E happy path
+        run: cargo test -p codex-alicia-ui e2e_happy_path_approval_execution_and_audit -- --exact
+
+      - name: E2E denied and expired
+        run: cargo test -p codex-alicia-ui e2e_denied_and_expired_blocked_audit -- --exact
+
+      - name: E2E summary
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Alicia E2E Flow - ${{ matrix.os }}"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- e2e_happy_path_approval_execution_and_audit"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- e2e_denied_and_expired_blocked_audit"
