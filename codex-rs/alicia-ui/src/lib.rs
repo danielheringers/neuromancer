@@ -210,6 +210,41 @@ pub enum UiEventStoreError {
     },
 }
 
+impl UiEventStoreError {
+    pub fn beginner_message(&self) -> String {
+        match self {
+            Self::SessionNotFound(_) => beginner_error_message(
+                "Nao encontrei a sessao selecionada.",
+                "Escolha outra sessao ativa ou inicie uma nova sessao.",
+            ),
+            Self::SessionInputNotBound(_) => beginner_error_message(
+                "A sessao ainda nao esta pronta para receber texto.",
+                "Aguarde a sessao iniciar e tente novamente.",
+            ),
+            Self::SessionInputSendFailed { .. } => beginner_error_message(
+                "Nao consegui enviar seu texto para o terminal.",
+                "Confira se a sessao ainda esta ativa e tente de novo.",
+            ),
+            Self::ApprovalNotPending(_) => beginner_error_message(
+                "Essa aprovacao ja foi resolvida.",
+                "Atualize a tela e siga para a proxima aprovacao pendente.",
+            ),
+            Self::PatchPreviewNotFound(_) => beginner_error_message(
+                "Nao encontrei a previa dessa mudanca.",
+                "Gere a previa novamente antes de aprovar ou rejeitar.",
+            ),
+            Self::PatchFileNotFound { .. } => beginner_error_message(
+                "Nao encontrei o arquivo da mudanca selecionada.",
+                "Atualize a previa e tente abrir o arquivo novamente.",
+            ),
+            Self::PatchHunkNotFound { .. } => beginner_error_message(
+                "Nao encontrei o bloco da mudanca selecionada.",
+                "Atualize a previa do diff e escolha o bloco novamente.",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AliciaUiRuntimeError {
     #[error("{0}")]
@@ -222,6 +257,43 @@ pub enum AliciaUiRuntimeError {
         #[source]
         source: std::io::Error,
     },
+}
+
+impl AliciaUiRuntimeError {
+    pub fn beginner_message(&self) -> String {
+        match self {
+            Self::SessionManager(error) => match error {
+                SessionManagerError::SessionAlreadyExists(_) => beginner_error_message(
+                    "Ja existe uma sessao com esse identificador.",
+                    "Use outro identificador de sessao e tente iniciar novamente.",
+                ),
+                SessionManagerError::SessionNotFound(_) => beginner_error_message(
+                    "Nao encontrei a sessao que voce tentou usar.",
+                    "Confirme o identificador da sessao ou inicie uma nova sessao.",
+                ),
+                SessionManagerError::PtyUnavailable => beginner_error_message(
+                    "Este ambiente nao suporta terminal PTY.",
+                    "Inicie a sessao no modo pipe.",
+                ),
+                SessionManagerError::SpawnFailed { .. } => beginner_error_message(
+                    "Nao consegui iniciar a sessao.",
+                    "Confirme o comando e o diretorio de trabalho antes de tentar de novo.",
+                ),
+            },
+            Self::SessionStopTimeout { .. } => beginner_error_message(
+                "A sessao demorou demais para encerrar.",
+                "Tente cancelar novamente ou finalize o processo manualmente no sistema.",
+            ),
+            Self::AuditWriteFailed { .. } => beginner_error_message(
+                "A tarefa foi encerrada, mas nao consegui salvar o log de auditoria.",
+                "Verifique permissoes de escrita do arquivo de auditoria e tente novamente.",
+            ),
+        }
+    }
+}
+
+fn beginner_error_message(problem: &str, next_step: &str) -> String {
+    format!("{problem} Proximo passo: {next_step}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1322,7 +1394,7 @@ impl AliciaEguiView {
                 if previous_active.as_deref() != Some(selected_session.as_str())
                     && let Err(error) = store.set_active_session(&selected_session)
                 {
-                    self.status_message = Some(error.to_string());
+                    self.status_message = Some(error.beginner_message());
                 }
 
                 let mut terminal_text = store.active_terminal_text().unwrap_or_default();
@@ -1353,7 +1425,7 @@ impl AliciaEguiView {
                                     Some(String::from("Input enviado para a sessão."));
                             }
                             Err(error) => {
-                                self.status_message = Some(error.to_string());
+                                self.status_message = Some(error.beginner_message());
                             }
                         }
                     }
@@ -1372,7 +1444,7 @@ impl AliciaEguiView {
                     ));
                 }
                 Err(error) => {
-                    self.status_message = Some(error.to_string());
+                    self.status_message = Some(error.beginner_message());
                 }
             }
         }
@@ -1388,7 +1460,7 @@ impl AliciaEguiView {
                     ));
                 }
                 Err(error) => {
-                    self.status_message = Some(error.to_string());
+                    self.status_message = Some(error.beginner_message());
                 }
             }
         }
@@ -1558,6 +1630,7 @@ mod tests {
     use codex_alicia_core::IpcEvent;
     use codex_alicia_core::IpcMessage;
     use codex_alicia_core::SessionManager;
+    use codex_alicia_core::SessionManagerError;
     use codex_alicia_core::SessionMode;
     use codex_alicia_core::SessionStartRequest;
     use codex_alicia_core::ipc::ActionProposed;
@@ -1570,11 +1643,13 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::AliciaUiRuntime;
+    use super::AliciaUiRuntimeError;
     use super::ApprovalPrompt;
     use super::ApprovalStatus;
     use super::CommandLifecycle;
     use super::PatchHunkDecision;
     use super::UiEventStore;
+    use super::UiEventStoreError;
 
     fn start_event(session_id: &str) -> IpcMessage {
         IpcMessage::new(IpcEvent::CommandStarted(CommandStarted {
@@ -1895,6 +1970,59 @@ mod tests {
                 duration_ms: 42
             }
         );
+    }
+
+    #[test]
+    fn store_errors_include_clear_next_step_message() {
+        let errors = vec![
+            UiEventStoreError::SessionNotFound("sess-missing".to_string()),
+            UiEventStoreError::SessionInputNotBound("sess-not-bound".to_string()),
+            UiEventStoreError::SessionInputSendFailed {
+                session_id: "sess-send".to_string(),
+                reason: "channel closed".to_string(),
+            },
+            UiEventStoreError::ApprovalNotPending("act-ready".to_string()),
+        ];
+
+        for error in errors {
+            let message = error.beginner_message();
+            assert!(
+                message.contains("Proximo passo:"),
+                "expected beginner guidance in message: {message}"
+            );
+            assert!(
+                !message.contains('`'),
+                "message should avoid technical formatting: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_errors_include_clear_next_step_message() {
+        let errors = vec![
+            AliciaUiRuntimeError::SessionManager(SessionManagerError::SessionNotFound(
+                "sess-runtime".to_string(),
+            )),
+            AliciaUiRuntimeError::SessionStopTimeout {
+                session_id: "sess-timeout".to_string(),
+            },
+            AliciaUiRuntimeError::AuditWriteFailed {
+                session_id: "sess-audit".to_string(),
+                source: std::io::Error::other("disk full"),
+            },
+        ];
+
+        for error in errors {
+            let message = error.beginner_message();
+            assert!(
+                message.contains("Proximo passo:"),
+                "expected beginner guidance in message: {message}"
+            );
+            assert!(
+                !message.contains('`'),
+                "message should avoid technical formatting: {message}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
