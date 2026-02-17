@@ -39,6 +39,19 @@ fn shell_echo_command(marker: &str) -> (String, Vec<String>) {
     }
 }
 
+fn shell_long_running_command_with_start_marker(marker: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| String::from("cmd.exe"));
+        let script = format!("echo {marker} & ping -n 20 127.0.0.1 > NUL");
+        (cmd, vec![String::from("/C"), script])
+    } else {
+        (
+            String::from("/bin/sh"),
+            vec![String::from("-c"), format!("echo {marker}; sleep 20")],
+        )
+    }
+}
+
 fn parse_jsonl_lines(text: &str) -> Vec<Value> {
     text.lines()
         .map(serde_json::from_str::<Value>)
@@ -334,6 +347,72 @@ async fn e2e_denied_and_expired_blocked_audit() -> Result<(), Box<dyn std::error
     assert_eq!(
         expired_entry.get("result_status").and_then(Value::as_str),
         Some("blocked")
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_safe_cancel_persists_final_audit_state() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let path = temp.path().join("audit.jsonl");
+    let audit_logger = AuditLogger::open(&path).await?;
+
+    let session_manager = SessionManager::new();
+    let mut runtime = AliciaUiRuntime::new(session_manager, 256).with_audit_logger(audit_logger);
+    runtime
+        .store_mut()
+        .set_permission_profile(PermissionProfile::ReadWriteWithApproval);
+
+    let marker = "alicia_cancel_start";
+    let (program, args) = shell_long_running_command_with_start_marker(marker);
+    runtime
+        .start_session(
+            SessionStartRequest::new(
+                "sess-e2e-cancel",
+                program,
+                args,
+                PathBuf::from("."),
+                inherited_env(),
+            )
+            .with_mode(SessionMode::Pipe),
+        )
+        .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut started = false;
+    while tokio::time::Instant::now() < deadline {
+        runtime.pump_events();
+        if let Some(text) = runtime.store().active_terminal_text()
+            && text.contains(marker)
+        {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(started, "expected command to start before cancellation");
+
+    runtime.stop_session("sess-e2e-cancel").await?;
+    assert!(!runtime.session_manager().is_active("sess-e2e-cancel").await);
+
+    let record = runtime
+        .store()
+        .audit_records()
+        .iter()
+        .find(|record| record.session_id == "sess-e2e-cancel")
+        .ok_or_else(|| std::io::Error::other("expected in-memory audit record"))?;
+    assert_eq!(record.result_status, ResultStatus::Failed);
+
+    let text = tokio::fs::read_to_string(&path).await?;
+    let entries = parse_jsonl_lines(&text);
+    let persisted = entries
+        .iter()
+        .find(|entry| entry.get("session_id").and_then(Value::as_str) == Some("sess-e2e-cancel"))
+        .ok_or_else(|| std::io::Error::other("expected persisted cancel audit entry"))?;
+    assert_eq!(
+        persisted.get("result_status").and_then(Value::as_str),
+        Some("failed")
     );
 
     Ok(())

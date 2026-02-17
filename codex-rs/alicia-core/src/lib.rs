@@ -34,6 +34,7 @@ pub use project_policy::resolve_effective_network_decision;
 pub use project_policy::resolve_effective_profile;
 pub use project_policy::resolve_effective_runtime_policy;
 pub use session::ReattachedSession;
+pub use session::SessionAuditContext;
 pub use session::SessionManager;
 pub use session::SessionManagerError;
 pub use session::SessionMode;

@@ -5,6 +5,7 @@ use std::time::Duration;
 use codex_alicia_core::ActionKind;
 use codex_alicia_core::ApprovalDecision;
 use codex_alicia_core::ApprovalResolution;
+use codex_alicia_core::AuditLogger;
 use codex_alicia_core::AuditRecord;
 use codex_alicia_core::CommandOutputStream;
 use codex_alicia_core::IpcEvent;
@@ -148,7 +149,34 @@ pub struct ApprovalPrompt {
 pub struct PatchPreviewState {
     pub action_id: String,
     pub files: Vec<String>,
+    pub file_previews: Vec<PatchFilePreview>,
     pub applied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchFilePreview {
+    pub file_path: String,
+    pub hunks: Vec<PatchHunkPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchHunkPreview {
+    pub hunk_id: String,
+    pub header: String,
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub decision: PatchHunkDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchHunkDecision {
+    Pending,
+    Approved,
+    Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,12 +195,33 @@ pub enum UiEventStoreError {
     SessionInputSendFailed { session_id: String, reason: String },
     #[error("approval `{0}` is not pending")]
     ApprovalNotPending(String),
+    #[error("patch preview not found for action `{0}`")]
+    PatchPreviewNotFound(String),
+    #[error("patch file `{file_path}` not found for action `{action_id}`")]
+    PatchFileNotFound {
+        action_id: String,
+        file_path: String,
+    },
+    #[error("patch hunk `{hunk_id}` not found for action `{action_id}` file `{file_path}`")]
+    PatchHunkNotFound {
+        action_id: String,
+        file_path: String,
+        hunk_id: String,
+    },
 }
 
 #[derive(Debug, Error)]
 pub enum AliciaUiRuntimeError {
     #[error("{0}")]
     SessionManager(#[from] SessionManagerError),
+    #[error("timed out waiting for session `{session_id}` to finish after cancellation")]
+    SessionStopTimeout { session_id: String },
+    #[error("failed to persist audit record for session `{session_id}`: {source}")]
+    AuditWriteFailed {
+        session_id: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +496,14 @@ impl UiEventStore {
             PatchPreviewState {
                 action_id: event.action_id.clone(),
                 files: event.files.clone(),
+                file_previews: event
+                    .files
+                    .iter()
+                    .map(|file_path| PatchFilePreview {
+                        file_path: file_path.clone(),
+                        hunks: Vec::new(),
+                    })
+                    .collect(),
                 applied: false,
             },
         );
@@ -468,6 +525,14 @@ impl UiEventStore {
                 PatchPreviewState {
                     action_id: event.action_id.clone(),
                     files: event.files.clone(),
+                    file_previews: event
+                        .files
+                        .iter()
+                        .map(|file_path| PatchFilePreview {
+                            file_path: file_path.clone(),
+                            hunks: Vec::new(),
+                        })
+                        .collect(),
                     applied: true,
                 },
             );
@@ -726,6 +791,133 @@ impl UiEventStore {
             .filter(|preview| !preview.applied)
             .collect()
     }
+
+    pub fn attach_patch_file_diff(
+        &mut self,
+        action_id: &str,
+        file_path: impl Into<String>,
+        unified_diff: &str,
+    ) -> Result<usize, UiEventStoreError> {
+        let file_path = file_path.into();
+        let hunks = parse_unified_diff_hunks(unified_diff);
+        let preview = self
+            .patch_previews
+            .get_mut(action_id)
+            .ok_or_else(|| UiEventStoreError::PatchPreviewNotFound(action_id.to_string()))?;
+
+        if !preview.files.iter().any(|file| file == &file_path) {
+            preview.files.push(file_path.clone());
+        }
+
+        if let Some(file_preview) = preview
+            .file_previews
+            .iter_mut()
+            .find(|file| file.file_path == file_path)
+        {
+            file_preview.hunks = hunks.clone();
+        } else {
+            preview.file_previews.push(PatchFilePreview {
+                file_path: file_path.clone(),
+                hunks: hunks.clone(),
+            });
+        }
+
+        if let Some(approval) = self.approvals.get_mut(action_id)
+            && !approval.impact_files.iter().any(|file| file == &file_path)
+        {
+            approval.impact_files.push(file_path.clone());
+        }
+
+        self.timeline.push(TimelineEntry {
+            sequence: self.next_sequence,
+            summary: format!(
+                "patch_hunks_loaded {} file={} hunks={}",
+                action_id,
+                file_path,
+                hunks.len()
+            ),
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+
+        Ok(hunks.len())
+    }
+
+    pub fn set_patch_hunk_decision(
+        &mut self,
+        action_id: &str,
+        file_path: &str,
+        hunk_id: &str,
+        decision: PatchHunkDecision,
+    ) -> Result<(), UiEventStoreError> {
+        let preview = self
+            .patch_previews
+            .get_mut(action_id)
+            .ok_or_else(|| UiEventStoreError::PatchPreviewNotFound(action_id.to_string()))?;
+
+        let file_preview = preview
+            .file_previews
+            .iter_mut()
+            .find(|file| file.file_path == file_path)
+            .ok_or_else(|| UiEventStoreError::PatchFileNotFound {
+                action_id: action_id.to_string(),
+                file_path: file_path.to_string(),
+            })?;
+
+        let hunk = file_preview
+            .hunks
+            .iter_mut()
+            .find(|hunk| hunk.hunk_id == hunk_id)
+            .ok_or_else(|| UiEventStoreError::PatchHunkNotFound {
+                action_id: action_id.to_string(),
+                file_path: file_path.to_string(),
+                hunk_id: hunk_id.to_string(),
+            })?;
+
+        hunk.decision = decision;
+        self.timeline.push(TimelineEntry {
+            sequence: self.next_sequence,
+            summary: format!(
+                "patch_hunk_decision {} file={} hunk={} decision={}",
+                action_id,
+                file_path,
+                hunk_id,
+                patch_hunk_decision_name(decision)
+            ),
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+
+        Ok(())
+    }
+
+    pub fn approve_patch_hunk(
+        &mut self,
+        action_id: &str,
+        file_path: &str,
+        hunk_id: &str,
+    ) -> Result<(), UiEventStoreError> {
+        self.set_patch_hunk_decision(action_id, file_path, hunk_id, PatchHunkDecision::Approved)
+    }
+
+    pub fn reject_patch_hunk(
+        &mut self,
+        action_id: &str,
+        file_path: &str,
+        hunk_id: &str,
+    ) -> Result<(), UiEventStoreError> {
+        self.set_patch_hunk_decision(action_id, file_path, hunk_id, PatchHunkDecision::Rejected)
+    }
+
+    pub fn unresolved_patch_hunk_count(&self, action_id: &str) -> Option<usize> {
+        let preview = self.patch_previews.get(action_id)?;
+        Some(
+            preview
+                .file_previews
+                .iter()
+                .flat_map(|file| file.hunks.iter())
+                .filter(|hunk| hunk.decision == PatchHunkDecision::Pending)
+                .count(),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -733,6 +925,7 @@ pub struct AliciaUiRuntime {
     session_manager: SessionManager,
     events_rx: tokio::sync::broadcast::Receiver<IpcMessage>,
     store: UiEventStore,
+    audit_logger: Option<AuditLogger>,
 }
 
 impl AliciaUiRuntime {
@@ -742,7 +935,13 @@ impl AliciaUiRuntime {
             session_manager,
             events_rx,
             store: UiEventStore::new(max_scrollback_lines),
+            audit_logger: None,
         }
+    }
+
+    pub fn with_audit_logger(mut self, audit_logger: AuditLogger) -> Self {
+        self.audit_logger = Some(audit_logger);
+        self
     }
 
     pub fn store(&self) -> &UiEventStore {
@@ -769,8 +968,16 @@ impl AliciaUiRuntime {
     }
 
     pub async fn stop_session(&mut self, session_id: &str) -> Result<(), AliciaUiRuntimeError> {
-        self.session_manager.stop(session_id).await?;
+        self.session_manager.cancel(session_id).await?;
         self.store.unbind_session_input(session_id);
+        let finished_event = self
+            .wait_for_session_finished_event(session_id, Duration::from_secs(10))
+            .await
+            .ok_or_else(|| AliciaUiRuntimeError::SessionStopTimeout {
+                session_id: session_id.to_string(),
+            })?;
+        self.record_cancellation_audit(session_id, &finished_event)
+            .await?;
         self.pump_events();
         Ok(())
     }
@@ -815,6 +1022,91 @@ impl AliciaUiRuntime {
 
         processed
     }
+
+    async fn wait_for_session_finished_event(
+        &mut self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Option<CommandFinished> {
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, self.events_rx.recv()).await {
+                Ok(Ok(message)) => {
+                    let mut finished = None;
+                    if let IpcEvent::CommandFinished(event) = &message.event
+                        && event.command_id == session_id
+                    {
+                        finished = Some(event.clone());
+                    }
+                    self.store.push(message);
+                    if finished.is_some() {
+                        return finished;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    async fn record_cancellation_audit(
+        &mut self,
+        session_id: &str,
+        finished_event: &CommandFinished,
+    ) -> Result<(), AliciaUiRuntimeError> {
+        let Some(audit_logger) = self.audit_logger.clone() else {
+            return Ok(());
+        };
+
+        let target = self
+            .store
+            .terminal_session(session_id)
+            .and_then(|session| {
+                if session.command.is_empty() {
+                    None
+                } else {
+                    Some(session.command.join(" "))
+                }
+            })
+            .unwrap_or_else(|| session_id.to_string());
+        let profile = self.store.permission_profile();
+        let policy_decision = profile.decision_for(ActionKind::ExecuteCommand);
+        let approval_decision = match policy_decision {
+            PolicyDecision::RequireApproval => ApprovalDecision::Approved,
+            PolicyDecision::Allow | PolicyDecision::Deny => ApprovalDecision::NotRequired,
+        };
+        let result_status = if finished_event.exit_code == 0 {
+            ResultStatus::Succeeded
+        } else {
+            ResultStatus::Failed
+        };
+        let record = AuditRecord::new(
+            session_id,
+            ActionKind::ExecuteCommand,
+            target,
+            profile,
+            policy_decision,
+            approval_decision,
+            result_status,
+            finished_event.duration_ms,
+        );
+        audit_logger.append(&record).await.map_err(|source| {
+            AliciaUiRuntimeError::AuditWriteFailed {
+                session_id: session_id.to_string(),
+                source,
+            }
+        })?;
+        self.store.add_audit_record(record);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -835,6 +1127,8 @@ impl AliciaEguiView {
         let timeline: Vec<TimelineEntry> = store.timeline().to_vec();
         let session_ids = store.terminal_session_ids().to_vec();
         let mut requested_resolutions: Vec<(String, ApprovalResolution)> = Vec::new();
+        let mut requested_hunk_decisions: Vec<(String, String, String, PatchHunkDecision)> =
+            Vec::new();
         let mut emitted_messages = Vec::new();
 
         egui::TopBottomPanel::top("alicia_status_bar").show(ctx, |ui| {
@@ -930,8 +1224,56 @@ impl AliciaEguiView {
                             ui.group(|ui| {
                                 ui.label(format!("Ação: {}", preview.action_id));
                                 ui.label(format!("Arquivos: {}", preview.files.len()));
-                                for file in &preview.files {
-                                    ui.label(format!("- {file}"));
+                                if preview.file_previews.is_empty() {
+                                    for file in &preview.files {
+                                        ui.label(format!("- {file}"));
+                                    }
+                                } else {
+                                    for file_preview in &preview.file_previews {
+                                        ui.separator();
+                                        ui.label(format!("Arquivo: {}", file_preview.file_path));
+
+                                        if file_preview.hunks.is_empty() {
+                                            ui.label(
+                                                "Sem blocos (hunks) detalhados para este arquivo.",
+                                            );
+                                            continue;
+                                        }
+
+                                        for hunk in &file_preview.hunks {
+                                            ui.group(|ui| {
+                                                ui.label(format!("Bloco: {}", hunk.hunk_id));
+                                                ui.label(hunk.header.as_str());
+                                                ui.label(format!(
+                                                    "Impacto: +{} / -{}",
+                                                    hunk.added_lines, hunk.removed_lines
+                                                ));
+                                                ui.label(format!(
+                                                    "Decisão: {}",
+                                                    patch_hunk_decision_name(hunk.decision)
+                                                ));
+
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Aprovar bloco").clicked() {
+                                                        requested_hunk_decisions.push((
+                                                            preview.action_id.clone(),
+                                                            file_preview.file_path.clone(),
+                                                            hunk.hunk_id.clone(),
+                                                            PatchHunkDecision::Approved,
+                                                        ));
+                                                    }
+                                                    if ui.button("Rejeitar bloco").clicked() {
+                                                        requested_hunk_decisions.push((
+                                                            preview.action_id.clone(),
+                                                            file_preview.file_path.clone(),
+                                                            hunk.hunk_id.clone(),
+                                                            PatchHunkDecision::Rejected,
+                                                        ));
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    }
                                 }
                             });
                             ui.separator();
@@ -1035,6 +1377,22 @@ impl AliciaEguiView {
             }
         }
 
+        for (action_id, file_path, hunk_id, decision) in requested_hunk_decisions {
+            match store.set_patch_hunk_decision(&action_id, &file_path, &hunk_id, decision) {
+                Ok(()) => {
+                    self.status_message = Some(format!(
+                        "Bloco {} ({}) atualizado para {}.",
+                        hunk_id,
+                        file_path,
+                        patch_hunk_decision_name(decision)
+                    ));
+                }
+                Err(error) => {
+                    self.status_message = Some(error.to_string());
+                }
+            }
+        }
+
         if store.has_running_sessions() {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
@@ -1110,6 +1468,87 @@ fn result_status_name(result_status: ResultStatus) -> &'static str {
     }
 }
 
+fn patch_hunk_decision_name(decision: PatchHunkDecision) -> &'static str {
+    match decision {
+        PatchHunkDecision::Pending => "pending",
+        PatchHunkDecision::Approved => "approved",
+        PatchHunkDecision::Rejected => "rejected",
+    }
+}
+
+fn parse_hunk_range(raw: &str, prefix: char) -> Option<(usize, usize)> {
+    let raw = raw.strip_prefix(prefix)?;
+    let mut parts = raw.split(',');
+    let start = parts.next()?.parse::<usize>().ok()?;
+    let count = parts
+        .next()
+        .map_or(Some(1_usize), |value| value.parse::<usize>().ok())?;
+    Some((start, count))
+}
+
+fn parse_unified_diff_hunks(unified_diff: &str) -> Vec<PatchHunkPreview> {
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<PatchHunkPreview> = None;
+    let mut hunk_index = 0_usize;
+
+    for line in unified_diff.lines() {
+        if line.starts_with("@@") {
+            if let Some(previous) = current_hunk.take() {
+                hunks.push(previous);
+            }
+
+            let mut parts = line.split_whitespace();
+            if parts.next() != Some("@@") {
+                continue;
+            }
+
+            let Some(old_range) = parts.next() else {
+                continue;
+            };
+            let Some(new_range) = parts.next() else {
+                continue;
+            };
+
+            let Some((old_start, old_count)) = parse_hunk_range(old_range, '-') else {
+                continue;
+            };
+            let Some((new_start, new_count)) = parse_hunk_range(new_range, '+') else {
+                continue;
+            };
+
+            hunk_index = hunk_index.saturating_add(1);
+            current_hunk = Some(PatchHunkPreview {
+                hunk_id: format!("hunk-{hunk_index}"),
+                header: line.to_string(),
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                added_lines: 0,
+                removed_lines: 0,
+                decision: PatchHunkDecision::Pending,
+            });
+            continue;
+        }
+
+        if let Some(current_hunk) = current_hunk.as_mut() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                current_hunk.added_lines = current_hunk.added_lines.saturating_add(1);
+                continue;
+            }
+            if line.starts_with('-') && !line.starts_with("---") {
+                current_hunk.removed_lines = current_hunk.removed_lines.saturating_add(1);
+            }
+        }
+    }
+
+    if let Some(previous) = current_hunk.take() {
+        hunks.push(previous);
+    }
+
+    hunks
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1134,6 +1573,7 @@ mod tests {
     use super::ApprovalPrompt;
     use super::ApprovalStatus;
     use super::CommandLifecycle;
+    use super::PatchHunkDecision;
     use super::UiEventStore;
 
     fn start_event(session_id: &str) -> IpcMessage {
@@ -1162,6 +1602,10 @@ mod tests {
 
     fn inherited_env() -> HashMap<String, String> {
         std::env::vars().collect()
+    }
+
+    fn sample_unified_diff() -> &'static str {
+        "@@ -1,2 +1,3 @@\n-line_1\n+line_1_new\n line_2\n+line_3\n@@ -10,1 +11,2 @@\n-old_tail\n+new_tail_a\n+new_tail_b\n"
     }
 
     #[test]
@@ -1317,6 +1761,87 @@ mod tests {
         assert_eq!(timeline[1].sequence, 1);
         assert!(timeline[0].summary.contains("patch_preview_ready"));
         assert!(timeline[1].summary.contains("patch_applied"));
+    }
+
+    #[test]
+    fn loads_patch_hunks_and_tracks_impact_per_hunk() {
+        let mut store = UiEventStore::default();
+        store.push(IpcMessage::new(IpcEvent::PatchPreviewReady(
+            PatchPreviewReady {
+                action_id: "act-hunks".to_string(),
+                files: vec!["src/main.rs".to_string()],
+            },
+        )));
+
+        let load_result =
+            store.attach_patch_file_diff("act-hunks", "src/main.rs", sample_unified_diff());
+        assert_eq!(load_result, Ok(2));
+
+        let unresolved_count = store.unresolved_patch_hunk_count("act-hunks");
+        assert_eq!(unresolved_count, Some(2));
+
+        let preview = store.diff_preview("act-hunks");
+        let Some(preview) = preview else {
+            panic!("expected patch preview");
+        };
+        assert_eq!(preview.file_previews.len(), 1);
+        let file_preview = &preview.file_previews[0];
+        assert_eq!(file_preview.file_path, "src/main.rs");
+        assert_eq!(file_preview.hunks.len(), 2);
+        assert_eq!(file_preview.hunks[0].added_lines, 2);
+        assert_eq!(file_preview.hunks[0].removed_lines, 1);
+        assert_eq!(file_preview.hunks[1].added_lines, 2);
+        assert_eq!(file_preview.hunks[1].removed_lines, 1);
+
+        assert!(
+            store
+                .timeline()
+                .iter()
+                .any(|entry| entry.summary.contains("patch_hunks_loaded act-hunks")),
+            "expected timeline to register loaded hunks"
+        );
+    }
+
+    #[test]
+    fn allows_approving_and_rejecting_hunks_individually() {
+        let mut store = UiEventStore::default();
+        store.push(IpcMessage::new(IpcEvent::PatchPreviewReady(
+            PatchPreviewReady {
+                action_id: "act-granular".to_string(),
+                files: vec!["src/main.rs".to_string()],
+            },
+        )));
+        let load_result =
+            store.attach_patch_file_diff("act-granular", "src/main.rs", sample_unified_diff());
+        assert_eq!(load_result, Ok(2));
+
+        let approve_result = store.approve_patch_hunk("act-granular", "src/main.rs", "hunk-1");
+        assert_eq!(approve_result, Ok(()));
+        let reject_result = store.reject_patch_hunk("act-granular", "src/main.rs", "hunk-2");
+        assert_eq!(reject_result, Ok(()));
+
+        assert_eq!(store.unresolved_patch_hunk_count("act-granular"), Some(0));
+
+        let preview = store.diff_preview("act-granular");
+        let Some(preview) = preview else {
+            panic!("expected patch preview");
+        };
+        let file_preview = &preview.file_previews[0];
+        assert_eq!(file_preview.hunks[0].decision, PatchHunkDecision::Approved);
+        assert_eq!(file_preview.hunks[1].decision, PatchHunkDecision::Rejected);
+
+        assert!(
+            store.timeline().iter().any(|entry| entry.summary.contains(
+                "patch_hunk_decision act-granular file=src/main.rs hunk=hunk-1 decision=approved"
+            )),
+            "expected approved hunk decision in timeline"
+        );
+        assert!(
+            store.timeline().iter().any(|entry| entry.summary.contains(
+                "patch_hunk_decision act-granular file=src/main.rs hunk=hunk-2 decision=rejected"
+            )),
+            "expected rejected hunk decision in timeline"
+        );
     }
 
     #[test]
