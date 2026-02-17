@@ -1,0 +1,24 @@
+[package]
+name = "codex-alicia-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AlicIA UI state and event bridge."
+
+[lib]
+name = "codex_alicia_ui"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-alicia-core = { workspace = true }
+egui = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

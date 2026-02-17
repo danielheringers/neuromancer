@@ -1,0 +1,27 @@
+[package]
+name = "codex-alicia-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AlicIA core contracts for policy and IPC events."
+
+[lib]
+name = "codex_alicia_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+codex-protocol = { workspace = true }
+codex-utils-pty = { workspace = true }
+codex-utils-sanitizer = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "codex-alicia-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AlicIA provider adapter contracts."
+
+[lib]
+name = "codex_alicia_adapters"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-alicia-core = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }

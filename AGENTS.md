@@ -1,3 +1,18 @@
+# Repository Sync (neuromancer)
+
+- Keep `upstream` pointed to `https://github.com/openai/codex.git`.
+- Keep `origin` pointed to `https://github.com/danielheringers/neuromancer.git`.
+- Treat `main` as an upstream mirror branch (do not put project-specific work directly on `main`).
+- Do project-specific work on the `neuromancer` branch (or feature branches based on it).
+- Standard update flow:
+  1. `git fetch upstream`
+  2. `git checkout main`
+  3. `git merge --ff-only upstream/main`
+  4. `git push origin main`
+  5. `git checkout neuromancer`
+  6. `git merge main`
+  7. `git push origin neuromancer`
+
 # Rust/codex-rs
 
 In the codex-rs folder where the rust code lives:
@@ -167,3 +182,49 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Validate with `cargo test -p codex-app-server-protocol`.
 - Avoid boilerplate tests that only assert experimental field markers for individual
   request fields in `common.rs`; rely on schema generation/tests and behavioral coverage instead.
+
+## AlicIA Active Scope (Current Project Focus)
+
+This repository now has an active initiative in `Alicia/` for building a Rust-based agent terminal
+using this codebase as the reference foundation.
+
+### Source of truth
+
+- Canonical product/architecture scope (prevails on conflict):
+  - `Alicia/00-plano-mestre.md`
+  - `Alicia/01-arquitetura-tecnica.md`
+  - `Alicia/02-seguranca-e-permissoes.md`
+  - `Alicia/03-ux-produto.md`
+  - `Alicia/04-roadmap-estimativas.md`
+  - `Alicia/05-riscos-mitigacoes.md`
+  - `Alicia/06-backlog-mvp.md`
+  - `Alicia/07-plano-release-oss.md`
+- Operational execution artifacts (must stay aligned to canonical docs above):
+  - `Alicia/08-plano-execucao-sprints.md`
+  - `Alicia/09-backlog-issues-mvp.md`
+  - `Alicia/10-contratos-tecnicos-v1.md`
+  - `Alicia/11-mapa-reuso-codex.md`
+
+### Scope rules
+
+- Treat AlicIA as the default project scope unless the user explicitly changes priorities.
+- Focus first on MVP `P0` items from `Alicia/06-backlog-mvp.md` and `Alicia/09-backlog-issues-mvp.md`.
+- Do not introduce non-MVP features unless explicitly requested by the user.
+- Keep cross-platform parity (Windows, macOS, Linux) from the beginning.
+- Apply a reuse-first strategy: prefer integrating existing `codex-rs` components over creating parallel engines.
+- For AlicIA UI work, use `egui` as the default UI stack. Keep `ratatui` conventions scoped to existing `codex-rs/tui` maintenance unless the user asks otherwise.
+- Enforce security-critical requirements in all implementations:
+  - block writes/actions outside the workspace,
+  - apply network policy by profile,
+  - require explicit approval for sensitive actions when policy demands it,
+  - fail closed (no explicit policy/approval decision means deny),
+  - emit append-only JSONL audit logs with redaction for sensitive data.
+
+### Execution order
+
+- Follow the sprint sequencing in `Alicia/08-plano-execucao-sprints.md` (Sprint 0 through Sprint 7).
+- When implementing work items, map tasks to issue IDs in `Alicia/09-backlog-issues-mvp.md`.
+- In progress updates and final summaries, report:
+  - which AlicIA issue IDs were addressed,
+  - which acceptance criteria were satisfied,
+  - which risks or blockers remain.
