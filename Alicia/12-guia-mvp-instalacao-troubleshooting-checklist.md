@@ -181,7 +181,7 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 - [x] Este guia revisado e atualizado para a versao candidata.
 - [ ] Notas de release/changelog preenchidas.
 - [x] Evidencias de CI anexadas (links dos jobs por SO).
-- [ ] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
+- [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO): `https://github.com/danielheringers/neuromancer/pull/13`.
 
 ## Estado de validacao (2026-02-18)
 1. Run `alicia-ci` com 9/9 jobs verdes:
@@ -194,6 +194,20 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-20260218-sync --audit-path ./.codex/alicia-smoke-audit-sync.jsonl -- cmd /C echo ALICIA_AUDIT_SYNC_OK
 ```
 - artefato: `codex-rs/.codex/alicia-smoke-audit-sync.jsonl`
+4. Revalidacao CI no contexto do PR atual:
+- PR: `https://github.com/danielheringers/neuromancer/pull/13`
+- run (`pull_request`, run_number `16`): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352`
+- resultado: `success` (9/9 jobs verdes)
+- jobs:
+  - `Alicia Policy and Approval Scenarios - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552234`
+  - `Alicia E2E Flow - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552256`
+  - `Alicia E2E Flow - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552257`
+  - `Alicia Policy and Approval Scenarios - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552265`
+  - `Alicia Suite Minima - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552266`
+  - `Alicia E2E Flow - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552268`
+  - `Alicia Suite Minima - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552280`
+  - `Alicia Policy and Approval Scenarios - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552296`
+  - `Alicia Suite Minima - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552310`
 
 ## 4.1) Consolidado para planejamento de continuidade (2026-02-18)
 
@@ -206,9 +220,9 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
   - `cargo test -p codex-alicia-ui`
 
 ## Pendente para fechar ciclo atual
-- [ ] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
+- [x] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
 - [ ] Preencher notas de release/changelog para a candidata de release.
-- [ ] Validar provider `claude-code` com binario real no host alvo de release (risco residual operacional).
+- [ ] Validar provider `claude-code` com binario real no host alvo de release (risco residual operacional; `claude-code --version` retorna `command not found` no host atual).
 
 
 ## 5) Evidencias recomendadas para aprovacao de release

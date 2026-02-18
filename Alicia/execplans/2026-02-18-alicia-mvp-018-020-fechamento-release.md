@@ -14,10 +14,10 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:23Z) Definido escopo do plano para `ALICIA-MVP-018`, `ALICIA-MVP-019` e `ALICIA-MVP-020`, incluindo risco operacional de `claude-code`.
 - [x] (2026-02-18 12:26Z) Baseline tecnico revalidado com `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui` (todos os testes passaram).
 - [x] (2026-02-18 12:26Z) Lint e formatacao executados no escopo AlicIA (`cargo clippy --fix ... -p codex-alicia-ui`; `cargo fmt --all` como fallback de Windows).
-- [ ] Publicar o delta local atual em PR contra `main` com escopo claramente delimitado.
-- [ ] Executar e registrar revalidacao completa do workflow `alicia-ci` (9 jobs: 3 jobs x 3 SO).
-- [ ] Consolidar notas de release/changelog da candidata e atualizar estado final no checklist `Alicia/12`.
-- [ ] Registrar decisao final sobre risco residual do adapter `claude-code` (mitigado, aceito temporariamente ou bloqueador).
+- [x] (2026-02-18 12:36Z) Delta local publicado em PR contra `main`: `https://github.com/danielheringers/neuromancer/pull/13`.
+- [x] (2026-02-18 12:36Z) Revalidacao completa do workflow `alicia-ci` no evento `pull_request` concluida com sucesso (9 jobs verdes): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352`.
+- [ ] Consolidar notas de release/changelog da candidata e atualizar estado final no checklist `Alicia/12` (concluido: checklist e pacote de evidencias atualizados; restante: release notes/changelog final).
+- [x] (2026-02-18 12:36Z) Decisao sobre risco residual do adapter `claude-code` registrada: risco aceito temporariamente ate validacao em host com binario real.
 
 ## Surprises & Discoveries
 
@@ -31,6 +31,10 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Evidence: `error: Recipe fmt could not be run because just could not find the shell: program not found`; fallback aplicado com `cargo fmt --all`.
 - Observation: O checklist atual de release ja marca quase tudo como concluido, mas ainda ha pendencias operacionais explicitas (delta local em PR/CI, changelog/release notes, validacao real de `claude-code`).
   Evidence: `Alicia/12-guia-mvp-instalacao-troubleshooting-checklist.md`, secoes `Release e documentacao` e `4.1`.
+- Observation: O host atual nao tem `gh` (GitHub CLI), entao a automacao de PR/CI precisou usar MCP GitHub e API REST do GitHub.
+  Evidence: `gh auth status` retorna `The term 'gh' is not recognized...`.
+- Observation: O host atual tambem nao tem `claude-code` instalado.
+  Evidence: `claude-code --version` retorna `The term 'claude-code' is not recognized...`.
 
 ## Decision Log
 
@@ -45,10 +49,16 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - Decision: Manter o risco de `claude-code` explicitamente registrado como gate de decisao, nao implodir o escopo com implementacao nova de adapter.
   Rationale: O risco atual e de validacao em host real, nao de desenvolvimento de funcionalidade no crate.
   Date/Author: 2026-02-18 / Codex
+- Decision: Usar MCP GitHub + GitHub REST API para abrir PR e monitorar CI quando `gh` nao estiver disponivel no host.
+  Rationale: Mantem o fluxo automatizado sem bloquear o fechamento do ciclo por dependencia de ferramenta local.
+  Date/Author: 2026-02-18 / Codex
+- Decision: Classificar o risco de `claude-code` como aceito temporariamente nesta iteracao, com validacao real adiada para host apropriado antes da release final.
+  Rationale: A validacao nao pode ser executada neste host por ausencia do binario; o risco permanece explicitado no checklist e pacote de PR.
+  Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
 
-No momento este plano esta em fase de execucao inicial. O principal ganho ate aqui e a definicao de um caminho de fechamento com evidencia objetiva e checkpoints claros. A avaliacao final sera registrada apos a conclusao dos itens pendentes em `Progress`, comparando resultado observado contra os criterios de aceite de `ALICIA-MVP-018/019/020`.
+Plano em fase avancada: PR aberto e CI 9/9 verde no contexto do `pull_request`, com evidencias registradas em `Alicia/12` e `Alicia/13`. O gap restante para fechamento completo desta execucao e somente consolidar notas de release/changelog da candidata. O objetivo original (tirar o ciclo de estado ad hoc e fechar com rastreabilidade) foi atendido para PR/CI/checklist, restando o item editorial final de release notes.
 
 ## Context and Orientation
 
@@ -118,9 +128,14 @@ Working directory: repository root `C:\Users\danie\OneDrive\Documentos\Projetos\
 
 5. Disparar/revalidar `alicia-ci` e registrar evidencias.
 
+    # Opcao A (quando gh estiver disponivel)
     gh workflow run alicia-ci.yml --ref neuromancer
     gh run list --workflow alicia-ci.yml --limit 3
     gh run view <run-id> --json status,conclusion,url
+
+    # Opcao B (fallback via GitHub API REST, usada nesta execucao)
+    Invoke-RestMethod https://api.github.com/repos/danielheringers/neuromancer/actions/workflows/alicia-ci.yml/runs?head_sha=<sha>
+    Invoke-RestMethod https://api.github.com/repos/danielheringers/neuromancer/actions/runs/<run-id>/jobs?per_page=100
 
    Expected: run concluido com `success` e 9 jobs verdes (3 jobs por 3 sistemas operacionais).
 
@@ -179,14 +194,15 @@ Baseline documental observado antes da execucao:
 Pendencias operacionais atuais (a partir de `Alicia/12`):
 
     - [ ] Notas de release/changelog preenchidas.
-    - [ ] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
-    - [ ] Validar provider `claude-code` com binario real no host alvo de release.
+    - [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
+    - [ ] Validar provider `claude-code` com binario real no host alvo de release (risco aceito temporariamente nesta iteracao).
 
 Historico de evidencias existentes para referencia:
 
     Alicia/13-pr-mvp-018-020.md
     - run com 9/9 jobs verdes registrado
-    - estado atual: sem PR aberto no momento
+    - PR atual aberto: https://github.com/danielheringers/neuromancer/pull/13
+    - revalidacao atual: https://github.com/danielheringers/neuromancer/actions/runs/22139722352 (9/9)
 
 ## Interfaces and Dependencies
 
@@ -208,3 +224,4 @@ Update note (2026-02-18 12:23Z): Plano criado para transformar pendencias operac
 
 
 Update note (2026-02-18 12:26Z): Progresso atualizado com validacao local concluida (testes, clippy e formatacao) e descoberta operacional do fallback `cargo fmt --all` no Windows.
+Update note (2026-02-18 12:36Z): Progresso atualizado com PR aberto (#13), CI `pull_request` 9/9 verde e decisao explicita de risco residual para `claude-code`; docs `Alicia/12` e `Alicia/13` sincronizadas.
