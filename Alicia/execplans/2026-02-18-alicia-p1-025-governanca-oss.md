@@ -24,6 +24,9 @@ Depois deste trabalho, o repositorio passa a ter bootstrap minimo de governanca 
 - Observation: O plano OSS ja cita os tres pilares de governanca solicitados.
   Evidence: `Alicia/07-plano-release-oss.md`, secao `Governanca inicial`.
 
+- Observation: O repositorio segue licenciamento Apache-2.0 herdado do upstream, enquanto `Alicia/07` cita MIT na governanca inicial.
+  Evidence: arquivo raiz `LICENSE` (Apache-2.0) e `Alicia/07-plano-release-oss.md`.
+
 ## Decision Log
 
 - Decision: Nao editar `Alicia/07-plano-release-oss.md` nesta iteracao.
@@ -38,9 +41,13 @@ Depois deste trabalho, o repositorio passa a ter bootstrap minimo de governanca 
   Rationale: Atende bootstrap minimo de governanca com regra acionavel e linguagem direta.
   Date/Author: 2026-02-18 / Codex
 
+- Decision: Nao alterar o arquivo `LICENSE` nesta iteracao.
+  Rationale: Mudanca de licenca e decisao legal/produto de alto impacto; manter alinhamento com upstream ate definicao explicita do mantenedor.
+  Date/Author: 2026-02-18 / Codex
+
 ## Outcomes & Retrospective
 
-Escopo concluido com alteracoes minimas e rastreaveis: backlog atualizado com novo item pos-MVP, novo ExecPlan criado e artefatos de governanca adicionados na raiz. Nao houve necessidade de revisao ampla no plano OSS porque a consistencia ja existia.
+Escopo concluido com alteracoes minimas e rastreaveis: backlog atualizado com novo item pos-MVP, novo ExecPlan criado e artefatos de governanca adicionados na raiz. Nao houve necessidade de revisao ampla no plano OSS porque a consistencia ja existia. Risco residual registrado: alinhamento de licenca (MIT no plano OSS vs Apache-2.0 no repositorio) depende de decisao explicita do mantenedor.
 
 ## Context and Orientation
 
