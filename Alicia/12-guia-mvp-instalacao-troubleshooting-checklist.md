@@ -179,7 +179,7 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 ## Release e documentacao
 - [x] `Alicia/07-plano-release-oss.md` revisado.
 - [x] Este guia revisado e atualizado para a versao candidata.
-- [ ] Notas de release/changelog preenchidas.
+- [x] Notas de release/changelog preenchidas: `Alicia/15-notas-release-candidata-mvp-018-020.md`.
 - [x] Evidencias de CI anexadas (links dos jobs por SO).
 - [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO): `https://github.com/danielheringers/neuromancer/pull/13`.
 
@@ -196,7 +196,8 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 - artefato: `codex-rs/.codex/alicia-smoke-audit-sync.jsonl`
 4. Revalidacao CI no contexto do PR atual:
 - PR: `https://github.com/danielheringers/neuromancer/pull/13`
-- run (`pull_request`, run_number `16`): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352`
+- run (`pull_request`, run_number `16`): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352` (success 9/9)
+- run (`pull_request`, run_number `19`): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314` (success 9/9, apos fix de intermitencia no `codex-alicia-core`)
 - resultado: `success` (9/9 jobs verdes)
 - jobs:
   - `Alicia Policy and Approval Scenarios - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552234`
@@ -221,7 +222,7 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 
 ## Pendente para fechar ciclo atual
 - [x] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
-- [ ] Preencher notas de release/changelog para a candidata de release.
+- [x] Preencher notas de release/changelog para a candidata de release.
 - [ ] Validar provider `claude-code` com binario real no host alvo de release (risco residual operacional; `claude-code --version` retorna `command not found` no host atual).
 
 

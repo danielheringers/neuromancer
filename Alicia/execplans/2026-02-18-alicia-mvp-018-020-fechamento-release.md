@@ -18,8 +18,9 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:36Z) Revalidacao completa do workflow `alicia-ci` no evento `pull_request` concluida com sucesso (9 jobs verdes): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352`.
 - [x] (2026-02-18 12:47Z) Diagnostico de falha na rodada seguinte de CI (`run 22140035071`): `start_pipe_session_emits_started_output_and_finished_events` falhou de forma intermitente no Ubuntu (`missing command output event with marker`).
 - [x] (2026-02-18 12:47Z) Ajuste aplicado no teste de `codex-alicia-core` para esperar eventos esperados sem depender da ordem `output` vs `finished`; validado localmente com 12 repeticoes do teste e regressao dos crates AlicIA.
-- [ ] Consolidar notas de release/changelog da candidata e atualizar estado final no checklist `Alicia/12` (concluido: checklist e pacote de evidencias atualizados; restante: release notes/changelog final).
+- [x] (2026-02-18 12:59Z) Notas de release/changelog da candidata consolidadas em `Alicia/15-notas-release-candidata-mvp-018-020.md` e checklist atualizado.
 - [x] (2026-02-18 12:36Z) Decisao sobre risco residual do adapter `claude-code` registrada: risco aceito temporariamente ate validacao em host com binario real.
+- [x] (2026-02-18 12:59Z) Revalidacao final de CI apos fix de intermitencia concluida com sucesso (run `19`, 9/9): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314`.
 
 ## Surprises & Discoveries
 
@@ -65,7 +66,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 
 ## Outcomes & Retrospective
 
-Plano em fase avancada: PR aberto e CI 9/9 verde no contexto do `pull_request`, com evidencias registradas em `Alicia/12` e `Alicia/13`. O gap restante para fechamento completo desta execucao e somente consolidar notas de release/changelog da candidata. O objetivo original (tirar o ciclo de estado ad hoc e fechar com rastreabilidade) foi atendido para PR/CI/checklist, restando o item editorial final de release notes.
+Plano em estado de fechamento: PR aberto com CI `pull_request` verde apos estabilizacao de teste intermitente, evidencias registradas em `Alicia/12` e `Alicia/13`, e notas de release consolidadas em `Alicia/15`. O objetivo original (tirar o ciclo de estado ad hoc e fechar com rastreabilidade) foi atendido. Resta apenas o risco conhecido de validacao real do provider `claude-code` em host com binario disponivel.
 
 ## Context and Orientation
 
@@ -200,7 +201,7 @@ Baseline documental observado antes da execucao:
 
 Pendencias operacionais atuais (a partir de `Alicia/12`):
 
-    - [ ] Notas de release/changelog preenchidas.
+    - [x] Notas de release/changelog preenchidas.
     - [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
     - [ ] Validar provider `claude-code` com binario real no host alvo de release (risco aceito temporariamente nesta iteracao).
 
@@ -210,6 +211,7 @@ Historico de evidencias existentes para referencia:
     - run com 9/9 jobs verdes registrado
     - PR atual aberto: https://github.com/danielheringers/neuromancer/pull/13
     - revalidacao atual: https://github.com/danielheringers/neuromancer/actions/runs/22139722352 (9/9)
+    - revalidacao final apos fix: https://github.com/danielheringers/neuromancer/actions/runs/22140345314 (9/9)
 
 ## Interfaces and Dependencies
 
@@ -233,3 +235,4 @@ Update note (2026-02-18 12:23Z): Plano criado para transformar pendencias operac
 Update note (2026-02-18 12:26Z): Progresso atualizado com validacao local concluida (testes, clippy e formatacao) e descoberta operacional do fallback `cargo fmt --all` no Windows.
 Update note (2026-02-18 12:36Z): Progresso atualizado com PR aberto (#13), CI `pull_request` 9/9 verde e decisao explicita de risco residual para `claude-code`; docs `Alicia/12` e `Alicia/13` sincronizadas.
 Update note (2026-02-18 12:47Z): Plano atualizado com diagnostico da falha intermitente no CI, correcao do teste em `codex-alicia-core` e nova rodada de validacao local.
+Update note (2026-02-18 12:59Z): Plano atualizado com release notes da candidata (`Alicia/15`), checklist sincronizado e revalidacao final de CI verde (run 19).
