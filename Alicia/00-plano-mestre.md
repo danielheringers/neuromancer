@@ -5,7 +5,7 @@ AlicIA será um terminal open source, focado em alta performance, com agentes de
 
 Decisões já fechadas:
 - Nome: AlicIA
-- Licença: MIT
+- Licença: Apache-2.0
 - UI: egui (nativo)
 - SO alvo: Windows + macOS + Linux com paridade desde o início
 - Segurança: bloquear acesso fora do workspace no MVP

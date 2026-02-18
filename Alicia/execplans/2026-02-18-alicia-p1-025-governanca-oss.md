@@ -15,6 +15,7 @@ Depois deste trabalho, o repositorio passa a ter bootstrap minimo de governanca 
 - [x] (2026-02-18 15:09Z) Criado `CONTRIBUTING.md` na raiz apontando para `docs/contributing.md` e reforcando fluxo por convite.
 - [x] (2026-02-18 15:09Z) Criado `CODE_OF_CONDUCT.md` na raiz com expectativas objetivas, aplicacao e canal de reporte.
 - [x] (2026-02-18 15:10Z) Validada consistencia de `Alicia/07-plano-release-oss.md`; sem necessidade de ajuste adicional.
+- [x] (2026-02-18 15:24Z) Decisao do mantenedor aplicada: alinhados `Alicia/00-plano-mestre.md` e `Alicia/07-plano-release-oss.md` para licenca `Apache-2.0`.
 
 ## Surprises & Discoveries
 
@@ -24,8 +25,11 @@ Depois deste trabalho, o repositorio passa a ter bootstrap minimo de governanca 
 - Observation: O plano OSS ja cita os tres pilares de governanca solicitados.
   Evidence: `Alicia/07-plano-release-oss.md`, secao `Governanca inicial`.
 
-- Observation: O repositorio segue licenciamento Apache-2.0 herdado do upstream, enquanto `Alicia/07` cita MIT na governanca inicial.
-  Evidence: arquivo raiz `LICENSE` (Apache-2.0) e `Alicia/07-plano-release-oss.md`.
+- Observation: No levantamento inicial desta iteracao, o repositorio seguia Apache-2.0 enquanto `Alicia/07` citava MIT na governanca inicial.
+  Evidence: comparacao entre arquivo raiz `LICENSE` (Apache-2.0) e versao anterior de `Alicia/07-plano-release-oss.md`.
+
+- Observation: A divergencia documental de licenca foi encerrada nesta iteracao por decisao explicita do mantenedor.
+  Evidence: `Alicia/00-plano-mestre.md` e `Alicia/07-plano-release-oss.md` agora citam `Apache-2.0`.
 
 ## Decision Log
 
@@ -45,9 +49,13 @@ Depois deste trabalho, o repositorio passa a ter bootstrap minimo de governanca 
   Rationale: Mudanca de licenca e decisao legal/produto de alto impacto; manter alinhamento com upstream ate definicao explicita do mantenedor.
   Date/Author: 2026-02-18 / Codex
 
+- Decision: Atualizar os documentos AlicIA de licenca para `Apache-2.0`.
+  Rationale: O mantenedor decidiu explicitar o alinhamento com a licenca real do repositorio.
+  Date/Author: 2026-02-18 / Codex
+
 ## Outcomes & Retrospective
 
-Escopo concluido com alteracoes minimas e rastreaveis: backlog atualizado com novo item pos-MVP, novo ExecPlan criado e artefatos de governanca adicionados na raiz. Nao houve necessidade de revisao ampla no plano OSS porque a consistencia ja existia. Risco residual registrado: alinhamento de licenca (MIT no plano OSS vs Apache-2.0 no repositorio) depende de decisao explicita do mantenedor.
+Escopo concluido com alteracoes minimas e rastreaveis: backlog atualizado com novo item pos-MVP, novo ExecPlan criado, artefatos de governanca adicionados na raiz e alinhamento de licenca consolidado em `Apache-2.0` nos documentos AlicIA relevantes. O risco residual de divergencia documental de licenca foi fechado nesta iteracao.
 
 ## Context and Orientation
 
@@ -126,3 +134,4 @@ Dependencias diretas deste escopo:
 - `Alicia/07-plano-release-oss.md` (consistencia de governanca inicial)
 
 Update note (2026-02-18 15:10Z): Plano criado e atualizado para refletir a implementacao completa do bootstrap de governanca OSS pos-MVP (`ALICIA-P1-025`) com backlog, artefatos raiz e verificacao de consistencia.
+Update note (2026-02-18 15:24Z): Plano atualizado apos decisao explicita do mantenedor para trocar a diretriz de licenca para `Apache-2.0`, com sincronizacao de `Alicia/00` e `Alicia/07`.

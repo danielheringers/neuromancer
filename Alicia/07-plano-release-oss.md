@@ -1,7 +1,7 @@
 # Plano de Entrega Open Source
 
 ## Governança inicial
-1. Licença MIT no repositório.
+1. Licença Apache-2.0 no repositório.
 2. `CONTRIBUTING.md` com fluxo de PR e revisão.
 3. `CODE_OF_CONDUCT.md`.
 4. Template de issue para bug/feature.
