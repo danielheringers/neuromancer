@@ -155,6 +155,10 @@ $env:ALICIA_REAL_PROVIDER_CLAUDE_CODE='1'
 $env:ALICIA_CLAUDE_CODE_BIN='claude-code'
 cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
 ```
+```bash
+cd codex-rs
+ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 ALICIA_CLAUDE_CODE_BIN=claude-code cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+```
 3. Resultado esperado:
    - `test real_provider_claude_code_smoke ... ok`
    - sem `ProviderCommandFailed` no output do teste.

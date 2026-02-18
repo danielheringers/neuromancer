@@ -22,6 +22,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:36Z) Decisao sobre risco residual do adapter `claude-code` registrada: risco aceito temporariamente ate validacao em host com binario real.
 - [x] (2026-02-18 12:59Z) Revalidacao final de CI apos fix de intermitencia concluida com sucesso (run `19`, 9/9): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314`.
 - [x] (2026-02-18 13:11Z) Adicionado smoke test real opt-in para `claude-code` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs` e procedimento de fechamento do risco sincronizado em `Alicia/12` e `Alicia/13`.
+- [x] (2026-02-18 13:16Z) Runbook de validacao real do `claude-code` expandido com comandos para PowerShell e bash (Windows/macOS/Linux), mantendo alinhamento cross-platform.
 
 ## Surprises & Discoveries
 
@@ -241,3 +242,4 @@ Update note (2026-02-18 12:36Z): Progresso atualizado com PR aberto (#13), CI `p
 Update note (2026-02-18 12:47Z): Plano atualizado com diagnostico da falha intermitente no CI, correcao do teste em `codex-alicia-core` e nova rodada de validacao local.
 Update note (2026-02-18 12:59Z): Plano atualizado com release notes da candidata (`Alicia/15`), checklist sincronizado e revalidacao final de CI verde (run 19).
 Update note (2026-02-18 13:11Z): Plano atualizado com smoke test real opt-in do provider `claude-code` e runbook objetivo para fechar o risco residual em host alvo.
+Update note (2026-02-18 13:16Z): Plano atualizado com comandos equivalentes de validacao para PowerShell e bash no fluxo de fechamento do risco residual.
