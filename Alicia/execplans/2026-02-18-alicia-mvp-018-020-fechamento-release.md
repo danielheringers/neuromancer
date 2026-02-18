@@ -25,6 +25,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 13:16Z) Runbook de validacao real do `claude-code` expandido com comandos para PowerShell e bash (Windows/macOS/Linux), mantendo alinhamento cross-platform.
 - [x] (2026-02-18 13:30Z) Risco residual do provider `claude-code` fechado no host atual: identificado binario real `claude` (`2.1.45`) e smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_CLAUDE_CODE_BIN=claude`.
 - [x] (2026-02-18 13:44Z) Corrigida nova intermitencia em `codex-alicia-core` no teste `cancel_does_not_corrupt_future_session_with_same_id` (sessao reutilizada apos cancelamento), removendo dependencia de ordem estrita entre `CommandOutputChunk` e `CommandFinished`.
+- [x] (2026-02-18 13:53Z) Ajustados testes de sessao para usar `delayed_echo_script(...)` em vez de `echo` imediato nos cenarios sensiveis, reduzindo perda intermitente de chunk de stdout em processos curtos.
 
 ## Surprises & Discoveries
 
@@ -48,6 +49,8 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Evidence: falha no CI: `missing command output event with marker`; ao repetir localmente apos ajuste, 12/12 execucoes passaram.
 - Observation: O teste `cancel_does_not_corrupt_future_session_with_same_id` apresentou falha intermitente no CI com `expected second run output marker for reused session id`.
   Evidence: job `Alicia Suite Minima - ubuntu-latest` (`run 25`) falhou em `Test alicia-core` com `exit code 101`; repeticao local mostrou a mesma falha uma vez durante stress-run.
+- Observation: Comandos `echo` muito curtos no teste podem encerrar antes da captura consistente de stdout em todos os ambientes de CI.
+  Evidence: apos trocar para `delayed_echo_script(...)`, revalidacoes locais extensivas passaram (`cargo test -p codex-alicia-core` em loop + 30 repeticoes por teste sensivel).
 
 ## Decision Log
 
@@ -79,6 +82,9 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Date/Author: 2026-02-18 / Codex
 - Decision: Aplicar o mesmo padrao de robustez temporal no teste de cancelamento/reuso de sessao (`sess-cancel-reuse`) usado no teste de pipe, aguardando sinais esperados sem assumir ordenacao.
   Rationale: Em ambiente concorrente, eventos de saida e finalizacao podem chegar em ordem diferente; o teste deve validar comportamento e nao interleaving interno.
+  Date/Author: 2026-02-18 / Codex
+- Decision: Preferir `delayed_echo_script(...)` nos testes que validam chunk de output para evitar falsos negativos de captura em processos ultracurtos.
+  Rationale: O objetivo dos testes e validar fluxo de eventos/sessao; adicionar pequeno atraso torna a observacao de output deterministica sem reduzir cobertura funcional.
   Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
@@ -257,3 +263,4 @@ Update note (2026-02-18 13:11Z): Plano atualizado com smoke test real opt-in do 
 Update note (2026-02-18 13:16Z): Plano atualizado com comandos equivalentes de validacao para PowerShell e bash no fluxo de fechamento do risco residual.
 Update note (2026-02-18 13:30Z): Plano atualizado com validacao real concluida no host atual usando `claude` (`2.1.45`) e fechamento do risco residual do provider.
 Update note (2026-02-18 13:44Z): Plano atualizado com correcao de nova intermitencia no `codex-alicia-core` para reuso de sessao apos cancelamento e rodada de revalidacao local intensiva.
+Update note (2026-02-18 13:53Z): Plano atualizado com mitigacao adicional para processos curtos (`delayed_echo_script`) e nova rodada de stress-tests locais sem falhas.

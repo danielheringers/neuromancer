@@ -595,7 +595,7 @@ mod tests {
         let manager = SessionManager::new();
         let mut events_rx = manager.event_receiver();
         let marker = "alicia_bridge_pipe_ok";
-        let (program, args) = shell_command(&format!("echo {marker}"));
+        let (program, args) = shell_command(&delayed_echo_script(marker));
         let request =
             SessionStartRequest::new("sess-pipe", program, args, PathBuf::from("."), env_map())
                 .with_mode(SessionMode::Pipe);
@@ -777,7 +777,7 @@ mod tests {
         );
 
         let second_marker = "cancel_reuse_second_ok";
-        let (program, args) = shell_command(&format!("echo {second_marker}"));
+        let (program, args) = shell_command(&delayed_echo_script(second_marker));
         manager
             .start(
                 SessionStartRequest::new(
