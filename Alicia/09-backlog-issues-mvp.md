@@ -16,6 +16,16 @@
 8. `ALICIA-MVP-016`, `ALICIA-MVP-017`: motor de eventos/diff aproveitavel da TUI atual, porem renderizacao `egui` ainda nao implementada.
 9. Referencia tecnica completa do inventario: `Alicia/11-mapa-reuso-codex.md`.
 
+## Atualizacao de Progresso - Implementacao (2026-02-18)
+1. `ALICIA-MVP-001`, `ALICIA-MVP-002`, `ALICIA-MVP-003`: concluidos com contratos de policy/IPC e bootstrap dos crates.
+2. `ALICIA-MVP-004`, `ALICIA-MVP-005`, `ALICIA-MVP-025`: concluidos no `SessionManager` com `start/stop/reattach`, bridge PTY/pipe e eventos normalizados.
+3. `ALICIA-MVP-006`, `ALICIA-MVP-007`, `ALICIA-MVP-008`, `ALICIA-MVP-026`: concluidos com mapeamento de perfis, guard canonico de workspace (incluindo symlink escape) e decisao de rede por perfil.
+4. `ALICIA-MVP-009`, `ALICIA-MVP-015`, `ALICIA-MVP-016`, `ALICIA-MVP-017`: concluidos no fluxo UI/runtime (`egui`) com terminal, fila de aprovacoes, timeline e diff preview.
+5. `ALICIA-MVP-010`, `ALICIA-MVP-011`, `ALICIA-MVP-027`: concluidos com auditoria JSONL append-only e redaction antes da persistencia.
+6. `ALICIA-MVP-012`, `ALICIA-MVP-013`, `ALICIA-MVP-014`, `ALICIA-MVP-028`: concluidos com contrato comum de adapter e adapters funcionais `codex-cli` e `claude-code`.
+7. `ALICIA-MVP-018`, `ALICIA-MVP-019`, `ALICIA-MVP-020`: concluidos com workflow cross-platform `alicia-ci`, testes E2E e guia de instalacao/troubleshooting/checklist.
+8. `ALICIA-P1-021`, `ALICIA-P1-022`, `ALICIA-P1-023`, `ALICIA-P1-024`: implementados (incluindo diff por hunk, policy por projeto, cancelamento seguro e mensagens para iniciantes).
+
 ## P0 Imediato - Integracao Reuse-first
 
 ### ALICIA-MVP-025 - Bridge de Sessao sobre `codex-utils-pty`

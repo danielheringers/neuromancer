@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 
 use codex_alicia_core::CommandOutputStream;
@@ -193,14 +194,16 @@ async fn probe_cli_version(
     provider_name: &str,
     minimum_supported_version: &Version,
 ) -> Result<Version, AdapterError> {
-    let output = tokio::process::Command::new(executable)
-        .arg("--version")
-        .output()
-        .await
-        .map_err(|err| AdapterError::ProviderCommandFailed {
-            provider: provider_name.to_string(),
-            message: err.to_string(),
-        })?;
+    let output = run_command_with_retry(|| {
+        let mut command = tokio::process::Command::new(executable);
+        command.arg("--version");
+        command
+    })
+    .await
+    .map_err(|err| AdapterError::ProviderCommandFailed {
+        provider: provider_name.to_string(),
+        message: err.to_string(),
+    })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -253,15 +256,16 @@ async fn run_cli_simple_task(
         cwd: cwd.to_string_lossy().to_string(),
     }))];
 
-    let output = tokio::process::Command::new(executable)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .map_err(|err| AdapterError::ProviderCommandFailed {
-            provider: provider_name.to_string(),
-            message: err.to_string(),
-        })?;
+    let output = run_command_with_retry(|| {
+        let mut command = tokio::process::Command::new(executable);
+        command.args(args).current_dir(cwd);
+        command
+    })
+    .await
+    .map_err(|err| AdapterError::ProviderCommandFailed {
+        provider: provider_name.to_string(),
+        message: err.to_string(),
+    })?;
 
     if !output.stdout.is_empty() {
         messages.push(IpcMessage::new(IpcEvent::CommandOutputChunk(
@@ -305,6 +309,34 @@ fn parse_version_from_output(output: &str) -> Option<Version> {
         let token = token.strip_prefix('v').unwrap_or(token);
         Version::parse(token).ok()
     })
+}
+
+#[cfg(unix)]
+const TEXT_FILE_BUSY_OS_ERROR: Option<i32> = Some(26);
+#[cfg(not(unix))]
+const TEXT_FILE_BUSY_OS_ERROR: Option<i32> = None;
+
+async fn run_command_with_retry<F>(mut build_command: F) -> std::io::Result<std::process::Output>
+where
+    F: FnMut() -> tokio::process::Command,
+{
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY_MS: u64 = 25;
+    let mut last_retryable_error: Option<std::io::Error> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match build_command().output().await {
+            Ok(output) => return Ok(output),
+            Err(err) if err.raw_os_error() == TEXT_FILE_BUSY_OS_ERROR && attempt < MAX_ATTEMPTS => {
+                last_retryable_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_retryable_error
+        .unwrap_or_else(|| std::io::Error::other("provider command retry attempts exhausted")))
 }
 
 #[cfg(test)]

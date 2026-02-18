@@ -1,6 +1,6 @@
 # AlicIA - Guia MVP (Instalacao, Troubleshooting e Pre-Release)
 
-Data de referencia: 2026-02-17
+Data de referencia: 2026-02-18
 
 ## Escopo
 Este guia operacional cobre o item `ALICIA-MVP-020`:
@@ -97,6 +97,23 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 ```bash
 cargo test -p codex-alicia-ui e2e_happy_path_approval_execution_and_audit -- --exact
 cargo test -p codex-alicia-ui e2e_denied_and_expired_blocked_audit -- --exact
+cargo test -p codex-alicia-ui e2e_safe_cancel_persists_final_audit_state -- --exact
+```
+
+### Smoke manual do launcher local (`codex-alicia-ui-app`)
+Windows:
+```powershell
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-local -- cmd /C echo ALICIA_OK
+```
+
+macOS/Linux:
+```bash
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-local -- /bin/sh -c "echo ALICIA_OK"
+```
+
+Com auditoria JSONL:
+```bash
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-audit --audit-path ./.codex/alicia-audit.jsonl -- /bin/sh -c "echo ALICIA_AUDIT_OK"
 ```
 
 ## 3) Troubleshooting
@@ -126,6 +143,29 @@ cargo clippy --fix --all-features --tests --allow-dirty -p codex-alicia-ui
 2. Conferir mensagem `UnsupportedProviderVersion` nos adapters.
 3. Atualizar `codex-cli`/`claude-code` para versao minima esperada.
 
+### Validacao real do provider `claude-code` (host alvo de release)
+1. Confirmar que o binario esta acessivel:
+```powershell
+claude --version
+```
+2. Executar o smoke real do adapter (teste habilitado por env var):
+```powershell
+cd codex-rs
+$env:ALICIA_REAL_PROVIDER_CLAUDE_CODE='1'
+cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+```
+```bash
+cd codex-rs
+ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+```
+3. Observacoes operacionais:
+   - o smoke autodetecta `claude` ou `claude-code` quando `ALICIA_CLAUDE_CODE_BIN` nao estiver definido;
+   - usar `ALICIA_CLAUDE_CODE_BIN` apenas para forcar um binario especifico.
+4. Resultado esperado:
+   - `test real_provider_claude_code_smoke ... ok`
+   - sem `ProviderCommandFailed` no output do teste.
+5. Registrar a evidencia no pacote de PR (`Alicia/13-pr-mvp-018-020.md`) e marcar o item pendente do checklist como concluido.
+
 ### Erro: aprovacao expira antes da decisao
 1. Conferir `expires_at_unix_s` no evento `approval_requested`.
 2. Confirmar que o clock local da maquina esta correto.
@@ -142,31 +182,80 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 ## 4) Checklist pre-release MVP (Go/No-Go)
 
 ## Qualidade e regressao
-- [ ] `suite_minima` verde em Windows, macOS e Linux.
-- [ ] `policy_approval_scenarios` verde em Windows, macOS e Linux.
-- [ ] `e2e_flow` verde em Windows, macOS e Linux.
-- [ ] Sem regressao funcional nos crates `codex-alicia-core`, `codex-alicia-adapters`, `codex-alicia-ui`.
+- [x] `suite_minima` verde em Windows, macOS e Linux.
+- [x] `policy_approval_scenarios` verde em Windows, macOS e Linux.
+- [x] `e2e_flow` verde em Windows, macOS e Linux.
+- [x] Sem regressao funcional nos crates `codex-alicia-core`, `codex-alicia-adapters`, `codex-alicia-ui`.
 
 ## Seguranca
-- [ ] Fluxo de aprovacao cobre `approved`, `denied` e `expired`.
-- [ ] Bloqueio fora do workspace validado por teste.
-- [ ] Auditoria JSONL inclui `policy_decision`, `approval_decision` e `result_status`.
-- [ ] Sem segredo em logs de auditoria (redaction ativa).
+- [x] Fluxo de aprovacao cobre `approved`, `denied` e `expired`.
+- [x] Bloqueio fora do workspace validado por teste.
+- [x] Auditoria JSONL inclui `policy_decision`, `approval_decision` e `result_status`.
+- [x] Sem segredo em logs de auditoria (redaction ativa).
 
 ## Runtime e UX minima
-- [ ] Terminal integrado recebe output em tempo real sem congelar.
-- [ ] Input do usuario chega na sessao ativa correta.
-- [ ] Timeline atualiza em ordem de eventos.
-- [ ] Diff preview por arquivo visivel antes de aplicar.
+- [x] Terminal integrado recebe output em tempo real sem congelar.
+- [x] Input do usuario chega na sessao ativa correta.
+- [x] Timeline atualiza em ordem de eventos.
+- [x] Diff preview por arquivo visivel antes de aplicar.
 
 ## Release e documentacao
-- [ ] `Alicia/07-plano-release-oss.md` revisado.
-- [ ] Este guia revisado e atualizado para a versao candidata.
-- [ ] Notas de release/changelog preenchidas.
-- [ ] Evidencias de CI anexadas (links dos jobs por SO).
+- [x] `Alicia/07-plano-release-oss.md` revisado.
+- [x] Este guia revisado e atualizado para a versao candidata.
+- [x] Notas de release/changelog preenchidas: `Alicia/15-notas-release-candidata-mvp-018-020.md`.
+- [x] Evidencias de CI anexadas (links dos jobs por SO).
+- [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO): `https://github.com/danielheringers/neuromancer/pull/13`.
+
+## Estado de validacao (2026-02-18)
+1. Run `alicia-ci` com 9/9 jobs verdes:
+- `https://github.com/danielheringers/neuromancer/actions/runs/22135313223`
+2. Regressao local complementar apos sync:
+- `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui`
+3. Smoke complementar com auditoria JSONL:
+- comando:
+```powershell
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-20260218-sync --audit-path ./.codex/alicia-smoke-audit-sync.jsonl -- cmd /C echo ALICIA_AUDIT_SYNC_OK
+```
+- artefato: `codex-rs/.codex/alicia-smoke-audit-sync.jsonl`
+4. Revalidacao CI no contexto do PR atual:
+- PR: `https://github.com/danielheringers/neuromancer/pull/13`
+- run (`pull_request`, run_number `16`): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352` (success 9/9)
+- run (`pull_request`, run_number `19`): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314` (success 9/9, apos fix de intermitencia no `codex-alicia-core`)
+- run (`pull_request`, run_number `32`): `https://github.com/danielheringers/neuromancer/actions/runs/22144213751` (success 9/9, commit `3c38be3de` apos hardening do smoke real de provider)
+- resultado: `success` (9/9 jobs verdes)
+- jobs:
+  - `Alicia Policy and Approval Scenarios - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562577`
+  - `Alicia E2E Flow - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562897`
+  - `Alicia E2E Flow - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562919`
+  - `Alicia Policy and Approval Scenarios - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562619`
+  - `Alicia Suite Minima - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562707`
+  - `Alicia E2E Flow - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562665`
+  - `Alicia Suite Minima - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016563040`
+  - `Alicia Policy and Approval Scenarios - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562711`
+  - `Alicia Suite Minima - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016563004`
+5. Validacao real do provider `claude-code` no host atual:
+- `claude --version` -> `2.1.45 (Claude Code)`
+- `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` (autodetect `claude`/`claude-code`) -> `ok`.
+
+## 4.1) Consolidado para planejamento de continuidade (2026-02-18)
+
+## Concluido (base MVP + P1 imediato)
+- [x] `ALICIA-MVP-001` a `ALICIA-MVP-020` implementados e documentados no backlog.
+- [x] `ALICIA-P1-021` a `ALICIA-P1-024` implementados (diff por hunk, policy por projeto, cancelamento seguro e mensagens para iniciantes).
+- [x] Regressao local dos crates AlicIA executada:
+  - `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui`
+- [x] Reforco de policy no runtime/UI validado localmente com:
+  - `cargo test -p codex-alicia-ui`
+
+## Pendente para fechar ciclo atual
+- [x] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
+- [x] Preencher notas de release/changelog para a candidata de release.
+- [x] Validar provider `claude-code` com binario real no host alvo de release (host atual usa binario `claude`; `claude --version` retornou `2.1.45 (Claude Code)` e `real_provider_claude_code_smoke` passou com `ALICIA_CLAUDE_CODE_BIN=claude` em 2026-02-18).
+
 
 ## 5) Evidencias recomendadas para aprovacao de release
 1. URL do workflow `alicia-ci` com os 3 jobs (`suite_minima`, `policy_approval_scenarios`, `e2e_flow`) verdes.
 2. Hash/tag candidata de release.
 3. Registro do smoke manual (um caso feliz + um caso negado/expirado).
 4. Exemplo de linha de auditoria validada no artefato JSONL.
+

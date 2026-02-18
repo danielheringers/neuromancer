@@ -7,6 +7,8 @@ on:
 
 jobs:
   sdks:
+    # SDK workflow is upstream-scoped; AlicIA fork uses alicia-ci for default PR validation.
+    if: ${{ github.repository_owner == 'openai' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

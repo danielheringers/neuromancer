@@ -15,6 +15,12 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::ActionKind;
+use crate::ApprovalDecision;
+use crate::AuditRecord;
+use crate::PermissionProfile;
+use crate::PolicyDecision;
+use crate::ResultStatus;
 use crate::ipc::CommandFinished;
 use crate::ipc::CommandOutputChunk;
 use crate::ipc::CommandOutputStream;
@@ -40,6 +46,7 @@ pub struct SessionStartRequest {
     pub env: HashMap<String, String>,
     pub arg0: Option<String>,
     pub mode: SessionMode,
+    pub audit_context: SessionAuditContext,
 }
 
 impl SessionStartRequest {
@@ -50,14 +57,16 @@ impl SessionStartRequest {
         cwd: PathBuf,
         env: HashMap<String, String>,
     ) -> Self {
+        let program = program.into();
         Self {
             session_id: session_id.into(),
-            program: program.into(),
+            program,
             args,
             cwd,
             env,
             arg0: None,
             mode: SessionMode::Auto,
+            audit_context: SessionAuditContext::for_execute_command(String::new()),
         }
     }
 
@@ -69,6 +78,32 @@ impl SessionStartRequest {
     pub fn with_arg0(mut self, arg0: impl Into<String>) -> Self {
         self.arg0 = Some(arg0.into());
         self
+    }
+
+    pub fn with_audit_context(mut self, audit_context: SessionAuditContext) -> Self {
+        self.audit_context = audit_context;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAuditContext {
+    pub action_kind: ActionKind,
+    pub target: String,
+    pub profile: PermissionProfile,
+    pub policy_decision: PolicyDecision,
+    pub approval_decision: ApprovalDecision,
+}
+
+impl SessionAuditContext {
+    pub fn for_execute_command(target: impl Into<String>) -> Self {
+        Self {
+            action_kind: ActionKind::ExecuteCommand,
+            target: target.into(),
+            profile: PermissionProfile::FullAccess,
+            policy_decision: PolicyDecision::Allow,
+            approval_decision: ApprovalDecision::NotRequired,
+        }
     }
 }
 
@@ -98,12 +133,15 @@ pub enum SessionManagerError {
 #[derive(Debug, Clone)]
 struct SessionRecord {
     handle: Arc<ProcessHandle>,
+    audit_context: SessionAuditContext,
+    cancellation_requested: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     events_tx: broadcast::Sender<IpcMessage>,
+    audit_logger: Option<crate::AuditLogger>,
 }
 
 impl Default for SessionManager {
@@ -118,7 +156,14 @@ impl SessionManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             events_tx,
+            audit_logger: None,
         }
+    }
+
+    pub fn with_audit_logger(audit_logger: crate::AuditLogger) -> Self {
+        let mut manager = Self::new();
+        manager.audit_logger = Some(audit_logger);
+        manager
     }
 
     pub fn event_receiver(&self) -> broadcast::Receiver<IpcMessage> {
@@ -149,7 +194,12 @@ impl SessionManager {
             exit_rx,
         } = self.spawn_process(&request).await?;
         let command = build_command(&request.program, &request.args);
+        let command_text = command.join(" ");
         let handle = Arc::new(session);
+        let mut audit_context = request.audit_context.clone();
+        if audit_context.target.is_empty() {
+            audit_context.target = command_text;
+        }
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -163,12 +213,19 @@ impl SessionManager {
                 request.session_id.clone(),
                 SessionRecord {
                     handle: Arc::clone(&handle),
+                    audit_context,
+                    cancellation_requested: false,
                 },
             );
         }
 
         self.spawn_output_forwarder(request.session_id.clone(), output_rx);
-        self.spawn_exit_watcher(request.session_id.clone(), exit_rx, started_at);
+        self.spawn_exit_watcher(
+            request.session_id.clone(),
+            exit_rx,
+            started_at,
+            self.audit_logger.clone(),
+        );
 
         let _ = self
             .events_tx
@@ -182,17 +239,36 @@ impl SessionManager {
     }
 
     pub async fn stop(&self, session_id: &str) -> Result<(), SessionManagerError> {
-        let record = {
+        let handle = {
             let mut sessions = self.sessions.lock().await;
-            sessions.remove(session_id)
+            let Some(record) = sessions.get_mut(session_id) else {
+                return Err(SessionManagerError::SessionNotFound(session_id.to_string()));
+            };
+            record.cancellation_requested = true;
+            Arc::clone(&record.handle)
         };
 
-        let Some(record) = record else {
+        if handle.has_exited() {
+            return Ok(());
+        }
+
+        handle.terminate();
+        Ok(())
+    }
+
+    pub async fn cancel(&self, session_id: &str) -> Result<(), SessionManagerError> {
+        self.stop(session_id).await
+    }
+
+    pub async fn is_cancellation_requested(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, SessionManagerError> {
+        let sessions = self.sessions.lock().await;
+        let Some(record) = sessions.get(session_id) else {
             return Err(SessionManagerError::SessionNotFound(session_id.to_string()));
         };
-
-        record.handle.terminate();
-        Ok(())
+        Ok(record.cancellation_requested)
     }
 
     pub async fn reattach(
@@ -313,6 +389,7 @@ impl SessionManager {
         session_id: String,
         exit_rx: oneshot::Receiver<i32>,
         started_at: Instant,
+        audit_logger: Option<crate::AuditLogger>,
     ) {
         let sessions = Arc::clone(&self.sessions);
         let events_tx = self.events_tx.clone();
@@ -330,9 +407,30 @@ impl SessionManager {
                     duration_ms,
                 },
             )));
-
-            let mut lock = sessions.lock().await;
-            lock.remove(&session_id);
+            let removed_session = {
+                let mut lock = sessions.lock().await;
+                lock.remove(&session_id)
+            };
+            if let Some(audit_logger) = audit_logger
+                && let Some(removed_session) = removed_session
+            {
+                let result_status = if exit_code == 0 && !removed_session.cancellation_requested {
+                    ResultStatus::Succeeded
+                } else {
+                    ResultStatus::Failed
+                };
+                let audit_record = AuditRecord::new(
+                    session_id,
+                    removed_session.audit_context.action_kind,
+                    removed_session.audit_context.target,
+                    removed_session.audit_context.profile,
+                    removed_session.audit_context.policy_decision,
+                    removed_session.audit_context.approval_decision,
+                    result_status,
+                    duration_ms,
+                );
+                let _ = audit_logger.append(&audit_record).await;
+            }
         });
     }
 }
@@ -346,18 +444,27 @@ fn build_command(program: &str, args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
     use anyhow::Result;
     use pretty_assertions::assert_eq;
+    use serde_json::Value;
+    use tempfile::TempDir;
 
+    use super::SessionAuditContext;
     use super::SessionManager;
     use super::SessionManagerError;
     use super::SessionMode;
     use super::SessionStartRequest;
+    use crate::ActionKind;
+    use crate::ApprovalDecision;
+    use crate::AuditLogger;
     use crate::IpcEvent;
     use crate::IpcMessage;
+    use crate::PermissionProfile;
+    use crate::PolicyDecision;
 
     fn shell_command(script: &str) -> (String, Vec<String>) {
         if cfg!(windows) {
@@ -389,6 +496,14 @@ mod tests {
 
     fn env_map() -> std::collections::HashMap<String, String> {
         std::env::vars().collect()
+    }
+
+    fn long_running_script_with_marker_start(marker: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {marker} & ping -n 20 127.0.0.1 > NUL")
+        } else {
+            format!("echo {marker}; sleep 20")
+        }
     }
 
     fn command_id_for_event(event: &IpcEvent) -> Option<&str> {
@@ -458,35 +573,74 @@ mod tests {
         }
     }
 
+    async fn wait_for_session_inactive(
+        manager: &SessionManager,
+        session_id: &str,
+        timeout_ms: u64,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if !manager.is_active(session_id).await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_pipe_session_emits_started_output_and_finished_events() -> Result<()> {
         let manager = SessionManager::new();
         let mut events_rx = manager.event_receiver();
         let marker = "alicia_bridge_pipe_ok";
-        let (program, args) = shell_command(&format!("echo {marker}"));
+        let (program, args) = shell_command(&delayed_echo_script(marker));
         let request =
             SessionStartRequest::new("sess-pipe", program, args, PathBuf::from("."), env_map())
                 .with_mode(SessionMode::Pipe);
 
         manager.start(request).await?;
 
-        let events = recv_events_until_finished(&mut events_rx, "sess-pipe", 10_000).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_started = false;
+        let mut saw_output = false;
+        let mut saw_finished = false;
+        while tokio::time::Instant::now() < deadline {
+            if saw_started && saw_output && saw_finished {
+                break;
+            }
+
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, events_rx.recv()).await {
+                Ok(Ok(message)) => {
+                    if command_id_for_event(&message.event) != Some("sess-pipe") {
+                        continue;
+                    }
+                    match &message.event {
+                        IpcEvent::CommandStarted(event) if event.command_id == "sess-pipe" => {
+                            saw_started = true;
+                        }
+                        IpcEvent::CommandOutputChunk(event) if event.chunk.contains(marker) => {
+                            saw_output = true;
+                        }
+                        IpcEvent::CommandFinished(event) if event.exit_code == 0 => {
+                            saw_finished = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_started, "missing command started event");
+        assert!(saw_output, "missing command output event with marker");
         assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandStarted(event) if event.command_id == "sess-pipe")
-            ),
-            "missing command started event"
-        );
-        assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandOutputChunk(event) if event.chunk.contains(marker))
-            ),
-            "missing command output event with marker"
-        );
-        assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandFinished(event) if event.exit_code == 0)
-            ),
+            saw_finished,
             "missing command finished event with exit code 0"
         );
 
@@ -526,6 +680,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_terminates_and_removes_active_session() -> Result<()> {
         let manager = SessionManager::new();
+        let mut events_rx = manager.event_receiver();
         let (program, args) = shell_command(&long_running_script());
         let request =
             SessionStartRequest::new("sess-stop", program, args, PathBuf::from("."), env_map())
@@ -535,7 +690,17 @@ mod tests {
         assert!(manager.is_active("sess-stop").await);
 
         manager.stop("sess-stop").await?;
-        assert!(!manager.is_active("sess-stop").await);
+        let finished_events = recv_events_until_finished(&mut events_rx, "sess-stop", 10_000).await;
+        assert!(
+            finished_events
+                .iter()
+                .any(|event| matches!(event.event, IpcEvent::CommandFinished(_))),
+            "expected command finished after stop"
+        );
+        assert!(
+            wait_for_session_inactive(&manager, "sess-stop", 5_000).await,
+            "session should become inactive after stop"
+        );
 
         let reattach_result = manager.reattach("sess-stop").await;
         assert!(matches!(
@@ -549,6 +714,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn duplicate_session_ids_are_rejected() -> Result<()> {
         let manager = SessionManager::new();
+        let mut events_rx = manager.event_receiver();
         let (program, args) = shell_command(&long_running_script());
         let request = SessionStartRequest::new(
             "sess-dup",
@@ -571,6 +737,170 @@ mod tests {
         ));
 
         manager.stop("sess-dup").await?;
+        let _ = recv_events_until_finished(&mut events_rx, "sess-dup", 10_000).await;
+        assert!(wait_for_session_inactive(&manager, "sess-dup", 5_000).await);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_does_not_corrupt_future_session_with_same_id() -> Result<()> {
+        let manager = SessionManager::new();
+        let mut events_rx = manager.event_receiver();
+        let first_marker = "cancel_first_start";
+        let (program, args) = shell_command(&long_running_script_with_marker_start(first_marker));
+        manager
+            .start(
+                SessionStartRequest::new(
+                    "sess-cancel-reuse",
+                    program,
+                    args,
+                    PathBuf::from("."),
+                    env_map(),
+                )
+                .with_mode(SessionMode::Pipe),
+            )
+            .await?;
+
+        manager.cancel("sess-cancel-reuse").await?;
+        let first_run_events =
+            recv_events_until_finished(&mut events_rx, "sess-cancel-reuse", 10_000).await;
+        assert!(
+            first_run_events
+                .iter()
+                .any(|event| matches!(event.event, IpcEvent::CommandFinished(_))),
+            "expected first cancelled run to emit command finished"
+        );
+        assert!(
+            wait_for_session_inactive(&manager, "sess-cancel-reuse", 5_000).await,
+            "expected first cancelled run to fully leave session map"
+        );
+
+        let second_marker = "cancel_reuse_second_ok";
+        let (program, args) = shell_command(&delayed_echo_script(second_marker));
+        manager
+            .start(
+                SessionStartRequest::new(
+                    "sess-cancel-reuse",
+                    program,
+                    args,
+                    PathBuf::from("."),
+                    env_map(),
+                )
+                .with_mode(SessionMode::Pipe),
+            )
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_second_output = false;
+        let mut saw_second_finished = false;
+        while tokio::time::Instant::now() < deadline {
+            if saw_second_output && saw_second_finished {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, events_rx.recv()).await {
+                Ok(Ok(message)) => {
+                    if command_id_for_event(&message.event) != Some("sess-cancel-reuse") {
+                        continue;
+                    }
+                    match &message.event {
+                        IpcEvent::CommandOutputChunk(event)
+                            if event.chunk.contains(second_marker) =>
+                        {
+                            saw_second_output = true;
+                        }
+                        IpcEvent::CommandFinished(event) if event.exit_code == 0 => {
+                            saw_second_finished = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_second_output,
+            "expected second run output marker for reused session id"
+        );
+        assert!(
+            saw_second_finished,
+            "expected second run to finish successfully"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_session_appends_failed_audit_record() -> Result<()> {
+        let temp = TempDir::new()?;
+        let audit_path = temp.path().join("audit.jsonl");
+        let audit_logger = AuditLogger::open(&audit_path).await?;
+        let manager = SessionManager::with_audit_logger(audit_logger);
+        let mut events_rx = manager.event_receiver();
+
+        let context = SessionAuditContext {
+            action_kind: ActionKind::ExecuteCommand,
+            target: "long_running_task".to_string(),
+            profile: PermissionProfile::ReadWriteWithApproval,
+            policy_decision: PolicyDecision::RequireApproval,
+            approval_decision: ApprovalDecision::Approved,
+        };
+
+        let (program, args) = shell_command(&long_running_script());
+        manager
+            .start(
+                SessionStartRequest::new(
+                    "sess-audit-cancel",
+                    program,
+                    args,
+                    PathBuf::from("."),
+                    HashMap::new(),
+                )
+                .with_mode(SessionMode::Pipe)
+                .with_audit_context(context),
+            )
+            .await?;
+
+        manager.cancel("sess-audit-cancel").await?;
+        let _ = recv_events_until_finished(&mut events_rx, "sess-audit-cancel", 10_000).await;
+        assert!(wait_for_session_inactive(&manager, "sess-audit-cancel", 5_000).await);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut parsed: Vec<Value> = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let text = tokio::fs::read_to_string(&audit_path)
+                .await
+                .unwrap_or_default();
+            parsed = text
+                .lines()
+                .map(serde_json::from_str::<Value>)
+                .filter_map(Result::ok)
+                .collect();
+            if !parsed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(!parsed.is_empty(), "expected at least one audit record");
+        let entry = parsed
+            .iter()
+            .find(|item| {
+                item.get("session_id").and_then(Value::as_str) == Some("sess-audit-cancel")
+            })
+            .expect("audit entry for cancelled session should exist");
+        assert_eq!(
+            entry.get("result_status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            entry.get("approval_decision").and_then(Value::as_str),
+            Some("approved")
+        );
 
         Ok(())
     }

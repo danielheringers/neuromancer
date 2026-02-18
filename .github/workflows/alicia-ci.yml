@@ -126,6 +126,9 @@ jobs:
       - name: E2E denied and expired
         run: cargo test -p codex-alicia-ui e2e_denied_and_expired_blocked_audit -- --exact
 
+      - name: E2E safe cancel
+        run: cargo test -p codex-alicia-ui e2e_safe_cancel_persists_final_audit_state -- --exact
+
       - name: E2E summary
         if: always()
         shell: pwsh
@@ -133,3 +136,4 @@ jobs:
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Alicia E2E Flow - ${{ matrix.os }}"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- e2e_happy_path_approval_execution_and_audit"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- e2e_denied_and_expired_blocked_audit"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- e2e_safe_cancel_persists_final_audit_state"
