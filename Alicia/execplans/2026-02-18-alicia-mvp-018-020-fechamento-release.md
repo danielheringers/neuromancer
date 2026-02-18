@@ -16,6 +16,8 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:26Z) Lint e formatacao executados no escopo AlicIA (`cargo clippy --fix ... -p codex-alicia-ui`; `cargo fmt --all` como fallback de Windows).
 - [x] (2026-02-18 12:36Z) Delta local publicado em PR contra `main`: `https://github.com/danielheringers/neuromancer/pull/13`.
 - [x] (2026-02-18 12:36Z) Revalidacao completa do workflow `alicia-ci` no evento `pull_request` concluida com sucesso (9 jobs verdes): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352`.
+- [x] (2026-02-18 12:47Z) Diagnostico de falha na rodada seguinte de CI (`run 22140035071`): `start_pipe_session_emits_started_output_and_finished_events` falhou de forma intermitente no Ubuntu (`missing command output event with marker`).
+- [x] (2026-02-18 12:47Z) Ajuste aplicado no teste de `codex-alicia-core` para esperar eventos esperados sem depender da ordem `output` vs `finished`; validado localmente com 12 repeticoes do teste e regressao dos crates AlicIA.
 - [ ] Consolidar notas de release/changelog da candidata e atualizar estado final no checklist `Alicia/12` (concluido: checklist e pacote de evidencias atualizados; restante: release notes/changelog final).
 - [x] (2026-02-18 12:36Z) Decisao sobre risco residual do adapter `claude-code` registrada: risco aceito temporariamente ate validacao em host com binario real.
 
@@ -35,6 +37,8 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Evidence: `gh auth status` retorna `The term 'gh' is not recognized...`.
 - Observation: O host atual tambem nao tem `claude-code` instalado.
   Evidence: `claude-code --version` retorna `The term 'claude-code' is not recognized...`.
+- Observation: O teste `start_pipe_session_emits_started_output_and_finished_events` era sensivel a ordem de chegada dos eventos e podia encerrar leitura cedo demais ao ver `CommandFinished` antes de `CommandOutputChunk`.
+  Evidence: falha no CI: `missing command output event with marker`; ao repetir localmente apos ajuste, 12/12 execucoes passaram.
 
 ## Decision Log
 
@@ -54,6 +58,9 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Date/Author: 2026-02-18 / Codex
 - Decision: Classificar o risco de `claude-code` como aceito temporariamente nesta iteracao, com validacao real adiada para host apropriado antes da release final.
   Rationale: A validacao nao pode ser executada neste host por ausencia do binario; o risco permanece explicitado no checklist e pacote de PR.
+  Date/Author: 2026-02-18 / Codex
+- Decision: Tornar o teste de sessao em pipe independente da ordem relativa entre `CommandOutputChunk` e `CommandFinished`.
+  Rationale: Em execucao concorrente, o watcher de exit pode publicar `finished` antes do forwarder de output publicar o chunk final; o teste deve validar comportamento observavel sem assumir ordenacao estrita.
   Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
@@ -225,3 +232,4 @@ Update note (2026-02-18 12:23Z): Plano criado para transformar pendencias operac
 
 Update note (2026-02-18 12:26Z): Progresso atualizado com validacao local concluida (testes, clippy e formatacao) e descoberta operacional do fallback `cargo fmt --all` no Windows.
 Update note (2026-02-18 12:36Z): Progresso atualizado com PR aberto (#13), CI `pull_request` 9/9 verde e decisao explicita de risco residual para `claude-code`; docs `Alicia/12` e `Alicia/13` sincronizadas.
+Update note (2026-02-18 12:47Z): Plano atualizado com diagnostico da falha intermitente no CI, correcao do teste em `codex-alicia-core` e nova rodada de validacao local.

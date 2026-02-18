@@ -602,23 +602,45 @@ mod tests {
 
         manager.start(request).await?;
 
-        let events = recv_events_until_finished(&mut events_rx, "sess-pipe", 10_000).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_started = false;
+        let mut saw_output = false;
+        let mut saw_finished = false;
+        while tokio::time::Instant::now() < deadline {
+            if saw_started && saw_output && saw_finished {
+                break;
+            }
+
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, events_rx.recv()).await {
+                Ok(Ok(message)) => {
+                    if command_id_for_event(&message.event) != Some("sess-pipe") {
+                        continue;
+                    }
+                    match &message.event {
+                        IpcEvent::CommandStarted(event) if event.command_id == "sess-pipe" => {
+                            saw_started = true;
+                        }
+                        IpcEvent::CommandOutputChunk(event) if event.chunk.contains(marker) => {
+                            saw_output = true;
+                        }
+                        IpcEvent::CommandFinished(event) if event.exit_code == 0 => {
+                            saw_finished = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_started, "missing command started event");
+        assert!(saw_output, "missing command output event with marker");
         assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandStarted(event) if event.command_id == "sess-pipe")
-            ),
-            "missing command started event"
-        );
-        assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandOutputChunk(event) if event.chunk.contains(marker))
-            ),
-            "missing command output event with marker"
-        );
-        assert!(
-            events.iter().any(
-                |message| matches!(&message.event, IpcEvent::CommandFinished(event) if event.exit_code == 0)
-            ),
+            saw_finished,
             "missing command finished event with exit code 0"
         );
 
