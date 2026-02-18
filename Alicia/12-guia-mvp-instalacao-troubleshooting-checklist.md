@@ -159,28 +159,40 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 ## 4) Checklist pre-release MVP (Go/No-Go)
 
 ## Qualidade e regressao
-- [ ] `suite_minima` verde em Windows, macOS e Linux.
-- [ ] `policy_approval_scenarios` verde em Windows, macOS e Linux.
-- [ ] `e2e_flow` verde em Windows, macOS e Linux.
-- [ ] Sem regressao funcional nos crates `codex-alicia-core`, `codex-alicia-adapters`, `codex-alicia-ui`.
+- [x] `suite_minima` verde em Windows, macOS e Linux.
+- [x] `policy_approval_scenarios` verde em Windows, macOS e Linux.
+- [x] `e2e_flow` verde em Windows, macOS e Linux.
+- [x] Sem regressao funcional nos crates `codex-alicia-core`, `codex-alicia-adapters`, `codex-alicia-ui`.
 
 ## Seguranca
-- [ ] Fluxo de aprovacao cobre `approved`, `denied` e `expired`.
-- [ ] Bloqueio fora do workspace validado por teste.
-- [ ] Auditoria JSONL inclui `policy_decision`, `approval_decision` e `result_status`.
-- [ ] Sem segredo em logs de auditoria (redaction ativa).
+- [x] Fluxo de aprovacao cobre `approved`, `denied` e `expired`.
+- [x] Bloqueio fora do workspace validado por teste.
+- [x] Auditoria JSONL inclui `policy_decision`, `approval_decision` e `result_status`.
+- [x] Sem segredo em logs de auditoria (redaction ativa).
 
 ## Runtime e UX minima
-- [ ] Terminal integrado recebe output em tempo real sem congelar.
-- [ ] Input do usuario chega na sessao ativa correta.
-- [ ] Timeline atualiza em ordem de eventos.
-- [ ] Diff preview por arquivo visivel antes de aplicar.
+- [x] Terminal integrado recebe output em tempo real sem congelar.
+- [x] Input do usuario chega na sessao ativa correta.
+- [x] Timeline atualiza em ordem de eventos.
+- [x] Diff preview por arquivo visivel antes de aplicar.
 
 ## Release e documentacao
-- [ ] `Alicia/07-plano-release-oss.md` revisado.
-- [ ] Este guia revisado e atualizado para a versao candidata.
+- [x] `Alicia/07-plano-release-oss.md` revisado.
+- [x] Este guia revisado e atualizado para a versao candidata.
 - [ ] Notas de release/changelog preenchidas.
-- [ ] Evidencias de CI anexadas (links dos jobs por SO).
+- [x] Evidencias de CI anexadas (links dos jobs por SO).
+
+## Estado de validacao (2026-02-18)
+1. Run `alicia-ci` com 9/9 jobs verdes:
+- `https://github.com/danielheringers/neuromancer/actions/runs/22135313223`
+2. Regressao local complementar apos sync:
+- `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui`
+3. Smoke complementar com auditoria JSONL:
+- comando:
+```powershell
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-20260218-sync --audit-path ./.codex/alicia-smoke-audit-sync.jsonl -- cmd /C echo ALICIA_AUDIT_SYNC_OK
+```
+- artefato: `codex-rs/.codex/alicia-smoke-audit-sync.jsonl`
 
 ## 5) Evidencias recomendadas para aprovacao de release
 1. URL do workflow `alicia-ci` com os 3 jobs (`suite_minima`, `policy_approval_scenarios`, `e2e_flow`) verdes.
