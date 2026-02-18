@@ -9,23 +9,32 @@ use codex_alicia_core::IpcEvent;
 use pretty_assertions::assert_eq;
 use semver::Version;
 
-fn detect_claude_executable() -> String {
-    if let Ok(executable) = env::var("ALICIA_CLAUDE_CODE_BIN") {
+fn resolve_claude_executable<F>(env_override: Option<String>, mut can_execute: F) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    if let Some(executable) = env_override {
         return executable;
     }
+
     for candidate in ["claude", "claude-code"] {
-        let status = Command::new(candidate)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if let Ok(status) = status
-            && status.success()
-        {
+        if can_execute(candidate) {
             return candidate.to_string();
         }
     }
+
     "claude".to_string()
+}
+
+fn detect_claude_executable() -> String {
+    resolve_claude_executable(env::var("ALICIA_CLAUDE_CODE_BIN").ok(), |candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
 }
 
 #[tokio::test]
@@ -67,4 +76,30 @@ async fn real_provider_claude_code_smoke() -> Result<()> {
     assert_eq!(finished.exit_code, 0);
 
     Ok(())
+}
+
+#[test]
+fn resolve_claude_executable_uses_explicit_override() {
+    let executable = resolve_claude_executable(Some("custom-claude-bin".to_string()), |_| false);
+    assert_eq!(executable, "custom-claude-bin");
+}
+
+#[test]
+fn resolve_claude_executable_prefers_claude_when_both_are_available() {
+    let executable = resolve_claude_executable(None, |candidate| {
+        matches!(candidate, "claude" | "claude-code")
+    });
+    assert_eq!(executable, "claude");
+}
+
+#[test]
+fn resolve_claude_executable_falls_back_to_claude_code_when_claude_is_missing() {
+    let executable = resolve_claude_executable(None, |candidate| candidate == "claude-code");
+    assert_eq!(executable, "claude-code");
+}
+
+#[test]
+fn resolve_claude_executable_defaults_to_claude_when_no_candidate_is_available() {
+    let executable = resolve_claude_executable(None, |_| false);
+    assert_eq!(executable, "claude");
 }
