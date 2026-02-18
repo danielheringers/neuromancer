@@ -14,6 +14,9 @@ permissions:
 jobs:
   codespell:
     name: Check for spelling errors
+    # Repository docs include Portuguese content for AlicIA planning, so keep
+    # this workflow upstream-scoped by default.
+    if: ${{ github.repository_owner == 'openai' }}
     runs-on: ubuntu-latest
 
     steps:

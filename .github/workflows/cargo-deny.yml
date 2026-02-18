@@ -8,6 +8,8 @@ on:
 
 jobs:
   cargo-deny:
+    # Keep upstream dependency policy checks in canonical repository CI.
+    if: ${{ github.repository_owner == 'openai' }}
     runs-on: ubuntu-latest
     defaults:
       run:
