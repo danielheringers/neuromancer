@@ -1,4 +1,6 @@
 use std::env;
+use std::process::Command;
+use std::process::Stdio;
 
 use anyhow::Result;
 use anyhow::bail;
@@ -6,6 +8,25 @@ use codex_alicia_adapters::ClaudeCodeAdapter;
 use codex_alicia_core::IpcEvent;
 use pretty_assertions::assert_eq;
 use semver::Version;
+
+fn detect_claude_executable() -> String {
+    if let Ok(executable) = env::var("ALICIA_CLAUDE_CODE_BIN") {
+        return executable;
+    }
+    for candidate in ["claude", "claude-code"] {
+        let status = Command::new(candidate)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Ok(status) = status
+            && status.success()
+        {
+            return candidate.to_string();
+        }
+    }
+    "claude".to_string()
+}
 
 #[tokio::test]
 async fn real_provider_claude_code_smoke() -> Result<()> {
@@ -16,7 +37,7 @@ async fn real_provider_claude_code_smoke() -> Result<()> {
         return Ok(());
     }
 
-    let executable = env::var("ALICIA_CLAUDE_CODE_BIN").unwrap_or_else(|_| "claude".to_string());
+    let executable = detect_claude_executable();
     let adapter =
         ClaudeCodeAdapter::new(executable).with_minimum_supported_version(Version::new(0, 0, 0));
 

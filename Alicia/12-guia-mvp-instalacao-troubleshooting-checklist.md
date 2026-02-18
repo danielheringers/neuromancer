@@ -152,17 +152,19 @@ claude --version
 ```powershell
 cd codex-rs
 $env:ALICIA_REAL_PROVIDER_CLAUDE_CODE='1'
-$env:ALICIA_CLAUDE_CODE_BIN='claude'
 cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
 ```
 ```bash
 cd codex-rs
-ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 ALICIA_CLAUDE_CODE_BIN=claude cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
 ```
-3. Resultado esperado:
+3. Observacoes operacionais:
+   - o smoke autodetecta `claude` ou `claude-code` quando `ALICIA_CLAUDE_CODE_BIN` nao estiver definido;
+   - usar `ALICIA_CLAUDE_CODE_BIN` apenas para forcar um binario especifico.
+4. Resultado esperado:
    - `test real_provider_claude_code_smoke ... ok`
    - sem `ProviderCommandFailed` no output do teste.
-4. Registrar a evidencia no pacote de PR (`Alicia/13-pr-mvp-018-020.md`) e marcar o item pendente do checklist como concluido.
+5. Registrar a evidencia no pacote de PR (`Alicia/13-pr-mvp-018-020.md`) e marcar o item pendente do checklist como concluido.
 
 ### Erro: aprovacao expira antes da decisao
 1. Conferir `expires_at_unix_s` no evento `approval_requested`.
