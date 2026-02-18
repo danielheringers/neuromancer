@@ -143,6 +143,23 @@ cargo clippy --fix --all-features --tests --allow-dirty -p codex-alicia-ui
 2. Conferir mensagem `UnsupportedProviderVersion` nos adapters.
 3. Atualizar `codex-cli`/`claude-code` para versao minima esperada.
 
+### Validacao real do provider `claude-code` (host alvo de release)
+1. Confirmar que o binario esta acessivel:
+```powershell
+claude-code --version
+```
+2. Executar o smoke real do adapter (teste habilitado por env var):
+```powershell
+cd codex-rs
+$env:ALICIA_REAL_PROVIDER_CLAUDE_CODE='1'
+$env:ALICIA_CLAUDE_CODE_BIN='claude-code'
+cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+```
+3. Resultado esperado:
+   - `test real_provider_claude_code_smoke ... ok`
+   - sem `ProviderCommandFailed` no output do teste.
+4. Registrar a evidencia no pacote de PR (`Alicia/13-pr-mvp-018-020.md`) e marcar o item pendente do checklist como concluido.
+
 ### Erro: aprovacao expira antes da decisao
 1. Conferir `expires_at_unix_s` no evento `approval_requested`.
 2. Confirmar que o clock local da maquina esta correto.
@@ -223,7 +240,7 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 ## Pendente para fechar ciclo atual
 - [x] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
 - [x] Preencher notas de release/changelog para a candidata de release.
-- [ ] Validar provider `claude-code` com binario real no host alvo de release (risco residual operacional; `claude-code --version` retorna `command not found` no host atual).
+- [ ] Validar provider `claude-code` com binario real no host alvo de release (executar `real_provider_claude_code_smoke` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs`; no host atual `claude-code --version` retorna `command not found`).
 
 
 ## 5) Evidencias recomendadas para aprovacao de release

@@ -21,6 +21,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:59Z) Notas de release/changelog da candidata consolidadas em `Alicia/15-notas-release-candidata-mvp-018-020.md` e checklist atualizado.
 - [x] (2026-02-18 12:36Z) Decisao sobre risco residual do adapter `claude-code` registrada: risco aceito temporariamente ate validacao em host com binario real.
 - [x] (2026-02-18 12:59Z) Revalidacao final de CI apos fix de intermitencia concluida com sucesso (run `19`, 9/9): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314`.
+- [x] (2026-02-18 13:11Z) Adicionado smoke test real opt-in para `claude-code` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs` e procedimento de fechamento do risco sincronizado em `Alicia/12` e `Alicia/13`.
 
 ## Surprises & Discoveries
 
@@ -62,6 +63,9 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Date/Author: 2026-02-18 / Codex
 - Decision: Tornar o teste de sessao em pipe independente da ordem relativa entre `CommandOutputChunk` e `CommandFinished`.
   Rationale: Em execucao concorrente, o watcher de exit pode publicar `finished` antes do forwarder de output publicar o chunk final; o teste deve validar comportamento observavel sem assumir ordenacao estrita.
+  Date/Author: 2026-02-18 / Codex
+- Decision: Criar um smoke test real de provider controlado por env var para `claude-code`, em vez de depender apenas de validacao manual ad hoc.
+  Rationale: A pendencia vira um procedimento reproduzivel com criterio de aceite claro (`cargo test ... real_provider_claude_code_smoke`) assim que houver host com binario.
   Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
@@ -236,3 +240,4 @@ Update note (2026-02-18 12:26Z): Progresso atualizado com validacao local conclu
 Update note (2026-02-18 12:36Z): Progresso atualizado com PR aberto (#13), CI `pull_request` 9/9 verde e decisao explicita de risco residual para `claude-code`; docs `Alicia/12` e `Alicia/13` sincronizadas.
 Update note (2026-02-18 12:47Z): Plano atualizado com diagnostico da falha intermitente no CI, correcao do teste em `codex-alicia-core` e nova rodada de validacao local.
 Update note (2026-02-18 12:59Z): Plano atualizado com release notes da candidata (`Alicia/15`), checklist sincronizado e revalidacao final de CI verde (run 19).
+Update note (2026-02-18 13:11Z): Plano atualizado com smoke test real opt-in do provider `claude-code` e runbook objetivo para fechar o risco residual em host alvo.
