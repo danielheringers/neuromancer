@@ -1,6 +1,6 @@
 # AlicIA - Guia MVP (Instalacao, Troubleshooting e Pre-Release)
 
-Data de referencia: 2026-02-17
+Data de referencia: 2026-02-18
 
 ## Escopo
 Este guia operacional cobre o item `ALICIA-MVP-020`:
@@ -181,6 +181,7 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 - [x] Este guia revisado e atualizado para a versao candidata.
 - [ ] Notas de release/changelog preenchidas.
 - [x] Evidencias de CI anexadas (links dos jobs por SO).
+- [ ] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
 
 ## Estado de validacao (2026-02-18)
 1. Run `alicia-ci` com 9/9 jobs verdes:
@@ -194,8 +195,25 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 ```
 - artefato: `codex-rs/.codex/alicia-smoke-audit-sync.jsonl`
 
+## 4.1) Consolidado para planejamento de continuidade (2026-02-18)
+
+## Concluido (base MVP + P1 imediato)
+- [x] `ALICIA-MVP-001` a `ALICIA-MVP-020` implementados e documentados no backlog.
+- [x] `ALICIA-P1-021` a `ALICIA-P1-024` implementados (diff por hunk, policy por projeto, cancelamento seguro e mensagens para iniciantes).
+- [x] Regressao local dos crates AlicIA executada:
+  - `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui`
+- [x] Reforco de policy no runtime/UI validado localmente com:
+  - `cargo test -p codex-alicia-ui`
+
+## Pendente para fechar ciclo atual
+- [ ] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
+- [ ] Preencher notas de release/changelog para a candidata de release.
+- [ ] Validar provider `claude-code` com binario real no host alvo de release (risco residual operacional).
+
+
 ## 5) Evidencias recomendadas para aprovacao de release
 1. URL do workflow `alicia-ci` com os 3 jobs (`suite_minima`, `policy_approval_scenarios`, `e2e_flow`) verdes.
 2. Hash/tag candidata de release.
 3. Registro do smoke manual (um caso feliz + um caso negado/expirado).
 4. Exemplo de linha de auditoria validada no artefato JSONL.
+

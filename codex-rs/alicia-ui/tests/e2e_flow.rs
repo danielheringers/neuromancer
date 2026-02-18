@@ -71,26 +71,25 @@ async fn e2e_happy_path_approval_execution_and_audit() -> Result<(), Box<dyn std
         runtime
             .store()
             .permission_profile()
-            .decision_for(ActionKind::WriteFile),
+            .decision_for(ActionKind::ExecuteCommand),
         PolicyDecision::RequireApproval
     );
+
+    let marker = "alicia_e2e_happy_ok";
+    let (program, args) = shell_echo_command(marker);
+    let mut command = vec![program.clone()];
+    command.extend(args.clone());
 
     runtime
         .store_mut()
         .push(IpcMessage::new(IpcEvent::ActionProposed(ActionProposed {
             action_id: String::from("act-e2e-happy"),
-            action_kind: ActionKind::WriteFile,
-            target: String::from("src/main.rs"),
+            action_kind: ActionKind::ExecuteCommand,
+            target: command.join(" "),
         })));
-    runtime.store_mut().attach_approval_command(
-        String::from("act-e2e-happy"),
-        vec![
-            String::from("cargo"),
-            String::from("test"),
-            String::from("-p"),
-            String::from("codex-alicia-ui"),
-        ],
-    );
+    runtime
+        .store_mut()
+        .attach_approval_command(String::from("act-e2e-happy"), command);
     runtime
         .store_mut()
         .push(IpcMessage::new(IpcEvent::ApprovalRequested(
@@ -110,8 +109,6 @@ async fn e2e_happy_path_approval_execution_and_audit() -> Result<(), Box<dyn std
     ));
     assert_eq!(runtime.store().pending_approval_count(), 0);
 
-    let marker = "alicia_e2e_happy_ok";
-    let (program, args) = shell_echo_command(marker);
     runtime
         .start_session(
             SessionStartRequest::new(
@@ -366,6 +363,28 @@ async fn e2e_safe_cancel_persists_final_audit_state() -> Result<(), Box<dyn std:
 
     let marker = "alicia_cancel_start";
     let (program, args) = shell_long_running_command_with_start_marker(marker);
+    let mut command = vec![program.clone()];
+    command.extend(args.clone());
+    runtime
+        .store_mut()
+        .push(IpcMessage::new(IpcEvent::ActionProposed(ActionProposed {
+            action_id: String::from("act-e2e-cancel"),
+            action_kind: ActionKind::ExecuteCommand,
+            target: command.join(" "),
+        })));
+    runtime
+        .store_mut()
+        .attach_approval_command(String::from("act-e2e-cancel"), command);
+    runtime
+        .store_mut()
+        .push(IpcMessage::new(IpcEvent::ApprovalRequested(
+            ApprovalRequested {
+                action_id: String::from("act-e2e-cancel"),
+                summary: String::from("Executar comando para testar cancelamento"),
+                expires_at_unix_s: 4_102_444_800,
+            },
+        )));
+    runtime.store_mut().approve("act-e2e-cancel")?;
     runtime
         .start_session(
             SessionStartRequest::new(

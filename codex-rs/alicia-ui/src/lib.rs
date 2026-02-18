@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use codex_alicia_core::ActionKind;
@@ -13,9 +14,11 @@ use codex_alicia_core::IpcMessage;
 use codex_alicia_core::PermissionProfile;
 use codex_alicia_core::PolicyDecision;
 use codex_alicia_core::ResultStatus;
+use codex_alicia_core::SessionAuditContext;
 use codex_alicia_core::SessionManager;
 use codex_alicia_core::SessionManagerError;
 use codex_alicia_core::SessionStartRequest;
+use codex_alicia_core::ensure_target_in_workspace;
 use codex_alicia_core::ipc::ActionProposed;
 use codex_alicia_core::ipc::ApprovalRequested;
 use codex_alicia_core::ipc::ApprovalResolved;
@@ -24,6 +27,8 @@ use codex_alicia_core::ipc::CommandOutputChunk;
 use codex_alicia_core::ipc::CommandStarted;
 use codex_alicia_core::ipc::PatchApplied;
 use codex_alicia_core::ipc::PatchPreviewReady;
+use codex_alicia_core::network_decision_for_profile;
+use codex_alicia_core::resolve_effective_profile;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -249,6 +254,21 @@ impl UiEventStoreError {
 pub enum AliciaUiRuntimeError {
     #[error("{0}")]
     SessionManager(#[from] SessionManagerError),
+    #[error("failed to resolve effective profile for workspace `{workspace}`: {source}")]
+    ResolveProfileFailed {
+        workspace: String,
+        #[source]
+        source: codex_alicia_core::ProjectPolicyConfigError,
+    },
+    #[error("workspace guard blocked session `{session_id}` for cwd `{cwd}`: {source}")]
+    WorkspaceGuardBlocked {
+        session_id: String,
+        cwd: String,
+        #[source]
+        source: codex_alicia_core::PolicyBridgeError,
+    },
+    #[error("command execution blocked for session `{session_id}`: {reason}")]
+    CommandBlocked { session_id: String, reason: String },
     #[error("timed out waiting for session `{session_id}` to finish after cancellation")]
     SessionStopTimeout { session_id: String },
     #[error("failed to persist audit record for session `{session_id}`: {source}")]
@@ -280,6 +300,18 @@ impl AliciaUiRuntimeError {
                     "Confirme o comando e o diretorio de trabalho antes de tentar de novo.",
                 ),
             },
+            Self::ResolveProfileFailed { .. } => beginner_error_message(
+                "Nao consegui carregar a politica efetiva do projeto.",
+                "Revise o arquivo .codex/alicia-policy.toml e tente novamente.",
+            ),
+            Self::WorkspaceGuardBlocked { .. } => beginner_error_message(
+                "A sessao foi bloqueada por tentar usar caminho fora do workspace.",
+                "Use um diretorio dentro do workspace atual.",
+            ),
+            Self::CommandBlocked { reason, .. } => beginner_error_message(
+                &format!("A execucao foi bloqueada pela policy: {reason}"),
+                "Aprove explicitamente a acao ou ajuste o perfil de permissao.",
+            ),
             Self::SessionStopTimeout { .. } => beginner_error_message(
                 "A sessao demorou demais para encerrar.",
                 "Tente cancelar novamente ou finalize o processo manualmente no sistema.",
@@ -686,6 +718,50 @@ impl UiEventStore {
         }
     }
 
+    pub fn resolved_approval_decision_for_command(
+        &self,
+        command: &[String],
+    ) -> Option<ApprovalDecision> {
+        for message in self.events.iter().rev() {
+            let IpcEvent::ApprovalResolved(event) = &message.event else {
+                continue;
+            };
+            let Some(approval) = self.approvals.get(&event.action_id) else {
+                continue;
+            };
+            if approval
+                .command
+                .as_ref()
+                .is_none_or(|stored| stored != command)
+            {
+                continue;
+            }
+            return Some(match event.resolution {
+                ApprovalResolution::Approved => ApprovalDecision::Approved,
+                ApprovalResolution::Denied => ApprovalDecision::Denied,
+                ApprovalResolution::Expired => ApprovalDecision::Expired,
+            });
+        }
+
+        for approval in self.approvals.values() {
+            if approval
+                .command
+                .as_ref()
+                .is_none_or(|stored| stored != command)
+            {
+                continue;
+            }
+            match approval.status {
+                ApprovalStatus::Pending => {}
+                ApprovalStatus::Approved => return Some(ApprovalDecision::Approved),
+                ApprovalStatus::Denied => return Some(ApprovalDecision::Denied),
+                ApprovalStatus::Expired => return Some(ApprovalDecision::Expired),
+            }
+        }
+
+        None
+    }
+
     pub fn resolve_pending_approval(
         &mut self,
         action_id: &str,
@@ -998,17 +1074,25 @@ pub struct AliciaUiRuntime {
     events_rx: tokio::sync::broadcast::Receiver<IpcMessage>,
     store: UiEventStore,
     audit_logger: Option<AuditLogger>,
+    workspace_root: PathBuf,
 }
 
 impl AliciaUiRuntime {
     pub fn new(session_manager: SessionManager, max_scrollback_lines: usize) -> Self {
         let events_rx = session_manager.event_receiver();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             session_manager,
             events_rx,
             store: UiEventStore::new(max_scrollback_lines),
             audit_logger: None,
+            workspace_root,
         }
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = workspace_root;
+        self
     }
 
     pub fn with_audit_logger(mut self, audit_logger: AuditLogger) -> Self {
@@ -1032,7 +1116,63 @@ impl AliciaUiRuntime {
         &mut self,
         request: SessionStartRequest,
     ) -> Result<(), AliciaUiRuntimeError> {
+        let mut request = request;
         let session_id = request.session_id.clone();
+        let command = command_tokens(&request.program, &request.args);
+        let command_target = command_target(
+            &request.program,
+            &request.args,
+            request.audit_context.target.as_str(),
+        );
+        let guard =
+            ensure_target_in_workspace(&self.workspace_root, &request.cwd).map_err(|source| {
+                AliciaUiRuntimeError::WorkspaceGuardBlocked {
+                    session_id: session_id.clone(),
+                    cwd: request.cwd.to_string_lossy().to_string(),
+                    source,
+                }
+            })?;
+        request.cwd = guard.canonical_target;
+
+        let fallback_profile = self.store.permission_profile();
+        let effective_profile = resolve_effective_profile(&self.workspace_root, fallback_profile)
+            .map_err(|source| AliciaUiRuntimeError::ResolveProfileFailed {
+            workspace: self.workspace_root.to_string_lossy().to_string(),
+            source,
+        })?;
+        self.store.set_permission_profile(effective_profile);
+
+        let exec_decision = effective_profile.decision_for(ActionKind::ExecuteCommand);
+        let network_decision = network_decision_for_profile(effective_profile);
+        let policy_decision = combine_policy_decisions(exec_decision, network_decision);
+        let store_approval_decision = self.store.resolved_approval_decision_for_command(&command);
+        let requested_approval_decision = selected_approval_decision(
+            request.audit_context.approval_decision,
+            store_approval_decision,
+        );
+        let approval_decision =
+            effective_approval_decision(policy_decision, requested_approval_decision);
+
+        if let Some(reason) = blocked_reason(policy_decision, approval_decision) {
+            self.record_blocked_audit(
+                &session_id,
+                command_target.as_str(),
+                effective_profile,
+                policy_decision,
+                approval_decision,
+            )
+            .await?;
+            return Err(AliciaUiRuntimeError::CommandBlocked { session_id, reason });
+        }
+
+        request.audit_context = SessionAuditContext {
+            action_kind: ActionKind::ExecuteCommand,
+            target: command_target,
+            profile: effective_profile,
+            policy_decision,
+            approval_decision,
+        };
+
         self.session_manager.start(request).await?;
         self.bind_session_input(&session_id).await?;
         self.pump_events();
@@ -1093,6 +1233,36 @@ impl AliciaUiRuntime {
         }
 
         processed
+    }
+
+    async fn record_blocked_audit(
+        &mut self,
+        session_id: &str,
+        target: &str,
+        profile: PermissionProfile,
+        policy_decision: PolicyDecision,
+        approval_decision: ApprovalDecision,
+    ) -> Result<(), AliciaUiRuntimeError> {
+        let record = AuditRecord::new(
+            session_id,
+            ActionKind::ExecuteCommand,
+            target,
+            profile,
+            policy_decision,
+            approval_decision,
+            ResultStatus::Blocked,
+            0,
+        );
+        if let Some(audit_logger) = self.audit_logger.clone() {
+            audit_logger.append(&record).await.map_err(|source| {
+                AliciaUiRuntimeError::AuditWriteFailed {
+                    session_id: session_id.to_string(),
+                    source,
+                }
+            })?;
+        }
+        self.store.add_audit_record(record);
+        Ok(())
     }
 
     async fn wait_for_session_finished_event(
@@ -1473,6 +1643,77 @@ impl AliciaEguiView {
     }
 }
 
+fn command_target(program: &str, args: &[String], audit_target: &str) -> String {
+    if audit_target.is_empty() {
+        command_tokens(program, args).join(" ")
+    } else {
+        audit_target.to_string()
+    }
+}
+
+fn command_tokens(program: &str, args: &[String]) -> Vec<String> {
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(program.to_string());
+    command.extend(args.iter().cloned());
+    command
+}
+
+fn selected_approval_decision(
+    requested_decision: ApprovalDecision,
+    store_decision: Option<ApprovalDecision>,
+) -> ApprovalDecision {
+    if let Some(store_decision) = store_decision {
+        store_decision
+    } else {
+        requested_decision
+    }
+}
+
+fn combine_policy_decisions(
+    exec_decision: PolicyDecision,
+    network_decision: PolicyDecision,
+) -> PolicyDecision {
+    match (exec_decision, network_decision) {
+        (PolicyDecision::Deny, _) | (_, PolicyDecision::Deny) => PolicyDecision::Deny,
+        (PolicyDecision::RequireApproval, _) | (_, PolicyDecision::RequireApproval) => {
+            PolicyDecision::RequireApproval
+        }
+        (PolicyDecision::Allow, PolicyDecision::Allow) => PolicyDecision::Allow,
+    }
+}
+
+fn effective_approval_decision(
+    policy_decision: PolicyDecision,
+    requested_approval_decision: ApprovalDecision,
+) -> ApprovalDecision {
+    match policy_decision {
+        PolicyDecision::Allow | PolicyDecision::Deny => ApprovalDecision::NotRequired,
+        PolicyDecision::RequireApproval => requested_approval_decision,
+    }
+}
+
+fn blocked_reason(
+    policy_decision: PolicyDecision,
+    approval_decision: ApprovalDecision,
+) -> Option<String> {
+    match policy_decision {
+        PolicyDecision::Allow => None,
+        PolicyDecision::Deny => Some(String::from("policy decision is deny")),
+        PolicyDecision::RequireApproval => match approval_decision {
+            ApprovalDecision::Approved => None,
+            ApprovalDecision::NotRequired => Some(String::from(
+                "approval required but no explicit decision was provided",
+            )),
+            ApprovalDecision::Denied => {
+                Some(String::from("approval required and was explicitly denied"))
+            }
+            ApprovalDecision::Expired => {
+                Some(String::from("approval required but the decision expired"))
+            }
+        },
+    }
+}
+
 fn action_kind_name(action_kind: ActionKind) -> &'static str {
     match action_kind {
         ActionKind::ReadFile => "read_file",
@@ -1627,8 +1868,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use codex_alicia_core::ActionKind;
+    use codex_alicia_core::ApprovalDecision;
     use codex_alicia_core::IpcEvent;
     use codex_alicia_core::IpcMessage;
+    use codex_alicia_core::PermissionProfile;
+    use codex_alicia_core::PolicyDecision;
+    use codex_alicia_core::ResultStatus;
     use codex_alicia_core::SessionManager;
     use codex_alicia_core::SessionManagerError;
     use codex_alicia_core::SessionMode;
@@ -1671,6 +1917,19 @@ mod tests {
                     String::from("-c"),
                     String::from("read ALICIA_INPUT; echo $ALICIA_INPUT"),
                 ],
+            )
+        }
+    }
+
+    fn shell_echo_command(marker: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| String::from("cmd.exe"));
+            let script = format!("echo {marker}");
+            (cmd, vec![String::from("/C"), script])
+        } else {
+            (
+                String::from("/bin/sh"),
+                vec![String::from("-c"), format!("echo {marker}")],
             )
         }
     }
@@ -1800,6 +2059,35 @@ mod tests {
         assert_eq!(
             store.approval("act-ctx").map(|item| item.status),
             Some(ApprovalStatus::Approved)
+        );
+    }
+
+    #[test]
+    fn resolved_approval_decision_for_command_reads_approval_state() {
+        let mut store = UiEventStore::default();
+        let command = vec!["cargo".to_string(), "test".to_string()];
+
+        store.push(IpcMessage::new(IpcEvent::ActionProposed(ActionProposed {
+            action_id: "act-command".to_string(),
+            action_kind: ActionKind::ExecuteCommand,
+            target: "cargo test".to_string(),
+        })));
+        store.attach_approval_command("act-command", command.clone());
+        store.push(IpcMessage::new(IpcEvent::ApprovalRequested(
+            ApprovalRequested {
+                action_id: "act-command".to_string(),
+                summary: "Executar comando".to_string(),
+                expires_at_unix_s: 1_735_689_600,
+            },
+        )));
+
+        assert_eq!(store.resolved_approval_decision_for_command(&command), None);
+
+        let approve_result = store.approve("act-command");
+        assert!(approve_result.is_ok());
+        assert_eq!(
+            store.resolved_approval_decision_for_command(&command),
+            Some(ApprovalDecision::Approved)
         );
     }
 
@@ -2003,6 +2291,25 @@ mod tests {
             AliciaUiRuntimeError::SessionManager(SessionManagerError::SessionNotFound(
                 "sess-runtime".to_string(),
             )),
+            AliciaUiRuntimeError::ResolveProfileFailed {
+                workspace: "workspace".to_string(),
+                source: codex_alicia_core::ProjectPolicyConfigError::ReadFailed {
+                    path: ".codex/alicia-policy.toml".to_string(),
+                    source: std::io::Error::other("missing file"),
+                },
+            },
+            AliciaUiRuntimeError::WorkspaceGuardBlocked {
+                session_id: "sess-workspace".to_string(),
+                cwd: "../outside".to_string(),
+                source: codex_alicia_core::PolicyBridgeError::TargetOutsideWorkspace {
+                    workspace: "/repo".to_string(),
+                    target: "/outside".to_string(),
+                },
+            },
+            AliciaUiRuntimeError::CommandBlocked {
+                session_id: "sess-blocked".to_string(),
+                reason: "approval required".to_string(),
+            },
             AliciaUiRuntimeError::SessionStopTimeout {
                 session_id: "sess-timeout".to_string(),
             },
@@ -2026,9 +2333,203 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_blocks_command_without_explicit_approval_in_read_write_profile() {
+        let session_manager = SessionManager::new();
+        let mut runtime = AliciaUiRuntime::new(session_manager, 128);
+        runtime
+            .store_mut()
+            .set_permission_profile(PermissionProfile::ReadWriteWithApproval);
+
+        let (program, args) = shell_echo_command("blocked-by-approval");
+        let session_id = "sess-blocked-approval";
+        let request = SessionStartRequest::new(
+            session_id,
+            program,
+            args,
+            PathBuf::from("."),
+            inherited_env(),
+        )
+        .with_mode(SessionMode::Pipe);
+
+        let result = runtime.start_session(request).await;
+        assert!(matches!(
+            result,
+            Err(AliciaUiRuntimeError::CommandBlocked { .. })
+        ));
+        assert!(!runtime.session_manager().is_active(session_id).await);
+
+        let blocked_record = runtime
+            .store()
+            .audit_records()
+            .iter()
+            .find(|record| record.session_id == session_id);
+        let Some(blocked_record) = blocked_record else {
+            panic!("expected blocked audit record");
+        };
+        assert_eq!(
+            blocked_record.policy_decision,
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            blocked_record.approval_decision,
+            ApprovalDecision::NotRequired
+        );
+        assert_eq!(blocked_record.result_status, ResultStatus::Blocked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_blocks_command_with_denied_approval_in_read_write_profile() {
+        let session_manager = SessionManager::new();
+        let mut runtime = AliciaUiRuntime::new(session_manager, 128);
+        runtime
+            .store_mut()
+            .set_permission_profile(PermissionProfile::ReadWriteWithApproval);
+
+        let marker = "denied-by-policy";
+        let (program, args) = shell_echo_command(marker);
+        let mut command = vec![program.clone()];
+        command.extend(args.clone());
+        runtime
+            .store_mut()
+            .push(IpcMessage::new(IpcEvent::ActionProposed(ActionProposed {
+                action_id: "act-denied-cmd".to_string(),
+                action_kind: ActionKind::ExecuteCommand,
+                target: command.join(" "),
+            })));
+        runtime
+            .store_mut()
+            .attach_approval_command("act-denied-cmd", command);
+        runtime
+            .store_mut()
+            .push(IpcMessage::new(IpcEvent::ApprovalRequested(
+                ApprovalRequested {
+                    action_id: "act-denied-cmd".to_string(),
+                    summary: "executar comando negado".to_string(),
+                    expires_at_unix_s: 4_102_444_800,
+                },
+            )));
+        let deny_result = runtime.store_mut().deny("act-denied-cmd");
+        assert!(deny_result.is_ok(), "expected denial to resolve");
+
+        let session_id = "sess-denied-approval";
+        let request = SessionStartRequest::new(
+            session_id,
+            program,
+            args,
+            PathBuf::from("."),
+            inherited_env(),
+        )
+        .with_mode(SessionMode::Pipe);
+        let result = runtime.start_session(request).await;
+        assert!(matches!(
+            result,
+            Err(AliciaUiRuntimeError::CommandBlocked { .. })
+        ));
+
+        let blocked_record = runtime
+            .store()
+            .audit_records()
+            .iter()
+            .find(|record| record.session_id == session_id);
+        let Some(blocked_record) = blocked_record else {
+            panic!("expected blocked audit record");
+        };
+        assert_eq!(
+            blocked_record.policy_decision,
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(blocked_record.approval_decision, ApprovalDecision::Denied);
+        assert_eq!(blocked_record.result_status, ResultStatus::Blocked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_allows_command_with_resolved_approval_in_read_write_profile() {
+        let session_manager = SessionManager::new();
+        let mut runtime = AliciaUiRuntime::new(session_manager, 128);
+        runtime
+            .store_mut()
+            .set_permission_profile(PermissionProfile::ReadWriteWithApproval);
+
+        let marker = "approved-by-policy";
+        let (program, args) = shell_echo_command(marker);
+        let mut command = vec![program.clone()];
+        command.extend(args.clone());
+        runtime
+            .store_mut()
+            .push(IpcMessage::new(IpcEvent::ActionProposed(ActionProposed {
+                action_id: "act-approved-cmd".to_string(),
+                action_kind: ActionKind::ExecuteCommand,
+                target: command.join(" "),
+            })));
+        runtime
+            .store_mut()
+            .attach_approval_command("act-approved-cmd", command);
+        runtime
+            .store_mut()
+            .push(IpcMessage::new(IpcEvent::ApprovalRequested(
+                ApprovalRequested {
+                    action_id: "act-approved-cmd".to_string(),
+                    summary: "executar comando aprovado".to_string(),
+                    expires_at_unix_s: 4_102_444_800,
+                },
+            )));
+        let approve_result = runtime.store_mut().approve("act-approved-cmd");
+        assert!(approve_result.is_ok(), "expected approval to resolve");
+
+        let request = SessionStartRequest::new(
+            "sess-approved-approval",
+            program,
+            args,
+            PathBuf::from("."),
+            inherited_env(),
+        )
+        .with_mode(SessionMode::Pipe);
+
+        if let Err(error) = runtime.start_session(request).await {
+            panic!("expected approved execution to start: {error}");
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_marker = false;
+        let mut finished_ok = false;
+        while tokio::time::Instant::now() < deadline {
+            runtime.pump_events();
+            if let Some(text) = runtime.store().active_terminal_text()
+                && text.contains(marker)
+            {
+                saw_marker = true;
+            }
+            if let Some(session) = runtime.store().terminal_session("sess-approved-approval")
+                && matches!(
+                    session.lifecycle,
+                    CommandLifecycle::Finished {
+                        exit_code: 0,
+                        duration_ms: _
+                    }
+                )
+            {
+                finished_ok = true;
+            }
+            if saw_marker && finished_ok {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(saw_marker, "expected approved command output marker");
+        assert!(
+            finished_ok,
+            "expected approved command to finish successfully"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_bridges_session_events_and_input() {
         let session_manager = SessionManager::new();
         let mut runtime = AliciaUiRuntime::new(session_manager, 128);
+        runtime
+            .store_mut()
+            .set_permission_profile(PermissionProfile::FullAccess);
         let session_id = "sess-runtime-bridge";
         let marker = "alicia_runtime_bridge_ok";
         let (program, args) = shell_echo_input_command();

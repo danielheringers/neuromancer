@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::Parser;
 use clap::ValueEnum;
 use codex_alicia_core::AuditLogger;
+use codex_alicia_core::PermissionProfile;
 use codex_alicia_core::SessionAuditContext;
 use codex_alicia_core::SessionManager;
 use codex_alicia_core::SessionMode;
@@ -87,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SessionManager::new()
     };
     let mut runtime = AliciaUiRuntime::new(session_manager, 2_000);
+    runtime
+        .store_mut()
+        .set_permission_profile(PermissionProfile::FullAccess);
     let request = SessionStartRequest::new(
         cli.session_id.clone(),
         program,
