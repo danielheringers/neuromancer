@@ -24,6 +24,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 13:11Z) Adicionado smoke test real opt-in para `claude-code` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs` e procedimento de fechamento do risco sincronizado em `Alicia/12` e `Alicia/13`.
 - [x] (2026-02-18 13:16Z) Runbook de validacao real do `claude-code` expandido com comandos para PowerShell e bash (Windows/macOS/Linux), mantendo alinhamento cross-platform.
 - [x] (2026-02-18 13:30Z) Risco residual do provider `claude-code` fechado no host atual: identificado binario real `claude` (`2.1.45`) e smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_CLAUDE_CODE_BIN=claude`.
+- [x] (2026-02-18 13:44Z) Corrigida nova intermitencia em `codex-alicia-core` no teste `cancel_does_not_corrupt_future_session_with_same_id` (sessao reutilizada apos cancelamento), removendo dependencia de ordem estrita entre `CommandOutputChunk` e `CommandFinished`.
 
 ## Surprises & Discoveries
 
@@ -45,6 +46,8 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Evidence: `claude --version` retorna `2.1.45 (Claude Code)` e `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` finaliza com `ok`.
 - Observation: O teste `start_pipe_session_emits_started_output_and_finished_events` era sensivel a ordem de chegada dos eventos e podia encerrar leitura cedo demais ao ver `CommandFinished` antes de `CommandOutputChunk`.
   Evidence: falha no CI: `missing command output event with marker`; ao repetir localmente apos ajuste, 12/12 execucoes passaram.
+- Observation: O teste `cancel_does_not_corrupt_future_session_with_same_id` apresentou falha intermitente no CI com `expected second run output marker for reused session id`.
+  Evidence: job `Alicia Suite Minima - ubuntu-latest` (`run 25`) falhou em `Test alicia-core` com `exit code 101`; repeticao local mostrou a mesma falha uma vez durante stress-run.
 
 ## Decision Log
 
@@ -73,6 +76,9 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Date/Author: 2026-02-18 / Codex
 - Decision: Ajustar o default do smoke real para `claude` e manter override por `ALICIA_CLAUDE_CODE_BIN`.
   Rationale: No host alvo atual, o comando oficial disponivel e `claude`; manter override preserva compatibilidade com ambientes diferentes.
+  Date/Author: 2026-02-18 / Codex
+- Decision: Aplicar o mesmo padrao de robustez temporal no teste de cancelamento/reuso de sessao (`sess-cancel-reuse`) usado no teste de pipe, aguardando sinais esperados sem assumir ordenacao.
+  Rationale: Em ambiente concorrente, eventos de saida e finalizacao podem chegar em ordem diferente; o teste deve validar comportamento e nao interleaving interno.
   Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
@@ -250,3 +256,4 @@ Update note (2026-02-18 12:59Z): Plano atualizado com release notes da candidata
 Update note (2026-02-18 13:11Z): Plano atualizado com smoke test real opt-in do provider `claude-code` e runbook objetivo para fechar o risco residual em host alvo.
 Update note (2026-02-18 13:16Z): Plano atualizado com comandos equivalentes de validacao para PowerShell e bash no fluxo de fechamento do risco residual.
 Update note (2026-02-18 13:30Z): Plano atualizado com validacao real concluida no host atual usando `claude` (`2.1.45`) e fechamento do risco residual do provider.
+Update note (2026-02-18 13:44Z): Plano atualizado com correcao de nova intermitencia no `codex-alicia-core` para reuso de sessao apos cancelamento e rodada de revalidacao local intensiva.

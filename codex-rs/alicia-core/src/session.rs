@@ -791,21 +791,43 @@ mod tests {
             )
             .await?;
 
-        let second_run_events =
-            recv_events_until_finished(&mut events_rx, "sess-cancel-reuse", 10_000).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_second_output = false;
+        let mut saw_second_finished = false;
+        while tokio::time::Instant::now() < deadline {
+            if saw_second_output && saw_second_finished {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, events_rx.recv()).await {
+                Ok(Ok(message)) => {
+                    if command_id_for_event(&message.event) != Some("sess-cancel-reuse") {
+                        continue;
+                    }
+                    match &message.event {
+                        IpcEvent::CommandOutputChunk(event)
+                            if event.chunk.contains(second_marker) =>
+                        {
+                            saw_second_output = true;
+                        }
+                        IpcEvent::CommandFinished(event) if event.exit_code == 0 => {
+                            saw_second_finished = true;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_) => break,
+            }
+        }
         assert!(
-            second_run_events.iter().any(|message| {
-                matches!(&message.event, IpcEvent::CommandOutputChunk(event) if event.chunk.contains(second_marker))
-            }),
+            saw_second_output,
             "expected second run output marker for reused session id"
         );
         assert!(
-            second_run_events.iter().any(|message| {
-                matches!(
-                    &message.event,
-                    IpcEvent::CommandFinished(event) if event.exit_code == 0
-                )
-            }),
+            saw_second_finished,
             "expected second run to finish successfully"
         );
 
