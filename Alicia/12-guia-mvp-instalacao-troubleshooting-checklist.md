@@ -221,20 +221,21 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 - PR: `https://github.com/danielheringers/neuromancer/pull/13`
 - run (`pull_request`, run_number `16`): `https://github.com/danielheringers/neuromancer/actions/runs/22139722352` (success 9/9)
 - run (`pull_request`, run_number `19`): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314` (success 9/9, apos fix de intermitencia no `codex-alicia-core`)
+- run (`pull_request`, run_number `32`): `https://github.com/danielheringers/neuromancer/actions/runs/22144213751` (success 9/9, commit `3c38be3de` apos hardening do smoke real de provider)
 - resultado: `success` (9/9 jobs verdes)
 - jobs:
-  - `Alicia Policy and Approval Scenarios - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552234`
-  - `Alicia E2E Flow - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552256`
-  - `Alicia E2E Flow - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552257`
-  - `Alicia Policy and Approval Scenarios - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552265`
-  - `Alicia Suite Minima - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552266`
-  - `Alicia E2E Flow - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552268`
-  - `Alicia Suite Minima - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552280`
-  - `Alicia Policy and Approval Scenarios - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552296`
-  - `Alicia Suite Minima - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552310`
+  - `Alicia Policy and Approval Scenarios - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562577`
+  - `Alicia E2E Flow - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562897`
+  - `Alicia E2E Flow - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562919`
+  - `Alicia Policy and Approval Scenarios - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562619`
+  - `Alicia Suite Minima - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562707`
+  - `Alicia E2E Flow - ubuntu-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562665`
+  - `Alicia Suite Minima - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016563040`
+  - `Alicia Policy and Approval Scenarios - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016562711`
+  - `Alicia Suite Minima - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22144213751/job/64016563004`
 5. Validacao real do provider `claude-code` no host atual:
 - `claude --version` -> `2.1.45 (Claude Code)`
-- `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` e `ALICIA_CLAUDE_CODE_BIN=claude` -> `ok`.
+- `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` (autodetect `claude`/`claude-code`) -> `ok`.
 
 ## 4.1) Consolidado para planejamento de continuidade (2026-02-18)
 

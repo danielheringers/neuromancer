@@ -27,8 +27,8 @@ Esta release candidata consolida os itens:
 
 1. PR em andamento:
    - `https://github.com/danielheringers/neuromancer/pull/13`
-2. CI final da rodada atual (`pull_request`, run `19`) com 9/9 jobs verdes:
-   - `https://github.com/danielheringers/neuromancer/actions/runs/22140345314`
+2. CI final da rodada atual (`pull_request`, run `32`) com 9/9 jobs verdes:
+   - `https://github.com/danielheringers/neuromancer/actions/runs/22144213751`
 3. Validacao local complementar:
    - `cargo test -p codex-alicia-core -p codex-alicia-adapters -p codex-alicia-ui`
 
@@ -37,7 +37,7 @@ Esta release candidata consolida os itens:
 1. Compatibilidade cross-platform validada nos 3 SO via CI.
 2. Validacao real de provider concluida no host atual (2026-02-18):
    - `claude --version` -> `2.1.45 (Claude Code)`.
-   - smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` e `ALICIA_CLAUDE_CODE_BIN=claude`.
+   - smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` (autodetect de `claude`/`claude-code` ativo; override opcional por `ALICIA_CLAUDE_CODE_BIN`).
 
 ## Rollback
 
