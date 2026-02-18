@@ -1,0 +1,180 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* JetBrains Rider Dark Theme - Alicia Terminal */
+  --background: #252525;
+  --foreground: #b3b6bb;
+  --card: #2b2d30;
+  --card-foreground: #b3b6bb;
+  --popover: #2b2d30;
+  --popover-foreground: #b3b6bb;
+  --primary: #39CC9B;
+  --primary-foreground: #1a1a1a;
+  --secondary: #44474b;
+  --secondary-foreground: #b3b6bb;
+  --muted: #2b2d30;
+  --muted-foreground: #77797c;
+  --accent: #6c95eb;
+  --accent-foreground: #1a1a1a;
+  --destructive: #cf4d4d;
+  --destructive-foreground: #ffffff;
+  --border: #171718dc;
+  --input: #44474b5d;
+  --ring: #39CC9B;
+  --chart-1: #39CC9B;
+  --chart-2: #6c95eb;
+  --chart-3: #c9a26d;
+  --chart-4: #9a94e9;
+  --chart-5: #ed94c0;
+  --radius: 0.5rem;
+  --sidebar: #1e1f22;
+  --sidebar-foreground: #b3b6bb;
+  --sidebar-primary: #39CC9B;
+  --sidebar-primary-foreground: #1a1a1a;
+  --sidebar-accent: #2e436e;
+  --sidebar-accent-foreground: #b9bcc0;
+  --sidebar-border: #171718dc;
+  --sidebar-ring: #39CC9B;
+
+  /* Custom Alicia tokens */
+  --terminal-bg: #1e1f22;
+  --terminal-fg: #C5CFD9;
+  --terminal-green: #39CC9B;
+  --terminal-blue: #6c95eb;
+  --terminal-gold: #c9a26d;
+  --terminal-purple: #9a94e9;
+  --terminal-red: #cf4d4d;
+  --terminal-cyan: #66c3cc;
+  --terminal-pink: #ed94c0;
+  --terminal-comment: #76a862;
+  --panel-bg: #2b2d30;
+  --panel-border: #171718dc;
+  --selection: #093866d3;
+  --line-highlight: #202424;
+}
+
+@theme inline {
+  --font-sans: 'Geist', 'Geist Fallback';
+  --font-mono: var(--font-jetbrains-mono), 'JetBrains Mono', 'Geist Mono', 'Geist Mono Fallback', monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Custom colors */
+  --color-terminal-bg: var(--terminal-bg);
+  --color-terminal-fg: var(--terminal-fg);
+  --color-terminal-green: var(--terminal-green);
+  --color-terminal-blue: var(--terminal-blue);
+  --color-terminal-gold: var(--terminal-gold);
+  --color-terminal-purple: var(--terminal-purple);
+  --color-terminal-red: var(--terminal-red);
+  --color-terminal-cyan: var(--terminal-cyan);
+  --color-terminal-pink: var(--terminal-pink);
+  --color-terminal-comment: var(--terminal-comment);
+  --color-panel-bg: var(--panel-bg);
+  --color-panel-border: var(--panel-border);
+  --color-selection: var(--selection);
+  --color-line-highlight: var(--line-highlight);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Custom scrollbar for terminal feel */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #252525;
+}
+::-webkit-scrollbar-thumb {
+  background: #4d4e5188;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #55575aa8;
+}
+
+/* Blinking cursor */
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.cursor-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Typing effect */
+@keyframes typing-dot {
+  0%, 20% { opacity: 0.2; }
+  50% { opacity: 1; }
+  80%, 100% { opacity: 0.2; }
+}
+
+.typing-dot:nth-child(1) { animation: typing-dot 1.4s infinite 0s; }
+.typing-dot:nth-child(2) { animation: typing-dot 1.4s infinite 0.2s; }
+.typing-dot:nth-child(3) { animation: typing-dot 1.4s infinite 0.4s; }
+
+/* Glow effect for status indicators */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 4px currentColor; }
+  50% { box-shadow: 0 0 8px currentColor, 0 0 16px currentColor; }
+}
+
+.status-pulse {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Boot screen loading spinner */
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin-slow {
+  animation: spin-slow 2s linear infinite;
+}

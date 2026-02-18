@@ -1,0 +1,1 @@
+{"timestamp":1771430803,"session_id":"demo-audit","action_kind":"execute_command","target":"cmd /C echo ALICIA_AUDIT_OK","profile":"full_access","policy_decision":"allow","approval_decision":"not_required","result_status":"succeeded","duration_ms":15}

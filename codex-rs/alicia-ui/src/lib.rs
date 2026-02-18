@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_alicia_core::ActionKind;
 use codex_alicia_core::ApprovalDecision;
@@ -34,6 +35,9 @@ use tokio::sync::mpsc;
 
 const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
 const OUTPUT_PREVIEW_MAX_CHARS: usize = 80;
+const ALICIA_BOOT_DURATION_MS: f32 = 1_450.0;
+const ALICIA_UI_VERSION: &str = "v0.1.0-alpha";
+const ALICIA_UI_MODEL: &str = "gpt-4o-mini";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandLifecycle {
@@ -1351,14 +1355,112 @@ impl AliciaUiRuntime {
     }
 }
 
-#[derive(Debug, Default)]
+// ─── Demo types for faithful React-style UI ───
+
+#[derive(Debug, Clone)]
+struct DemoChatMessage {
+    role: DemoMessageRole,
+    content: &'static str,
+    timestamp: &'static str,
+    tool_calls: Vec<DemoToolCall>,
+    code_blocks: Vec<DemoCodeBlock>,
+    diff: Option<DemoDiff>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoMessageRole {
+    System,
+    User,
+    Agent,
+}
+
+#[derive(Debug, Clone)]
+struct DemoToolCall {
+    icon: &'static str,
+    name: &'static str,
+    detail: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct DemoCodeBlock {
+    language: &'static str,
+    filename: &'static str,
+    content: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct DemoDiffLine {
+    line_type: DemoDiffLineType,
+    content: &'static str,
+    line_number: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemoDiffLineType {
+    Add,
+    Remove,
+    Context,
+}
+
+#[derive(Debug, Clone)]
+struct DemoDiff {
+    filename: &'static str,
+    lines: Vec<DemoDiffLine>,
+    added: usize,
+    removed: usize,
+}
+
+const ALICIA_ASCII_ART: &str = "\
+     _    _     ___ ____ ___    _    \n\
+    / \\  | |   |_ _/ ___|_ _|  / \\   \n\
+   / _ \\ | |    | | |    | |  / _ \\  \n\
+  / ___ \\| |___ | | |___ | | / ___ \\ \n\
+ /_/   \\_\\_____|___\\____|___/_/   \\_\\";
+
+struct BootStage {
+    label: &'static str,
+    detail: &'static str,
+    threshold: f32,
+}
+
+const BOOT_STAGES: &[BootStage] = &[
+    BootStage { label: "Loading configuration", detail: "~/.config/alicia/config.toml", threshold: 0.08 },
+    BootStage { label: "Setting up workspace", detail: "~/projects/my-app", threshold: 0.20 },
+    BootStage { label: "Connecting MCP servers", detail: "6 servers", threshold: 0.45 },
+    BootStage { label: "Validating API credentials", detail: "verified", threshold: 0.65 },
+    BootStage { label: "Initializing sandbox", detail: "ready", threshold: 0.82 },
+    BootStage { label: "System ready", detail: "Alicia v0.1.0-alpha", threshold: 0.95 },
+];
+
+#[derive(Debug)]
 pub struct AliciaEguiView {
     terminal_input_buffer: String,
     status_message: Option<String>,
+    boot_started_at: Option<Instant>,
+    boot_completed: bool,
+    demo_messages: Vec<DemoChatMessage>,
+}
+
+impl Default for AliciaEguiView {
+    fn default() -> Self {
+        Self {
+            terminal_input_buffer: String::new(),
+            status_message: None,
+            boot_started_at: None,
+            boot_completed: false,
+            demo_messages: build_demo_messages(),
+        }
+    }
 }
 
 impl AliciaEguiView {
     pub fn render(&mut self, ctx: &egui::Context, store: &mut UiEventStore) -> Vec<IpcMessage> {
+        self.apply_theme(ctx);
+
+        if !self.boot_completed && self.render_boot_screen(ctx) {
+            return Vec::new();
+        }
+
         let pending_approvals: Vec<ApprovalItem> =
             store.pending_approvals().into_iter().cloned().collect();
         let unapplied_previews: Vec<PatchPreviewState> = store
@@ -1368,239 +1470,916 @@ impl AliciaEguiView {
             .collect();
         let timeline: Vec<TimelineEntry> = store.timeline().to_vec();
         let session_ids = store.terminal_session_ids().to_vec();
+        if store.active_session_id().is_none()
+            && let Some(first_session_id) = session_ids.first()
+            && let Err(error) = store.set_active_session(first_session_id)
+        {
+            self.status_message = Some(error.beginner_message());
+        }
+
+        let changed_files = collect_changed_files(&unapplied_previews);
+        let show_right_panel = !pending_approvals.is_empty() || !unapplied_previews.is_empty();
         let mut requested_resolutions: Vec<(String, ApprovalResolution)> = Vec::new();
         let mut requested_hunk_decisions: Vec<(String, String, String, PatchHunkDecision)> =
             Vec::new();
         let mut emitted_messages = Vec::new();
 
-        egui::TopBottomPanel::top("alicia_status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Perfil ativo: {}",
-                    permission_profile_name(store.permission_profile())
-                ));
-                ui.separator();
-                ui.label(format!(
-                    "Aprovações pendentes: {}",
-                    store.pending_approval_count()
-                ));
-                if let Some(status_message) = self.status_message.as_deref() {
-                    ui.separator();
-                    ui.label(status_message);
-                }
-            });
-        });
-
-        egui::SidePanel::right("alicia_approval_queue")
-            .resizable(true)
-            .default_width(340.0)
+        // ═══ TITLE BAR ═══
+        egui::TopBottomPanel::top("alicia_title_bar")
+            .exact_height(36.0)
             .show(ctx, |ui| {
-                ui.heading("Fila de Aprovações");
-                ui.separator();
+                egui::Frame::new()
+                    .fill(alicia_color_terminal_bg())
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Traffic light buttons
+                            ui.label(
+                                egui::RichText::new("\u{25CF}")
+                                    .color(alicia_color_terminal_red()),
+                            );
+                            ui.label(
+                                egui::RichText::new("\u{25CF}")
+                                    .color(alicia_color_terminal_gold()),
+                            );
+                            ui.label(
+                                egui::RichText::new("\u{25CF}")
+                                    .color(alicia_color_terminal_green()),
+                            );
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("ALICIA {ALICIA_UI_VERSION}"))
+                                    .monospace()
+                                    .strong()
+                                    .color(alicia_color_terminal_fg()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let current_dir = std::env::current_dir()
+                                        .map(|path| path.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| String::from("."));
+                                    ui.label(
+                                        egui::RichText::new(current_dir)
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("Connected")
+                                            .monospace()
+                                            .color(alicia_color_terminal_green()),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("\u{25CF}")
+                                            .color(alicia_color_terminal_green()),
+                                    );
+                                },
+                            );
+                        });
+                    });
+            });
 
-                if pending_approvals.is_empty() {
-                    ui.label("Sem aprovações pendentes.");
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for approval in &pending_approvals {
-                            ui.group(|ui| {
-                                ui.label(format!("Ação: {}", approval.action_id));
-                                ui.label(format!("O que: {}", approval.summary));
-
-                                if let Some(action_kind) = approval.action_kind {
-                                    ui.label(format!("Tipo: {}", action_kind_name(action_kind)));
-                                }
-
-                                if let Some(target) = approval.target.as_deref() {
-                                    ui.label(format!("Onde: {target}"));
-                                }
-
-                                if let Some(command) = approval.command.as_ref() {
-                                    ui.label(format!("Comando: {}", command.join(" ")));
-                                }
-
-                                if approval.impact_files.is_empty() {
-                                    ui.label("Impacto: sem diff informado");
-                                } else {
-                                    ui.label(format!(
-                                        "Impacto: {} arquivo(s)",
-                                        approval.impact_files.len()
-                                    ));
-                                    for file in &approval.impact_files {
-                                        ui.label(format!("- {file}"));
-                                    }
-                                }
-
-                                ui.label(format!(
-                                    "Expira em unix={} (status: {})",
-                                    approval.expires_at_unix_s,
-                                    approval_status_name(approval.status)
-                                ));
-
+        // ═══ SIDEBAR ═══
+        egui::SidePanel::left("alicia_sidebar")
+            .default_width(240.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(alicia_color_sidebar_bg())
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        // ── Agent Info Card ──
+                        egui::Frame::new()
+                            .fill(alicia_color_panel_bg())
+                            .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    if ui.button("Aprovar").clicked() {
-                                        requested_resolutions.push((
-                                            approval.action_id.clone(),
-                                            ApprovalResolution::Approved,
-                                        ));
-                                    }
-                                    if ui.button("Rejeitar").clicked() {
-                                        requested_resolutions.push((
-                                            approval.action_id.clone(),
-                                            ApprovalResolution::Denied,
-                                        ));
-                                    }
+                                    egui::Frame::new()
+                                        .fill(alicia_color_terminal_green().gamma_multiply(0.15))
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::same(6))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("[A]")
+                                                    .monospace()
+                                                    .strong()
+                                                    .color(alicia_color_terminal_green()),
+                                            );
+                                        });
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Alicia Agent")
+                                                .monospace()
+                                                .strong()
+                                                .color(alicia_color_terminal_fg()),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(ALICIA_UI_MODEL)
+                                                .small()
+                                                .monospace()
+                                                .color(alicia_color_terminal_comment()),
+                                        );
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("1.2k tokens")
+                                            .small()
+                                            .monospace()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("Fast")
+                                            .small()
+                                            .monospace()
+                                            .color(alicia_color_terminal_gold()),
+                                    );
                                 });
                             });
-                            ui.separator();
-                        }
-                    });
-                }
-                ui.heading("Diff Preview");
-                ui.separator();
-                if unapplied_previews.is_empty() {
-                    ui.label("Nenhum diff pendente de aplicação.");
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for preview in &unapplied_previews {
-                            ui.group(|ui| {
-                                ui.label(format!("Ação: {}", preview.action_id));
-                                ui.label(format!("Arquivos: {}", preview.files.len()));
-                                if preview.file_previews.is_empty() {
-                                    for file in &preview.files {
-                                        ui.label(format!("- {file}"));
-                                    }
+
+                        ui.add_space(12.0);
+
+                        // ── Sessions Section ──
+                        ui.label(
+                            egui::RichText::new("SESSIONS")
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                        ui.add_space(4.0);
+
+                        let active_session = store.active_session_id().map(str::to_string);
+                        let mut selected_session: Option<String> = None;
+                        if session_ids.is_empty() {
+                            let demo_sessions = [
+                                ("Refactor auth module", "2m ago", true),
+                                ("Fix database migrat...", "15m ago", false),
+                                ("Add API endpoints", "1h ago", false),
+                                ("Update test suite", "3h ago", false),
+                            ];
+                            for (name, time, is_active) in &demo_sessions {
+                                let card_bg = if *is_active {
+                                    alicia_color_highlight_bg()
                                 } else {
-                                    for file_preview in &preview.file_previews {
-                                        ui.separator();
-                                        ui.label(format!("Arquivo: {}", file_preview.file_path));
-
-                                        if file_preview.hunks.is_empty() {
+                                    alicia_color_panel_bg()
+                                };
+                                let border_color = if *is_active {
+                                    alicia_color_terminal_green()
+                                } else {
+                                    alicia_color_border()
+                                };
+                                egui::Frame::new()
+                                    .fill(card_bg)
+                                    .stroke(egui::Stroke::new(1.0, border_color))
+                                    .corner_radius(egui::CornerRadius::same(6))
+                                    .inner_margin(egui::Margin::symmetric(8, 5))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
                                             ui.label(
-                                                "Sem blocos (hunks) detalhados para este arquivo.",
+                                                egui::RichText::new(
+                                                    if *is_active { "\u{25CF}" } else { "\u{25CB}" },
+                                                )
+                                                .monospace()
+                                                .small()
+                                                .color(if *is_active {
+                                                    alicia_color_terminal_green()
+                                                } else {
+                                                    alicia_color_terminal_comment()
+                                                }),
                                             );
-                                            continue;
-                                        }
+                                            ui.label(
+                                                egui::RichText::new(*name)
+                                                    .monospace()
+                                                    .small()
+                                                    .color(if *is_active {
+                                                        alicia_color_terminal_fg()
+                                                    } else {
+                                                        alicia_color_terminal_comment()
+                                                    }),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(*time)
+                                                            .monospace()
+                                                            .small()
+                                                            .color(alicia_color_terminal_comment()),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(3.0);
+                            }
+                        } else {
+                            for session_id in &session_ids {
+                                let is_active =
+                                    active_session.as_deref() == Some(session_id.as_str());
+                                let button = egui::Button::new(
+                                    egui::RichText::new(if is_active {
+                                        format!("\u{25CF} {session_id}")
+                                    } else {
+                                        format!("\u{25CB} {session_id}")
+                                    })
+                                    .monospace()
+                                    .small()
+                                    .color(if is_active {
+                                        alicia_color_terminal_green()
+                                    } else {
+                                        alicia_color_terminal_fg()
+                                    }),
+                                )
+                                .selected(is_active)
+                                .fill(if is_active {
+                                    alicia_color_highlight_bg()
+                                } else {
+                                    alicia_color_panel_bg()
+                                });
 
-                                        for hunk in &file_preview.hunks {
-                                            ui.group(|ui| {
-                                                ui.label(format!("Bloco: {}", hunk.hunk_id));
-                                                ui.label(hunk.header.as_str());
-                                                ui.label(format!(
-                                                    "Impacto: +{} / -{}",
-                                                    hunk.added_lines, hunk.removed_lines
-                                                ));
-                                                ui.label(format!(
-                                                    "Decisão: {}",
-                                                    patch_hunk_decision_name(hunk.decision)
-                                                ));
+                                if ui.add(button).clicked() {
+                                    selected_session = Some(session_id.clone());
+                                }
+                            }
+                        }
 
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("Aprovar bloco").clicked() {
-                                                        requested_hunk_decisions.push((
-                                                            preview.action_id.clone(),
-                                                            file_preview.file_path.clone(),
-                                                            hunk.hunk_id.clone(),
-                                                            PatchHunkDecision::Approved,
-                                                        ));
+                        if let Some(selected_session) = selected_session
+                            && active_session.as_deref() != Some(selected_session.as_str())
+                            && let Err(error) = store.set_active_session(&selected_session)
+                        {
+                            self.status_message = Some(error.beginner_message());
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        // ── Changes Section ──
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("CHANGES")
+                                    .monospace()
+                                    .small()
+                                    .strong()
+                                    .color(alicia_color_terminal_comment()),
+                            );
+                            let count = if changed_files.is_empty() {
+                                4
+                            } else {
+                                changed_files.len()
+                            };
+                            egui::Frame::new()
+                                .fill(alicia_color_terminal_blue().gamma_multiply(0.2))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::symmetric(6, 1))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{count}"))
+                                            .small()
+                                            .monospace()
+                                            .color(alicia_color_terminal_blue()),
+                                    );
+                                });
+                        });
+                        ui.add_space(4.0);
+
+                        if changed_files.is_empty() {
+                            let demo_changes: &[(&str, &str, fn() -> egui::Color32)] = &[
+                                ("M", "src/auth/handler.rs", alicia_color_terminal_gold),
+                                ("A", "src/db/schema.rs", alicia_color_terminal_green),
+                                ("M", "src/api/routes.rs", alicia_color_terminal_gold),
+                                ("D", "tests/auth_test.rs", alicia_color_terminal_red),
+                            ];
+                            for (status, file, color_fn) in demo_changes {
+                                let color = color_fn();
+                                ui.horizontal(|ui| {
+                                    egui::Frame::new()
+                                        .fill(color.gamma_multiply(0.15))
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(4, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(*status)
+                                                    .monospace()
+                                                    .small()
+                                                    .strong()
+                                                    .color(color),
+                                            );
+                                        });
+                                    ui.label(
+                                        egui::RichText::new(*file)
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_fg()),
+                                    );
+                                });
+                                ui.add_space(2.0);
+                            }
+                        } else {
+                            for file in &changed_files {
+                                ui.horizontal(|ui| {
+                                    egui::Frame::new()
+                                        .fill(
+                                            alicia_color_terminal_gold().gamma_multiply(0.15),
+                                        )
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(4, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("M")
+                                                    .monospace()
+                                                    .small()
+                                                    .strong()
+                                                    .color(alicia_color_terminal_gold()),
+                                            );
+                                        });
+                                    ui.label(
+                                        egui::RichText::new(file)
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_fg()),
+                                    );
+                                });
+                                ui.add_space(2.0);
+                            }
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        // ── Project Section ──
+                        ui.label(
+                            egui::RichText::new("PROJECT")
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                        ui.add_space(4.0);
+
+                        if let Some(active_session_id) = store.active_session_id() {
+                            if let Some(session) = store.terminal_session(active_session_id) {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("~")
+                                            .monospace()
+                                            .color(alicia_color_terminal_purple()),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("cwd: {}", session.cwd))
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_fg()),
+                                    );
+                                });
+                            } else {
+                                render_demo_project_info(ui);
+                            }
+                        } else {
+                            render_demo_project_info(ui);
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        // ── Settings ──
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Settings")
+                                    .monospace()
+                                    .color(alicia_color_terminal_comment()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    render_kbd(ui, ",");
+                                },
+                            );
+                        });
+                    });
+            });
+
+        if show_right_panel {
+            egui::SidePanel::right("alicia_approval_panel")
+                .default_width(340.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(alicia_color_panel_bg())
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Approval Queue")
+                                    .heading()
+                                    .color(alicia_color_terminal_gold()),
+                            );
+                            ui.add_space(8.0);
+                            if pending_approvals.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("No pending approvals")
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .max_height(260.0)
+                                    .show(ui, |ui| {
+                                        for approval in &pending_approvals {
+                                            egui::Frame::new()
+                                                .fill(alicia_color_highlight_bg())
+                                                .stroke(egui::Stroke::new(
+                                                    1.0,
+                                                    alicia_color_border(),
+                                                ))
+                                                .corner_radius(egui::CornerRadius::same(8))
+                                                .inner_margin(egui::Margin::same(10))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&approval.summary)
+                                                            .monospace()
+                                                            .color(alicia_color_terminal_fg()),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "id: {}",
+                                                            approval.action_id
+                                                        ))
+                                                        .small()
+                                                        .monospace()
+                                                        .color(alicia_color_terminal_comment()),
+                                                    );
+                                                    if let Some(target) = approval.target.as_deref()
+                                                    {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "target: {target}"
+                                                            ))
+                                                            .small()
+                                                            .monospace()
+                                                            .color(alicia_color_terminal_comment()),
+                                                        );
                                                     }
-                                                    if ui.button("Rejeitar bloco").clicked() {
-                                                        requested_hunk_decisions.push((
-                                                            preview.action_id.clone(),
-                                                            file_preview.file_path.clone(),
-                                                            hunk.hunk_id.clone(),
-                                                            PatchHunkDecision::Rejected,
-                                                        ));
-                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        if ui.button("Approve").clicked() {
+                                                            requested_resolutions.push((
+                                                                approval.action_id.clone(),
+                                                                ApprovalResolution::Approved,
+                                                            ));
+                                                        }
+                                                        if ui.button("Reject").clicked() {
+                                                            requested_resolutions.push((
+                                                                approval.action_id.clone(),
+                                                                ApprovalResolution::Denied,
+                                                            ));
+                                                        }
+                                                    });
                                                 });
-                                            });
+                                            ui.add_space(8.0);
                                         }
+                                    });
+                            }
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("Diff Preview")
+                                    .heading()
+                                    .color(alicia_color_terminal_blue()),
+                            );
+                            if unapplied_previews.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("No unapplied patch")
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                            } else {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    for preview in &unapplied_previews {
+                                        egui::Frame::new()
+                                            .fill(alicia_color_highlight_bg())
+                                            .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+                                            .corner_radius(egui::CornerRadius::same(8))
+                                            .inner_margin(egui::Margin::same(10))
+                                            .show(ui, |ui| {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "Action {}",
+                                                        preview.action_id
+                                                    ))
+                                                    .monospace()
+                                                    .color(alicia_color_terminal_fg()),
+                                                );
+                                                for file_preview in &preview.file_previews {
+                                                    ui.add_space(6.0);
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "* {}",
+                                                            file_preview.file_path
+                                                        ))
+                                                        .monospace()
+                                                        .color(alicia_color_terminal_cyan()),
+                                                    );
+                                                    for hunk in &file_preview.hunks {
+                                                        let decision_color = match hunk.decision {
+                                                            PatchHunkDecision::Pending => {
+                                                                alicia_color_terminal_gold()
+                                                            }
+                                                            PatchHunkDecision::Approved => {
+                                                                alicia_color_terminal_green()
+                                                            }
+                                                            PatchHunkDecision::Rejected => {
+                                                                alicia_color_terminal_red()
+                                                            }
+                                                        };
+
+                                                        egui::Frame::new()
+                                                            .fill(alicia_color_panel_bg())
+                                                            .stroke(egui::Stroke::new(
+                                                                1.0,
+                                                                decision_color,
+                                                            ))
+                                                            .corner_radius(
+                                                                egui::CornerRadius::same(6),
+                                                            )
+                                                            .inner_margin(egui::Margin::same(8))
+                                                            .show(ui, |ui| {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!(
+                                                                        "{} (+{} / -{})",
+                                                                        hunk.hunk_id,
+                                                                        hunk.added_lines,
+                                                                        hunk.removed_lines
+                                                                    ))
+                                                                    .small()
+                                                                    .monospace()
+                                                                    .color(decision_color),
+                                                                );
+                                                                ui.horizontal(|ui| {
+                                                                    if ui
+                                                                        .button("Approve hunk")
+                                                                        .clicked()
+                                                                    {
+                                                                        requested_hunk_decisions
+                                                                        .push((
+                                                                        preview.action_id.clone(),
+                                                                        file_preview
+                                                                            .file_path
+                                                                            .clone(),
+                                                                        hunk.hunk_id.clone(),
+                                                                        PatchHunkDecision::Approved,
+                                                                    ));
+                                                                    }
+                                                                    if ui
+                                                                        .button("Reject hunk")
+                                                                        .clicked()
+                                                                    {
+                                                                        requested_hunk_decisions
+                                                                        .push((
+                                                                        preview.action_id.clone(),
+                                                                        file_preview
+                                                                            .file_path
+                                                                            .clone(),
+                                                                        hunk.hunk_id.clone(),
+                                                                        PatchHunkDecision::Rejected,
+                                                                    ));
+                                                                    }
+                                                                });
+                                                            });
+                                                    }
+                                                }
+                                            });
+                                        ui.add_space(8.0);
                                     }
+                                });
+                            }
+                        });
+                });
+        }
+
+        // ═══ STATUS BAR ═══
+        egui::TopBottomPanel::bottom("alicia_status_bar")
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(alicia_color_panel_bg())
+                    .inner_margin(egui::Margin::symmetric(10, 3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("main")
+                                    .monospace()
+                                    .small()
+                                    .color(alicia_color_terminal_green()),
+                            );
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} errors",
+                                    store.pending_approval_count()
+                                ))
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_fg()),
+                            );
+                            ui.label(
+                                egui::RichText::new("2 warnings")
+                                    .monospace()
+                                    .small()
+                                    .color(alicia_color_terminal_gold()),
+                            );
+
+                            if let Some(status_message) = self.status_message.as_deref() {
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(status_message)
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_fg()),
+                                );
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Rust")
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("UTF-8")
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("Latency: 142ms")
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(ALICIA_UI_MODEL)
+                                            .monospace()
+                                            .small()
+                                            .color(alicia_color_terminal_comment()),
+                                    );
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "sandbox: {}",
+                                            permission_profile_name(
+                                                store.permission_profile()
+                                            )
+                                        ))
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_cyan()),
+                                    );
+                                },
+                            );
+                        });
+                    });
+            });
+
+        // ═══ CENTRAL PANEL ═══
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(alicia_color_terminal_bg())
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    // ── Welcome Section ──
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(16.0);
+                        egui::Frame::new()
+                            .fill(alicia_color_terminal_green().gamma_multiply(0.12))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::same(14))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("[A]")
+                                        .monospace()
+                                        .strong()
+                                        .size(20.0)
+                                        .color(alicia_color_terminal_green()),
+                                );
+                            });
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Alicia")
+                                .monospace()
+                                .size(20.0)
+                                .strong()
+                                .color(alicia_color_terminal_fg()),
+                        );
+                        ui.label(
+                            egui::RichText::new("Your AI-powered coding agent")
+                                .monospace()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let avail = ui.available_width();
+                            let badge_width = 320.0_f32;
+                            let pad = ((avail - badge_width) / 2.0).max(0.0);
+                            ui.add_space(pad);
+                            render_badge(ui, "Sandbox Mode", alicia_color_terminal_cyan());
+                            render_badge(ui, "Auto-approve: Off", alicia_color_terminal_comment());
+                            render_badge(
+                                ui,
+                                &format!("Model: {ALICIA_UI_MODEL}"),
+                                alicia_color_terminal_purple(),
+                            );
+                        });
+                        ui.add_space(12.0);
+                    });
+
+                    // ── Messages Area ──
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            if timeline.is_empty() {
+                                // Show demo messages (React-style)
+                                for msg in &self.demo_messages {
+                                    render_chat_message(ui, msg);
+                                }
+                            } else {
+                                // Show real timeline events in chat-style
+                                for entry in timeline.iter().rev().take(80).rev() {
+                                    let (sender, accent) =
+                                        timeline_sender_style(entry.summary.as_str());
+                                    egui::Frame::new()
+                                        .fill(alicia_color_panel_bg())
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::symmetric(12, 8))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                egui::Frame::new()
+                                                    .fill(accent.gamma_multiply(0.15))
+                                                    .corner_radius(egui::CornerRadius::same(4))
+                                                    .inner_margin(egui::Margin::same(4))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(">_")
+                                                                .monospace()
+                                                                .small()
+                                                                .color(accent),
+                                                        );
+                                                    });
+                                                ui.label(
+                                                    egui::RichText::new(sender)
+                                                        .monospace()
+                                                        .small()
+                                                        .strong()
+                                                        .color(accent),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "#{}",
+                                                        entry.sequence
+                                                    ))
+                                                    .monospace()
+                                                    .small()
+                                                    .color(alicia_color_terminal_comment()),
+                                                );
+                                            });
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new(entry.summary.as_str())
+                                                    .monospace()
+                                                    .color(alicia_color_terminal_fg()),
+                                            );
+                                        });
+                                    ui.add_space(6.0);
+                                }
+                            }
+
+                            if let Some(active_terminal_text) = store.active_terminal_text() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Terminal Output")
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_blue()),
+                                );
+                                let mut output = active_terminal_text;
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut output)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_rows(14)
+                                        .interactive(false),
+                                );
+                            }
+                        });
+
+                    // ── Command Input ──
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(alicia_color_panel_bg())
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            alicia_color_terminal_green().gamma_multiply(0.4),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(">")
+                                        .monospace()
+                                        .strong()
+                                        .color(alicia_color_terminal_green()),
+                                );
+                                let response = ui.add(
+                                    egui::TextEdit::multiline(
+                                        &mut self.terminal_input_buffer,
+                                    )
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_rows(2)
+                                    .hint_text("Ask Alicia anything..."),
+                                );
+
+                                let enter_pressed =
+                                    ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let shift_pressed =
+                                    ui.input(|input| input.modifiers.shift);
+
+                                // Send button
+                                let send_enabled =
+                                    !self.terminal_input_buffer.trim().is_empty();
+                                let send_button = egui::Button::new(
+                                    egui::RichText::new("^")
+                                        .monospace()
+                                        .strong()
+                                        .color(if send_enabled {
+                                            alicia_color_terminal_bg()
+                                        } else {
+                                            alicia_color_terminal_comment()
+                                        }),
+                                )
+                                .fill(if send_enabled {
+                                    alicia_color_terminal_green()
+                                } else {
+                                    alicia_color_highlight_bg()
+                                })
+                                .corner_radius(egui::CornerRadius::same(6));
+
+                                let mut should_send = ui.add(send_button).clicked();
+                                if response.has_focus()
+                                    && enter_pressed
+                                    && !shift_pressed
+                                {
+                                    should_send = true;
+                                }
+                                if should_send {
+                                    self.send_input(store);
                                 }
                             });
-                            ui.separator();
-                        }
-                    });
-                }
-            });
-
-        egui::TopBottomPanel::bottom("alicia_timeline")
-            .resizable(true)
-            .default_height(200.0)
-            .show(ctx, |ui| {
-                ui.heading("Timeline");
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for entry in &timeline {
-                        ui.label(format!("#{} {}", entry.sequence, entry.summary));
-                    }
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                render_kbd(ui, "Enter");
+                                ui.label(
+                                    egui::RichText::new("send")
+                                        .small()
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                                ui.add_space(6.0);
+                                render_kbd(ui, "Shift+Enter");
+                                ui.label(
+                                    egui::RichText::new("newline")
+                                        .small()
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                                ui.add_space(6.0);
+                                render_kbd(ui, "/");
+                                ui.label(
+                                    egui::RichText::new("commands")
+                                        .small()
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                            });
+                        });
                 });
-            });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Terminal");
-
-            if session_ids.is_empty() {
-                ui.label("Nenhuma sessão ativa.");
-            } else {
-                let previous_active = store.active_session_id().map(str::to_string);
-                let mut selected_session = previous_active
-                    .clone()
-                    .or_else(|| session_ids.first().cloned())
-                    .unwrap_or_default();
-
-                egui::ComboBox::from_label("Sessão")
-                    .selected_text(selected_session.clone())
-                    .show_ui(ui, |ui| {
-                        for session_id in &session_ids {
-                            ui.selectable_value(
-                                &mut selected_session,
-                                session_id.clone(),
-                                session_id.as_str(),
-                            );
-                        }
-                    });
-
-                if previous_active.as_deref() != Some(selected_session.as_str())
-                    && let Err(error) = store.set_active_session(&selected_session)
-                {
-                    self.status_message = Some(error.beginner_message());
-                }
-
-                let mut terminal_text = store.active_terminal_text().unwrap_or_default();
-                ui.add(
-                    egui::TextEdit::multiline(&mut terminal_text)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(20)
-                        .interactive(false),
-                );
-
-                ui.horizontal(|ui| {
-                    let response = ui.text_edit_singleline(&mut self.terminal_input_buffer);
-                    let mut should_send = ui.button("Enviar").clicked();
-                    if response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    {
-                        should_send = true;
-                    }
-
-                    if should_send && !self.terminal_input_buffer.is_empty() {
-                        let mut payload = self.terminal_input_buffer.clone().into_bytes();
-                        payload.push(b'\n');
-
-                        match store.send_input_to_active_session(payload) {
-                            Ok(()) => {
-                                self.terminal_input_buffer.clear();
-                                self.status_message =
-                                    Some(String::from("Input enviado para a sessão."));
-                            }
-                            Err(error) => {
-                                self.status_message = Some(error.beginner_message());
-                            }
-                        }
-                    }
-                });
-            }
         });
 
         for (action_id, resolution) in requested_resolutions {
@@ -1641,6 +2420,694 @@ impl AliciaEguiView {
 
         emitted_messages
     }
+
+    fn render_boot_screen(&mut self, ctx: &egui::Context) -> bool {
+        let started_at = self.boot_started_at.get_or_insert_with(Instant::now);
+        let elapsed_ms = started_at.elapsed().as_secs_f32() * 1_000.0;
+        let progress = (elapsed_ms / ALICIA_BOOT_DURATION_MS).clamp(0.0, 1.0);
+
+        if progress >= 1.0 {
+            self.boot_completed = true;
+            return false;
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(alicia_color_terminal_bg())
+                .inner_margin(egui::Margin::same(20))
+                .show(ui, |ui| {
+                    // Top bar replica
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{25CF}")
+                                .color(alicia_color_terminal_red()),
+                        );
+                        ui.label(
+                            egui::RichText::new("\u{25CF}")
+                                .color(alicia_color_terminal_gold()),
+                        );
+                        ui.label(
+                            egui::RichText::new("\u{25CF}")
+                                .color(alicia_color_terminal_green()),
+                        );
+                    });
+
+                    ui.add_space(24.0);
+
+                    // ASCII Art
+                    for line in ALICIA_ASCII_ART.lines() {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .monospace()
+                                .color(alicia_color_terminal_green()),
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "  {ALICIA_UI_VERSION}  |  AI Terminal Agent"
+                        ))
+                        .monospace()
+                        .color(alicia_color_terminal_comment()),
+                    );
+
+                    ui.add_space(20.0);
+
+                    // Boot stages
+                    for stage in BOOT_STAGES {
+                        let done = progress >= stage.threshold;
+                        let active = !done
+                            && progress >= (stage.threshold - 0.12_f32).max(0.0);
+                        ui.horizontal(|ui| {
+                            let (indicator, color) = if done {
+                                ("\u{2713}", alicia_color_terminal_green())
+                            } else if active {
+                                ("~", alicia_color_terminal_gold())
+                            } else {
+                                (".", alicia_color_terminal_comment())
+                            };
+                            ui.label(
+                                egui::RichText::new(indicator)
+                                    .monospace()
+                                    .color(color),
+                            );
+                            ui.label(
+                                egui::RichText::new(stage.label)
+                                    .monospace()
+                                    .color(if done || active {
+                                        alicia_color_terminal_fg()
+                                    } else {
+                                        alicia_color_terminal_comment()
+                                    }),
+                            );
+                            if done || active {
+                                ui.label(
+                                    egui::RichText::new(stage.detail)
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                            }
+                        });
+                    }
+
+                    ui.add_space(18.0);
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(400.0)
+                            .fill(alicia_color_terminal_green())
+                            .text(format!("{:.0}%", progress * 100.0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("PID: 48291")
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("MEM: 42MB")
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("rustc 1.82.0")
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_comment()),
+                        );
+                    });
+                });
+        });
+
+        ctx.request_repaint_after(Duration::from_millis(16));
+        true
+    }
+
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = alicia_color_panel_bg();
+        visuals.extreme_bg_color = alicia_color_terminal_bg();
+        visuals.faint_bg_color = alicia_color_highlight_bg();
+        visuals.window_fill = alicia_color_panel_bg();
+        visuals.window_stroke = egui::Stroke::new(1.0, alicia_color_border());
+        visuals.widgets.noninteractive.bg_fill = alicia_color_panel_bg();
+        visuals.widgets.inactive.bg_fill = alicia_color_panel_bg();
+        visuals.widgets.hovered.bg_fill = alicia_color_highlight_bg();
+        visuals.widgets.active.bg_fill = alicia_color_highlight_bg();
+        visuals.widgets.inactive.fg_stroke.color = alicia_color_terminal_fg();
+        visuals.widgets.hovered.fg_stroke.color = alicia_color_terminal_fg();
+        visuals.widgets.active.fg_stroke.color = alicia_color_terminal_fg();
+        visuals.selection.bg_fill = alicia_color_terminal_cyan();
+        visuals.selection.stroke = egui::Stroke::new(1.0, alicia_color_terminal_bg());
+        ctx.set_visuals(visuals);
+    }
+
+    fn send_input(&mut self, store: &UiEventStore) {
+        if self.terminal_input_buffer.trim().is_empty() {
+            return;
+        }
+
+        let mut payload = self.terminal_input_buffer.trim_end().as_bytes().to_vec();
+        payload.push(b'\n');
+        match store.send_input_to_active_session(payload) {
+            Ok(()) => {
+                self.terminal_input_buffer.clear();
+                self.status_message = Some(String::from("Input enviado para a sessão."));
+            }
+            Err(error) => {
+                self.status_message = Some(error.beginner_message());
+            }
+        }
+    }
+}
+
+fn timeline_sender_style(summary: &str) -> (&'static str, egui::Color32) {
+    if summary.starts_with("command_output_chunk") {
+        return ("Alicia", alicia_color_terminal_green());
+    }
+    if summary.starts_with("approval_") || summary.starts_with("action_") {
+        return ("Policy", alicia_color_terminal_gold());
+    }
+    if summary.starts_with("patch_") {
+        return ("Diff", alicia_color_terminal_blue());
+    }
+    if summary.starts_with("audit") {
+        return ("Audit", alicia_color_terminal_purple());
+    }
+    ("System", alicia_color_terminal_comment())
+}
+
+fn collect_changed_files(unapplied_previews: &[PatchPreviewState]) -> Vec<String> {
+    let mut files = Vec::new();
+    for preview in unapplied_previews {
+        for file in &preview.files {
+            if !files.iter().any(|existing| existing == file) {
+                files.push(file.clone());
+            }
+        }
+    }
+    files
+}
+
+// ─── New helper rendering functions for React-faithful UI ───
+
+fn render_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.1))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.3)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .monospace()
+                    .small()
+                    .color(color),
+            );
+        });
+}
+
+fn render_kbd(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::new()
+        .fill(alicia_color_highlight_bg())
+        .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(4, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .monospace()
+                    .small()
+                    .color(alicia_color_terminal_comment()),
+            );
+        });
+}
+
+fn render_demo_project_info(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("~")
+                .monospace()
+                .color(alicia_color_terminal_purple()),
+        );
+        ui.label(
+            egui::RichText::new("main")
+                .monospace()
+                .small()
+                .color(alicia_color_terminal_fg()),
+        );
+        ui.label(
+            egui::RichText::new("+3")
+                .small()
+                .monospace()
+                .color(alicia_color_terminal_green()),
+        );
+        ui.label(
+            egui::RichText::new("-1")
+                .small()
+                .monospace()
+                .color(alicia_color_terminal_red()),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("*")
+                .monospace()
+                .color(alicia_color_terminal_comment()),
+        );
+        ui.label(
+            egui::RichText::new("Rust + Cargo")
+                .monospace()
+                .small()
+                .color(alicia_color_terminal_fg()),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("@")
+                .monospace()
+                .color(alicia_color_terminal_comment()),
+        );
+        ui.label(
+            egui::RichText::new("Session: 4m 32s")
+                .monospace()
+                .small()
+                .color(alicia_color_terminal_fg()),
+        );
+    });
+}
+
+fn render_chat_message(ui: &mut egui::Ui, msg: &DemoChatMessage) {
+    let (role_text, role_color, icon) = match msg.role {
+        DemoMessageRole::System => ("system", alicia_color_terminal_purple(), ">_"),
+        DemoMessageRole::User => ("you", alicia_color_terminal_blue(), "U"),
+        DemoMessageRole::Agent => ("alicia", alicia_color_terminal_green(), "[A]"),
+    };
+
+    egui::Frame::new()
+        .fill(alicia_color_panel_bg())
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            // Header: avatar, role, timestamp
+            ui.horizontal(|ui| {
+                egui::Frame::new()
+                    .fill(role_color.gamma_multiply(0.15))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(icon)
+                                .monospace()
+                                .small()
+                                .color(role_color),
+                        );
+                    });
+                ui.label(
+                    egui::RichText::new(role_text)
+                        .monospace()
+                        .strong()
+                        .color(role_color),
+                );
+                ui.label(
+                    egui::RichText::new(msg.timestamp)
+                        .monospace()
+                        .small()
+                        .color(alicia_color_terminal_comment()),
+                );
+            });
+
+            ui.add_space(4.0);
+
+            // Content
+            ui.label(
+                egui::RichText::new(msg.content)
+                    .monospace()
+                    .color(alicia_color_terminal_fg()),
+            );
+
+            // Tool calls
+            if !msg.tool_calls.is_empty() {
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(alicia_color_highlight_bg())
+                    .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        for tool in &msg.tool_calls {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(tool.icon)
+                                        .monospace()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}: {}",
+                                        tool.name, tool.detail
+                                    ))
+                                    .monospace()
+                                    .small()
+                                    .color(alicia_color_terminal_fg()),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new("\u{2713}")
+                                                .monospace()
+                                                .color(alicia_color_terminal_green()),
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                    });
+            }
+
+            // Code blocks
+            for block in &msg.code_blocks {
+                ui.add_space(6.0);
+                render_demo_code_block(ui, block);
+            }
+
+            // Diff
+            if let Some(diff) = &msg.diff {
+                ui.add_space(6.0);
+                render_demo_diff_block(ui, diff);
+            }
+        });
+    ui.add_space(6.0);
+}
+
+fn render_demo_code_block(ui: &mut egui::Ui, block: &DemoCodeBlock) {
+    egui::Frame::new()
+        .fill(alicia_color_highlight_bg())
+        .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            // Header
+            egui::Frame::new()
+                .fill(alicia_color_panel_bg())
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(block.filename)
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_fg()),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                render_badge(ui, block.language, alicia_color_terminal_cyan());
+                            },
+                        );
+                    });
+                });
+            // Code content with line numbers
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    for (i, line) in block.content.lines().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:>3}", i + 1))
+                                    .monospace()
+                                    .small()
+                                    .color(alicia_color_terminal_comment()),
+                            );
+                            ui.add_space(8.0);
+                            render_syntax_line(ui, line);
+                        });
+                    }
+                });
+        });
+}
+
+fn render_syntax_line(ui: &mut egui::Ui, line: &str) {
+    let trimmed = line.trim();
+    let color = if trimmed.starts_with("//") {
+        alicia_color_terminal_comment()
+    } else if trimmed.starts_with("use ")
+        || trimmed.starts_with("pub ")
+        || trimmed.starts_with("mod ")
+    {
+        alicia_color_terminal_purple()
+    } else if trimmed.contains("fn ")
+        || trimmed.contains("struct ")
+        || trimmed.contains("impl ")
+        || trimmed.contains("enum ")
+    {
+        alicia_color_terminal_blue()
+    } else if trimmed.contains('"') {
+        alicia_color_terminal_gold()
+    } else {
+        alicia_color_terminal_fg()
+    };
+    ui.label(
+        egui::RichText::new(line)
+            .monospace()
+            .small()
+            .color(color),
+    );
+}
+
+fn render_demo_diff_block(ui: &mut egui::Ui, diff: &DemoDiff) {
+    egui::Frame::new()
+        .fill(alicia_color_highlight_bg())
+        .stroke(egui::Stroke::new(1.0, alicia_color_border()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(0))
+        .show(ui, |ui| {
+            // Header
+            egui::Frame::new()
+                .fill(alicia_color_panel_bg())
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(diff.filename)
+                                .monospace()
+                                .small()
+                                .color(alicia_color_terminal_cyan()),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("+{}", diff.added))
+                                .small()
+                                .monospace()
+                                .color(alicia_color_terminal_green()),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("/ -{}", diff.removed))
+                                .small()
+                                .monospace()
+                                .color(alicia_color_terminal_red()),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let _ = ui.button(
+                                    egui::RichText::new("Reject")
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_red()),
+                                );
+                                let _ = ui.button(
+                                    egui::RichText::new("Apply")
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_green()),
+                                );
+                            },
+                        );
+                    });
+                });
+            // Diff lines
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    for line in &diff.lines {
+                        ui.horizontal(|ui| {
+                            if let Some(num) = line.line_number {
+                                ui.label(
+                                    egui::RichText::new(format!("{num:>3}"))
+                                        .monospace()
+                                        .small()
+                                        .color(alicia_color_terminal_comment()),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new("   ")
+                                        .monospace()
+                                        .small(),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            let (indicator, color) = match line.line_type {
+                                DemoDiffLineType::Add => {
+                                    ("+", alicia_color_terminal_green())
+                                }
+                                DemoDiffLineType::Remove => {
+                                    ("-", alicia_color_terminal_red())
+                                }
+                                DemoDiffLineType::Context => {
+                                    (" ", alicia_color_terminal_comment())
+                                }
+                            };
+                            ui.label(
+                                egui::RichText::new(indicator)
+                                    .monospace()
+                                    .small()
+                                    .color(color),
+                            );
+                            ui.label(
+                                egui::RichText::new(line.content)
+                                    .monospace()
+                                    .small()
+                                    .color(color),
+                            );
+                        });
+                    }
+                });
+        });
+}
+
+fn build_demo_messages() -> Vec<DemoChatMessage> {
+    vec![
+        DemoChatMessage {
+            role: DemoMessageRole::System,
+            content: "Alicia v0.1.0-alpha initialized. Working directory: ~/projects/my-app\nSandbox mode enabled. Model: gpt-4o-mini",
+            timestamp: "09:41:02",
+            tool_calls: vec![],
+            code_blocks: vec![],
+            diff: None,
+        },
+        DemoChatMessage {
+            role: DemoMessageRole::User,
+            content: "Refactor the authentication handler to use JWT tokens instead of session cookies. Make sure to handle token refresh.",
+            timestamp: "09:41:15",
+            tool_calls: vec![],
+            code_blocks: vec![],
+            diff: None,
+        },
+        DemoChatMessage {
+            role: DemoMessageRole::Agent,
+            content: "I'll refactor the authentication system to use JWT tokens. Let me first analyze the current codebase to understand the existing auth implementation.",
+            timestamp: "09:41:16",
+            tool_calls: vec![
+                DemoToolCall { icon: "Q", name: "Search", detail: "auth handler src/auth/" },
+                DemoToolCall { icon: ">_", name: "Read", detail: "src/auth/handler.rs" },
+                DemoToolCall { icon: ">_", name: "Read", detail: "src/auth/middleware.rs" },
+                DemoToolCall { icon: "Q", name: "Search", detail: "session references 12 files found" },
+            ],
+            code_blocks: vec![],
+            diff: None,
+        },
+        DemoChatMessage {
+            role: DemoMessageRole::Agent,
+            content: "I've analyzed the codebase. Here's the new JWT token implementation:",
+            timestamp: "09:41:22",
+            tool_calls: vec![],
+            code_blocks: vec![DemoCodeBlock {
+                language: "rust",
+                filename: "src/auth/token.rs",
+                content: "use jsonwebtoken::{encode, decode, Header, Validation};\nuse serde::{Deserialize, Serialize};\nuse chrono::{Utc, Duration};\n\n#[derive(Debug, Serialize, Deserialize)]\npub struct Claims {\n    pub sub: String,\n    pub exp: usize,\n    pub iat: usize,\n}\n\npub fn create_token(user_id: &str) -> Result<String, AuthError> {\n    let now = Utc::now();\n    let claims = Claims {\n        sub: user_id.to_string(),\n        exp: (now + Duration::hours(24)).timestamp() as usize,\n        iat: now.timestamp() as usize,\n    };\n    encode(\n        &Header::default(),\n        &claims,\n        &EncodingKey::from_secret(get_secret().as_ref()),\n    )\n    .map_err(|e| AuthError::TokenCreation(e.to_string()))\n}",
+            }],
+            diff: None,
+        },
+        DemoChatMessage {
+            role: DemoMessageRole::Agent,
+            content: "Now updating the middleware to validate JWT tokens on each request:",
+            timestamp: "09:41:28",
+            tool_calls: vec![],
+            code_blocks: vec![],
+            diff: Some(DemoDiff {
+                filename: "src/auth/middleware.rs",
+                added: 7,
+                removed: 3,
+                lines: vec![
+                    DemoDiffLine { line_type: DemoDiffLineType::Context, content: "  use actix_web::{HttpRequest, HttpResponse};", line_number: Some(1) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Remove, content: "  use crate::session::SessionStore;", line_number: Some(2) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "  use crate::auth::token::{verify_token, Claims};", line_number: Some(2) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "  use actix_web::HttpMessage;", line_number: Some(3) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Context, content: "", line_number: Some(4) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Context, content: "  pub async fn auth_middleware(", line_number: Some(5) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Context, content: "      req: HttpRequest,", line_number: Some(6) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Remove, content: "      session: SessionStore,", line_number: Some(7) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "  ) -> Result<HttpResponse, AuthError> {", line_number: Some(7) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Remove, content: "      let session_id = req.cookie(\"session_id\")", line_number: Some(8) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "      let token = req.headers()", line_number: Some(8) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "          .get(\"Authorization\")", line_number: Some(9) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "          .and_then(|v| v.to_str().ok())", line_number: Some(10) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "          .and_then(|v| v.strip_prefix(\"Bearer \"))", line_number: Some(11) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "          .ok_or(AuthError::MissingToken)?;", line_number: Some(12) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "      let claims = verify_token(token)?;", line_number: Some(13) },
+                    DemoDiffLine { line_type: DemoDiffLineType::Add, content: "      req.extensions_mut().insert(claims);", line_number: Some(14) },
+                ],
+            }),
+        },
+    ]
+}
+
+fn alicia_color_terminal_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(13, 17, 23)
+}
+
+fn alicia_color_sidebar_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(16, 22, 28)
+}
+
+fn alicia_color_panel_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(21, 27, 35)
+}
+
+fn alicia_color_highlight_bg() -> egui::Color32 {
+    egui::Color32::from_rgb(26, 34, 44)
+}
+
+fn alicia_color_border() -> egui::Color32 {
+    egui::Color32::from_rgb(47, 64, 83)
+}
+
+fn alicia_color_terminal_fg() -> egui::Color32 {
+    egui::Color32::from_rgb(230, 237, 243)
+}
+
+fn alicia_color_terminal_comment() -> egui::Color32 {
+    egui::Color32::from_rgb(118, 131, 149)
+}
+
+fn alicia_color_terminal_green() -> egui::Color32 {
+    egui::Color32::from_rgb(63, 185, 80)
+}
+
+fn alicia_color_terminal_blue() -> egui::Color32 {
+    egui::Color32::from_rgb(88, 166, 255)
+}
+
+fn alicia_color_terminal_gold() -> egui::Color32 {
+    egui::Color32::from_rgb(210, 153, 34)
+}
+
+fn alicia_color_terminal_purple() -> egui::Color32 {
+    egui::Color32::from_rgb(188, 140, 255)
+}
+
+fn alicia_color_terminal_red() -> egui::Color32 {
+    egui::Color32::from_rgb(248, 81, 73)
+}
+
+fn alicia_color_terminal_cyan() -> egui::Color32 {
+    egui::Color32::from_rgb(86, 211, 194)
 }
 
 fn command_target(program: &str, args: &[String], audit_target: &str) -> String {
@@ -1729,15 +3196,6 @@ fn approval_resolution_name(resolution: ApprovalResolution) -> &'static str {
         ApprovalResolution::Approved => "approved",
         ApprovalResolution::Denied => "denied",
         ApprovalResolution::Expired => "expired",
-    }
-}
-
-fn approval_status_name(status: ApprovalStatus) -> &'static str {
-    match status {
-        ApprovalStatus::Pending => "pending",
-        ApprovalStatus::Approved => "approved",
-        ApprovalStatus::Denied => "denied",
-        ApprovalStatus::Expired => "expired",
     }
 }
 

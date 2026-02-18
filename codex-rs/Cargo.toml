@@ -173,6 +173,7 @@ dirs = "6"
 dotenvy = "0.15.7"
 dunce = "1.0.4"
 egui = "0.31.1"
+eframe = { version = "0.31.1", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 encoding_rs = "0.8.35"
 env-flags = "0.1.1"
 env_logger = "0.11.5"

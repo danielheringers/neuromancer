@@ -9,9 +9,18 @@ description = "AlicIA UI state and event bridge."
 name = "codex-alicia-ui-app"
 path = "src/main.rs"
 
+[[bin]]
+name = "codex-alicia-ui-desktop"
+path = "src/bin/desktop.rs"
+required-features = ["desktop"]
+
 [lib]
 name = "codex_alicia_ui"
 path = "src/lib.rs"
+
+[features]
+default = []
+desktop = ["dep:eframe"]
 
 [lints]
 workspace = true
@@ -19,6 +28,7 @@ workspace = true
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 codex-alicia-core = { workspace = true }
+eframe = { workspace = true, optional = true }
 egui = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

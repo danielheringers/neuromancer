@@ -100,6 +100,17 @@ cargo test -p codex-alicia-ui e2e_denied_and_expired_blocked_audit -- --exact
 cargo test -p codex-alicia-ui e2e_safe_cancel_persists_final_audit_state -- --exact
 ```
 
+### UI desktop local (janela egui real)
+Abrir somente a janela:
+```bash
+cargo run -p codex-alicia-ui --features desktop --bin codex-alicia-ui-desktop
+```
+
+Abrir a janela e iniciar uma sessao automaticamente:
+```bash
+cargo run -p codex-alicia-ui --features desktop --bin codex-alicia-ui-desktop -- --session-id demo-ui -- cmd /C echo ALICIA_UI_OK
+```
+
 ### Smoke manual do launcher local (`codex-alicia-ui-app`)
 Windows:
 ```powershell
