@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "AlicIA UI state and event bridge."
 
+[[bin]]
+name = "codex-alicia-ui-app"
+path = "src/main.rs"
+
 [lib]
 name = "codex_alicia_ui"
 path = "src/lib.rs"
@@ -13,10 +17,11 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+clap = { workspace = true, features = ["derive"] }
 codex-alicia-core = { workspace = true }
 egui = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

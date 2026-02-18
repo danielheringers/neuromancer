@@ -97,6 +97,23 @@ cargo test -p codex-alicia-ui expire_pending_approvals_marks_final_state -- --ex
 ```bash
 cargo test -p codex-alicia-ui e2e_happy_path_approval_execution_and_audit -- --exact
 cargo test -p codex-alicia-ui e2e_denied_and_expired_blocked_audit -- --exact
+cargo test -p codex-alicia-ui e2e_safe_cancel_persists_final_audit_state -- --exact
+```
+
+### Smoke manual do launcher local (`codex-alicia-ui-app`)
+Windows:
+```powershell
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-local -- cmd /C echo ALICIA_OK
+```
+
+macOS/Linux:
+```bash
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-local -- /bin/sh -c "echo ALICIA_OK"
+```
+
+Com auditoria JSONL:
+```bash
+cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id demo-audit --audit-path ./.codex/alicia-audit.jsonl -- /bin/sh -c "echo ALICIA_AUDIT_OK"
 ```
 
 ## 3) Troubleshooting

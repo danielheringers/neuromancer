@@ -1349,6 +1349,7 @@ dependencies = [
 name = "codex-alicia-ui"
 version = "0.0.0"
 dependencies = [
+ "clap",
  "codex-alicia-core",
  "egui",
  "pretty_assertions",
