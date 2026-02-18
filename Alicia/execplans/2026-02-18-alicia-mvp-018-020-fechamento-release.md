@@ -23,6 +23,7 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - [x] (2026-02-18 12:59Z) Revalidacao final de CI apos fix de intermitencia concluida com sucesso (run `19`, 9/9): `https://github.com/danielheringers/neuromancer/actions/runs/22140345314`.
 - [x] (2026-02-18 13:11Z) Adicionado smoke test real opt-in para `claude-code` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs` e procedimento de fechamento do risco sincronizado em `Alicia/12` e `Alicia/13`.
 - [x] (2026-02-18 13:16Z) Runbook de validacao real do `claude-code` expandido com comandos para PowerShell e bash (Windows/macOS/Linux), mantendo alinhamento cross-platform.
+- [x] (2026-02-18 13:30Z) Risco residual do provider `claude-code` fechado no host atual: identificado binario real `claude` (`2.1.45`) e smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_CLAUDE_CODE_BIN=claude`.
 
 ## Surprises & Discoveries
 
@@ -40,6 +41,8 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
   Evidence: `gh auth status` retorna `The term 'gh' is not recognized...`.
 - Observation: O host atual tambem nao tem `claude-code` instalado.
   Evidence: `claude-code --version` retorna `The term 'claude-code' is not recognized...`.
+- Observation: O provider Claude neste host usa binario `claude` (nao `claude-code`); o smoke real passou ao apontar `ALICIA_CLAUDE_CODE_BIN=claude`.
+  Evidence: `claude --version` retorna `2.1.45 (Claude Code)` e `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` finaliza com `ok`.
 - Observation: O teste `start_pipe_session_emits_started_output_and_finished_events` era sensivel a ordem de chegada dos eventos e podia encerrar leitura cedo demais ao ver `CommandFinished` antes de `CommandOutputChunk`.
   Evidence: falha no CI: `missing command output event with marker`; ao repetir localmente apos ajuste, 12/12 execucoes passaram.
 
@@ -68,10 +71,13 @@ Depois deste trabalho, o time tera um fluxo objetivo para fechar o ciclo atual s
 - Decision: Criar um smoke test real de provider controlado por env var para `claude-code`, em vez de depender apenas de validacao manual ad hoc.
   Rationale: A pendencia vira um procedimento reproduzivel com criterio de aceite claro (`cargo test ... real_provider_claude_code_smoke`) assim que houver host com binario.
   Date/Author: 2026-02-18 / Codex
+- Decision: Ajustar o default do smoke real para `claude` e manter override por `ALICIA_CLAUDE_CODE_BIN`.
+  Rationale: No host alvo atual, o comando oficial disponivel e `claude`; manter override preserva compatibilidade com ambientes diferentes.
+  Date/Author: 2026-02-18 / Codex
 
 ## Outcomes & Retrospective
 
-Plano em estado de fechamento: PR aberto com CI `pull_request` verde apos estabilizacao de teste intermitente, evidencias registradas em `Alicia/12` e `Alicia/13`, e notas de release consolidadas em `Alicia/15`. O objetivo original (tirar o ciclo de estado ad hoc e fechar com rastreabilidade) foi atendido. Resta apenas o risco conhecido de validacao real do provider `claude-code` em host com binario disponivel.
+Plano em estado de fechamento concluido: PR aberto com CI `pull_request` verde apos estabilizacao de teste intermitente, evidencias registradas em `Alicia/12` e `Alicia/13`, notas de release consolidadas em `Alicia/15` e validacao real do provider `claude-code` executada no host atual via binario `claude`.
 
 ## Context and Orientation
 
@@ -161,7 +167,7 @@ Working directory: repository root `C:\Users\danie\OneDrive\Documentos\Projetos\
 
 7. Resolver risco `claude-code`.
 
-    claude-code --version
+    claude --version
 
    If binary is present, executar smoke de adapter e anexar evidencia. If binary is absent, registrar risco residual com dono, prazo e criterio de saida.
 
@@ -208,7 +214,7 @@ Pendencias operacionais atuais (a partir de `Alicia/12`):
 
     - [x] Notas de release/changelog preenchidas.
     - [x] Delta local atual publicado em PR e validado novamente no `alicia-ci` (3 SO).
-    - [ ] Validar provider `claude-code` com binario real no host alvo de release (risco aceito temporariamente nesta iteracao).
+    - [x] Validar provider `claude-code` com binario real no host alvo de release (host atual usa binario `claude`).
 
 Historico de evidencias existentes para referencia:
 
@@ -243,3 +249,4 @@ Update note (2026-02-18 12:47Z): Plano atualizado com diagnostico da falha inter
 Update note (2026-02-18 12:59Z): Plano atualizado com release notes da candidata (`Alicia/15`), checklist sincronizado e revalidacao final de CI verde (run 19).
 Update note (2026-02-18 13:11Z): Plano atualizado com smoke test real opt-in do provider `claude-code` e runbook objetivo para fechar o risco residual em host alvo.
 Update note (2026-02-18 13:16Z): Plano atualizado com comandos equivalentes de validacao para PowerShell e bash no fluxo de fechamento do risco residual.
+Update note (2026-02-18 13:30Z): Plano atualizado com validacao real concluida no host atual usando `claude` (`2.1.45`) e fechamento do risco residual do provider.

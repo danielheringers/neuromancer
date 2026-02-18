@@ -16,8 +16,7 @@ async fn real_provider_claude_code_smoke() -> Result<()> {
         return Ok(());
     }
 
-    let executable =
-        env::var("ALICIA_CLAUDE_CODE_BIN").unwrap_or_else(|_| "claude-code".to_string());
+    let executable = env::var("ALICIA_CLAUDE_CODE_BIN").unwrap_or_else(|_| "claude".to_string());
     let adapter =
         ClaudeCodeAdapter::new(executable).with_minimum_supported_version(Version::new(0, 0, 0));
 

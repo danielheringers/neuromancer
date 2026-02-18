@@ -35,9 +35,9 @@ Esta release candidata consolida os itens:
 ## Compatibilidade e riscos conhecidos
 
 1. Compatibilidade cross-platform validada nos 3 SO via CI.
-2. Risco residual conhecido:
-   - provider `claude-code` nao validado com binario real neste host (`command not found`).
-   - status: risco aceito temporariamente para esta candidata; validacao real obrigatoria antes da release final.
+2. Validacao real de provider concluida no host atual (2026-02-18):
+   - `claude --version` -> `2.1.45 (Claude Code)`.
+   - smoke `real_provider_claude_code_smoke` aprovado com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` e `ALICIA_CLAUDE_CODE_BIN=claude`.
 
 ## Rollback
 

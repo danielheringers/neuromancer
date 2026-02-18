@@ -146,18 +146,18 @@ cargo clippy --fix --all-features --tests --allow-dirty -p codex-alicia-ui
 ### Validacao real do provider `claude-code` (host alvo de release)
 1. Confirmar que o binario esta acessivel:
 ```powershell
-claude-code --version
+claude --version
 ```
 2. Executar o smoke real do adapter (teste habilitado por env var):
 ```powershell
 cd codex-rs
 $env:ALICIA_REAL_PROVIDER_CLAUDE_CODE='1'
-$env:ALICIA_CLAUDE_CODE_BIN='claude-code'
+$env:ALICIA_CLAUDE_CODE_BIN='claude'
 cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
 ```
 ```bash
 cd codex-rs
-ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 ALICIA_CLAUDE_CODE_BIN=claude-code cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
+ALICIA_REAL_PROVIDER_CLAUDE_CODE=1 ALICIA_CLAUDE_CODE_BIN=claude cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture
 ```
 3. Resultado esperado:
    - `test real_provider_claude_code_smoke ... ok`
@@ -230,6 +230,9 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
   - `Alicia Suite Minima - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552280`
   - `Alicia Policy and Approval Scenarios - macos-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552296`
   - `Alicia Suite Minima - windows-latest`: `https://github.com/danielheringers/neuromancer/actions/runs/22139722352/job/64000552310`
+5. Validacao real do provider `claude-code` no host atual:
+- `claude --version` -> `2.1.45 (Claude Code)`
+- `cargo test -p codex-alicia-adapters real_provider_claude_code_smoke -- --exact --nocapture` com `ALICIA_REAL_PROVIDER_CLAUDE_CODE=1` e `ALICIA_CLAUDE_CODE_BIN=claude` -> `ok`.
 
 ## 4.1) Consolidado para planejamento de continuidade (2026-02-18)
 
@@ -244,7 +247,7 @@ cargo run -p codex-alicia-ui --bin codex-alicia-ui-app -- --session-id smoke-202
 ## Pendente para fechar ciclo atual
 - [x] Publicar o delta local atual (branch `neuromancer`) e rerodar o workflow `alicia-ci`.
 - [x] Preencher notas de release/changelog para a candidata de release.
-- [ ] Validar provider `claude-code` com binario real no host alvo de release (executar `real_provider_claude_code_smoke` em `codex-rs/alicia-adapters/tests/real_provider_smoke.rs`; no host atual `claude-code --version` retorna `command not found`).
+- [x] Validar provider `claude-code` com binario real no host alvo de release (host atual usa binario `claude`; `claude --version` retornou `2.1.45 (Claude Code)` e `real_provider_claude_code_smoke` passou com `ALICIA_CLAUDE_CODE_BIN=claude` em 2026-02-18).
 
 
 ## 5) Evidencias recomendadas para aprovacao de release
