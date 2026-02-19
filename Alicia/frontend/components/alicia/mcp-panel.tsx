@@ -136,8 +136,8 @@ export function McpPanel({ servers, onClose }: McpPanelProps) {
 
         {/* Scrollable server list */}
         <div className="overflow-y-auto p-3 flex flex-col gap-2 min-h-0">
-          {servers.map(server => (
-            <ServerRow key={server.id} server={server} />
+          {servers.map((server, index) => (
+            <ServerRow key={`${server.id}-${index}`} server={server} />
           ))}
         </div>
 
@@ -165,3 +165,4 @@ export function McpPanel({ servers, onClose }: McpPanelProps) {
     </div>
   )
 }
+
