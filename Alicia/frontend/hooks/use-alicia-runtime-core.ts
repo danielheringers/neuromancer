@@ -1,7 +1,15 @@
-import { useCallback, useMemo, type Dispatch, type MutableRefObject, type SetStateAction } from "react"
+import {
+  useCallback,
+  useMemo,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react"
 
 import { type AliciaState } from "@/lib/alicia-types"
 import {
+  isRuntimeCommandUnavailable,
+  mapThreadRecordsToSessions,
   parseMcpListOutput,
   relativeNowLabel,
   writeModelsCache,
@@ -14,11 +22,13 @@ import {
   codexBridgeStop,
   codexModelsList,
   codexMcpList,
+  codexThreadList,
   runCodexCommand,
   terminalCreate,
   terminalKill,
   terminalResize,
   type CodexModel,
+  type CodexThreadRecord,
 } from "@/lib/tauri-bridge"
 
 interface UseAliciaRuntimeCoreParams {
@@ -43,6 +53,11 @@ interface UseAliciaRuntimeCoreParams {
   setActiveTerminalId: Dispatch<SetStateAction<number | null>>
 }
 
+interface RefreshThreadListOptions {
+  activeThreadId?: string | null
+  notifyOnError?: boolean
+}
+
 export function useAliciaRuntimeCore({
   addMessage,
   runtime,
@@ -65,29 +80,88 @@ export function useAliciaRuntimeCore({
   setActiveTerminalId,
 }: UseAliciaRuntimeCoreParams) {
   const setActiveSessionEntry = useCallback(
-    (sessionId: number, model?: string) => {
+    (sessionId: number, model?: string, threadId?: string | null) => {
       setAliciaState((previous) => {
-        const id = `session-${sessionId}`
+        const normalizedThreadId =
+          typeof threadId === "string" && threadId.trim().length > 0
+            ? threadId.trim()
+            : null
+        const id = normalizedThreadId ?? `session-${sessionId}`
         const existing = previous.sessions.find((session) => session.id === id)
         return {
           ...previous,
           sessions: [
             {
               id,
+              threadId: normalizedThreadId ?? existing?.threadId,
               name: existing?.name ?? `Session ${sessionId}`,
               time: relativeNowLabel(),
               active: true,
               messageCount: existing?.messageCount ?? 0,
               model: existing?.model ?? model ?? previous.model,
+              createdAt: existing?.createdAt ?? null,
+              updatedAt: existing?.updatedAt ?? null,
+              sourceKind: existing?.sourceKind ?? null,
+              cwd: existing?.cwd,
             },
             ...previous.sessions
               .filter((session) => session.id !== id)
               .map((session) => ({ ...session, active: false })),
-          ].slice(0, 20),
+          ].slice(0, 50),
         }
       })
     },
     [setAliciaState],
+  )
+
+  const refreshThreadList = useCallback(
+    async (
+      options: RefreshThreadListOptions = {},
+    ): Promise<CodexThreadRecord[]> => {
+      if (!runtime.connected) {
+        return []
+      }
+
+      try {
+        const response = await codexThreadList({
+          cursor: null,
+          limit: 50,
+          sortKey: "updated_at",
+          archived: false,
+        })
+
+        const records = Array.isArray(response.data) ? response.data : []
+        const activeThreadId =
+          typeof options.activeThreadId === "string" &&
+          options.activeThreadId.trim().length > 0
+            ? options.activeThreadId.trim()
+            : threadIdRef.current
+
+        const sessions = mapThreadRecordsToSessions(records, {
+          activeThreadId,
+          fallbackModel: aliciaState.model,
+        })
+
+        setAliciaState((previous) => ({
+          ...previous,
+          sessions: sessions.slice(0, 50),
+        }))
+
+        return records
+      } catch (error) {
+        if (options.notifyOnError && !isRuntimeCommandUnavailable(error)) {
+          addMessage("system", `[threads] refresh failed: ${String(error)}`)
+        }
+        return []
+      }
+    },
+    [
+      addMessage,
+      aliciaState.model,
+      runtime.connected,
+      setAliciaState,
+      threadIdRef,
+    ],
   )
 
   const refreshMcpServers = useCallback(async () => {
@@ -144,7 +218,10 @@ export function useAliciaRuntimeCore({
         setModelsFromCache(availableModels.length > 0)
         if (notifyOnError) {
           if (availableModels.length > 0) {
-            addMessage("system", `[models] live refresh failed, using cached catalog: ${message}`)
+            addMessage(
+              "system",
+              `[models] live refresh failed, using cached catalog: ${message}`,
+            )
           } else {
             addMessage("system", `[models] failed: ${message}`)
           }
@@ -192,7 +269,12 @@ export function useAliciaRuntimeCore({
           threadIdRef.current = null
           seenEventSeqRef.current.clear()
           streamedAgentTextRef.current.clear()
-          setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
+          setRuntime((prev) => ({
+            ...prev,
+            state: "idle",
+            sessionId: null,
+            pid: null,
+          }))
         }
         if (!forceNew && runtime.sessionId != null) {
           return true
@@ -252,7 +334,14 @@ export function useAliciaRuntimeCore({
         return false
       }
     },
-    [addMessage, runtime.connected, setActiveTerminalId, setTerminalTabs, terminalBuffersRef, xtermRef],
+    [
+      addMessage,
+      runtime.connected,
+      setActiveTerminalId,
+      setTerminalTabs,
+      terminalBuffersRef,
+      xtermRef,
+    ],
   )
 
   const closeTerminalTab = useCallback(
@@ -283,13 +372,17 @@ export function useAliciaRuntimeCore({
       return current.displayName
     }
     if (aliciaState.model === "default") {
-      return availableModels.find((model) => model.isDefault)?.displayName || "Codex Default"
+      return (
+        availableModels.find((model) => model.isDefault)?.displayName ||
+        "Codex Default"
+      )
     }
     return aliciaState.model
   }, [aliciaState.model, availableModels])
 
   return {
     setActiveSessionEntry,
+    refreshThreadList,
     refreshMcpServers,
     refreshModelsCatalog,
     openModelPanel,

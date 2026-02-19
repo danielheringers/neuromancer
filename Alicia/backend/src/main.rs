@@ -28,7 +28,7 @@ use crate::mcp_runtime::{McpServerListResponse, McpStartupWarmupResponse};
 pub(crate) use crate::launch_runtime::{default_codex_binary, resolve_binary_path, resolve_codex_launch};
 pub(crate) use crate::events_runtime::{emit_codex_event, emit_lifecycle, emit_stderr, emit_stdout, emit_terminal_data, emit_terminal_exit};
 
-
+// Comentario de teste
 const CODEX_HELP_CLI_TREE: &str = r#"codex
   exec (alias: e)
     resume
@@ -91,7 +91,7 @@ const CODEX_HELP_SLASH_COMMANDS: &[&str] = &[
     "/diff",
     "/mention",
     "/status",
-    "/debug-config",
+    // "/debug-config",
     "/statusline",
     "/mcp",
     "/apps",
@@ -212,6 +212,190 @@ struct CodexTurnRunResponse {
 #[serde(rename_all = "camelCase")]
 struct CodexThreadOpenResponse {
     thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadTurnHistoryMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadTurnSummary {
+    id: String,
+    status: String,
+    item_count: usize,
+    #[serde(default)]
+    messages: Vec<CodexThreadTurnHistoryMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadSummary {
+    id: String,
+    #[serde(default)]
+    codex_thread_id: Option<String>,
+    preview: String,
+    model_provider: String,
+    created_at: i64,
+    updated_at: i64,
+    cwd: String,
+    path: Option<String>,
+    source: String,
+    turn_count: usize,
+    #[serde(default)]
+    turns: Vec<CodexThreadTurnSummary>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadListRequest {
+    cursor: Option<String>,
+    limit: Option<u32>,
+    sort_key: Option<String>,
+    model_providers: Option<Vec<String>>,
+    source_kinds: Option<Vec<String>>,
+    archived: Option<bool>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadListResponse {
+    data: Vec<CodexThreadSummary>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadReadRequest {
+    thread_id: String,
+    include_turns: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadReadResponse {
+    thread: CodexThreadSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadArchiveRequest {
+    thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadArchiveResponse {
+    id: String,
+    codex_thread_id: String,
+    archived: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadUnarchiveRequest {
+    thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadUnarchiveResponse {
+    thread: CodexThreadSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadCompactStartRequest {
+    thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadCompactStartResponse {
+    ok: bool,
+    thread_id: String,
+    codex_thread_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadRollbackRequest {
+    thread_id: String,
+    num_turns: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadRollbackResponse {
+    thread: CodexThreadSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadForkRequest {
+    thread_id: String,
+    path: Option<String>,
+    model: Option<String>,
+    model_provider: Option<String>,
+    cwd: Option<String>,
+    approval_policy: Option<String>,
+    sandbox: Option<String>,
+    config: Option<Value>,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    persist_extended_history: Option<bool>,
+    new_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadForkResponse {
+    thread: CodexThreadSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerRequest {
+    thread_id: String,
+    input_items: Vec<CodexInputItem>,
+    expected_turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnSteerResponse {
+    thread_id: String,
+    codex_thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnInterruptRequest {
+    thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnInterruptResponse {
+    ok: bool,
+    thread_id: String,
+    codex_thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexApprovalRespondRequest {
+    action_id: String,
+    decision: String,
+    remember: Option<bool>,
+    execpolicy_amendment: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,6 +594,86 @@ async fn codex_thread_open(
 }
 
 #[tauri::command]
+async fn codex_thread_list(
+    state: State<'_, AppState>,
+    request: Option<CodexThreadListRequest>,
+) -> Result<CodexThreadListResponse, String> {
+    crate::session_runtime::codex_thread_list_impl(state, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+async fn codex_thread_read(
+    state: State<'_, AppState>,
+    request: CodexThreadReadRequest,
+) -> Result<CodexThreadReadResponse, String> {
+    crate::session_runtime::codex_thread_read_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_archive(
+    state: State<'_, AppState>,
+    request: CodexThreadArchiveRequest,
+) -> Result<CodexThreadArchiveResponse, String> {
+    crate::session_runtime::codex_thread_archive_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_unarchive(
+    state: State<'_, AppState>,
+    request: CodexThreadUnarchiveRequest,
+) -> Result<CodexThreadUnarchiveResponse, String> {
+    crate::session_runtime::codex_thread_unarchive_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_compact_start(
+    state: State<'_, AppState>,
+    request: CodexThreadCompactStartRequest,
+) -> Result<CodexThreadCompactStartResponse, String> {
+    crate::session_runtime::codex_thread_compact_start_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_rollback(
+    state: State<'_, AppState>,
+    request: CodexThreadRollbackRequest,
+) -> Result<CodexThreadRollbackResponse, String> {
+    crate::session_runtime::codex_thread_rollback_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_fork(
+    state: State<'_, AppState>,
+    request: CodexThreadForkRequest,
+) -> Result<CodexThreadForkResponse, String> {
+    crate::session_runtime::codex_thread_fork_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_turn_steer(
+    state: State<'_, AppState>,
+    request: CodexTurnSteerRequest,
+) -> Result<CodexTurnSteerResponse, String> {
+    crate::session_runtime::codex_turn_steer_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_turn_interrupt(
+    state: State<'_, AppState>,
+    request: CodexTurnInterruptRequest,
+) -> Result<CodexTurnInterruptResponse, String> {
+    crate::session_runtime::codex_turn_interrupt_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_approval_respond(
+    state: State<'_, AppState>,
+    request: CodexApprovalRespondRequest,
+) -> Result<(), String> {
+    crate::session_runtime::codex_approval_respond_impl(state, request).await
+}
+
+#[tauri::command]
 async fn send_codex_input(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -537,6 +801,16 @@ fn main() {
             codex_bridge_stop,
             codex_turn_run,
             codex_thread_open,
+            codex_thread_list,
+            codex_thread_read,
+            codex_thread_archive,
+            codex_thread_unarchive,
+            codex_thread_compact_start,
+            codex_thread_rollback,
+            codex_thread_fork,
+            codex_turn_steer,
+            codex_turn_interrupt,
+            codex_approval_respond,
             update_codex_config,
             codex_config_get,
             codex_config_set,

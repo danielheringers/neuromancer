@@ -2,6 +2,8 @@
 
 import { Bot, User, ChevronRight, Check, FileEdit, Search, Terminal, Copy, CheckCheck, FileCode2 } from "lucide-react"
 import { useState } from "react"
+import { parseAgentSpawnerPayload } from "@/lib/agent-spawner-events"
+import { AgentSpawner } from "./agent-spawner"
 import { StatusSnapshotCard, parseStatusSnapshot } from "./status-snapshot-card"
 
 type MessageType = "user" | "agent" | "system" | "tool"
@@ -170,6 +172,8 @@ export function TerminalMessage({
   thinking,
 }: TerminalMessageProps) {
   const statusSnapshot = type === "system" ? parseStatusSnapshot(content) : null
+  const agentSpawnerPayload =
+    type === "system" ? parseAgentSpawnerPayload(content) : null
 
   return (
     <div className={`group flex gap-3 px-5 py-3 ${type === "user" ? "bg-line-highlight/50" : ""} hover:bg-line-highlight/30 transition-colors`}>
@@ -220,6 +224,12 @@ export function TerminalMessage({
           <>
             {statusSnapshot ? (
               <StatusSnapshotCard snapshot={statusSnapshot} timestamp={timestamp} />
+            ) : agentSpawnerPayload ? (
+              <AgentSpawner
+                agents={agentSpawnerPayload.agents}
+                waiting={agentSpawnerPayload.waiting}
+                timestamp={timestamp}
+              />
             ) : (
               <div className="text-sm text-terminal-fg/90 leading-relaxed whitespace-pre-wrap">
                 {content}
@@ -267,3 +277,6 @@ export function TerminalMessage({
 export function FileCode2Icon(props: React.SVGProps<SVGSVGElement>) {
   return <FileCode2 {...props} />
 }
+
+
+

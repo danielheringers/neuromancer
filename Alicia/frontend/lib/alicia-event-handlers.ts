@@ -12,9 +12,13 @@ import {
   formatStructuredItem,
   itemIdentity,
   mergeTerminalBuffer,
+  normalizePlanStepStatus,
+  type ApprovalRequestState,
   type Message,
   type RuntimeState,
   type TerminalTab,
+  type TurnDiffState,
+  type TurnPlanState,
 } from "@/lib/alicia-runtime-helpers"
 
 type AddMessage = (type: Message["type"], content: string) => void
@@ -23,28 +27,41 @@ interface CodexEventHandlerDeps {
   addMessage: AddMessage
   setRuntime: Dispatch<SetStateAction<RuntimeState>>
   setIsThinking: Dispatch<SetStateAction<boolean>>
+  setPendingApprovals: Dispatch<SetStateAction<ApprovalRequestState[]>>
+  setTurnDiff: Dispatch<SetStateAction<TurnDiffState | null>>
+  setTurnPlan: Dispatch<SetStateAction<TurnPlanState | null>>
   seenEventSeqRef: MutableRefObject<Set<number>>
   streamedAgentTextRef: MutableRefObject<Map<string, string>>
+  threadIdRef: MutableRefObject<string | null>
 }
 
 export function createCodexEventHandler({
   addMessage,
   setRuntime,
   setIsThinking,
+  setPendingApprovals,
+  setTurnDiff,
+  setTurnPlan,
   seenEventSeqRef,
   streamedAgentTextRef,
+  threadIdRef,
 }: CodexEventHandlerDeps) {
   return (event: CodexRuntimeEvent) => {
     if (event.type === "lifecycle") {
       if (event.payload.status === "error") {
         setRuntime((prev) => ({ ...prev, state: "error" }))
         setIsThinking(false)
+        setPendingApprovals([])
+        setTurnDiff(null)
         streamedAgentTextRef.current.clear()
         addMessage("system", event.payload.message ?? "runtime error")
       }
       if (event.payload.status === "stopped") {
         setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
         setIsThinking(false)
+        setPendingApprovals([])
+        setTurnDiff(null)
+        setTurnPlan(null)
         streamedAgentTextRef.current.clear()
       }
       return
@@ -83,10 +100,17 @@ export function createCodexEventHandler({
     const eventType = String(payload.type ?? "")
     if (eventType === "thread.started") {
       const codexThreadId = String(payload.thread_id ?? "")
+      if (codexThreadId.trim().length > 0) {
+        threadIdRef.current = codexThreadId
+      }
       addMessage("system", `[thread] started ${codexThreadId}`)
       return
     }
     if (eventType === "turn.started") {
+      const turnThreadId = String(payload.thread_id ?? "")
+      if (turnThreadId.trim().length > 0) {
+        threadIdRef.current = turnThreadId
+      }
       setIsThinking(true)
       return
     }
@@ -102,6 +126,116 @@ export function createCodexEventHandler({
       addMessage("system", `[turn failed] ${String(error?.message ?? "unknown")}`)
       return
     }
+
+    if (eventType === "thread.token_usage.updated") {
+      const usage = payload.token_usage as Record<string, unknown> | undefined
+      const total = usage?.total as Record<string, unknown> | undefined
+      const input = Number(total?.input_tokens ?? 0)
+      const output = Number(total?.output_tokens ?? 0)
+      const totalTokens = Number(total?.total_tokens ?? 0)
+      if (
+        Number.isFinite(input) &&
+        Number.isFinite(output) &&
+        Number.isFinite(totalTokens) &&
+        totalTokens > 0
+      ) {
+        addMessage(
+          "system",
+          `[usage] total=${totalTokens} input=${input} output=${output}`,
+        )
+      }
+      return
+    }
+
+    if (eventType === "turn.diff.updated") {
+      setTurnDiff({
+        threadId: String(payload.thread_id ?? ""),
+        turnId: String(payload.turn_id ?? ""),
+        diff: String(payload.diff ?? ""),
+      })
+      return
+    }
+
+    if (eventType === "turn.plan.updated") {
+      const rawPlan = Array.isArray(payload.plan) ? payload.plan : []
+      const plan = rawPlan
+        .map((entry) => {
+          const step = String((entry as Record<string, unknown>)?.step ?? "").trim()
+          if (!step) {
+            return null
+          }
+          return {
+            step,
+            status: normalizePlanStepStatus(
+              (entry as Record<string, unknown>)?.status,
+            ),
+          }
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+
+      setTurnPlan({
+        threadId: String(payload.thread_id ?? ""),
+        turnId: String(payload.turn_id ?? ""),
+        explanation:
+          typeof payload.explanation === "string" && payload.explanation.trim().length > 0
+            ? payload.explanation
+            : null,
+        plan,
+      })
+      return
+    }
+
+    if (eventType === "approval.requested") {
+      const nextApproval: ApprovalRequestState = {
+        actionId: String(payload.action_id ?? ""),
+        kind:
+          payload.kind === "file_change" ? "file_change" : "command_execution",
+        threadId: String(payload.thread_id ?? ""),
+        turnId: String(payload.turn_id ?? ""),
+        itemId: String(payload.item_id ?? ""),
+        reason: String(payload.reason ?? ""),
+        command: String(payload.command ?? ""),
+        cwd: String(payload.cwd ?? ""),
+        grantRoot: String(payload.grant_root ?? ""),
+        commandActions: Array.isArray(payload.command_actions)
+          ? payload.command_actions
+          : [],
+        proposedExecpolicyAmendment: Array.isArray(
+          payload.proposed_execpolicy_amendment,
+        )
+          ? payload.proposed_execpolicy_amendment.map((entry) => String(entry))
+          : [],
+      }
+
+      if (!nextApproval.actionId) {
+        return
+      }
+
+      setPendingApprovals((previous) => {
+        const existing = previous.findIndex(
+          (entry) => entry.actionId === nextApproval.actionId,
+        )
+        if (existing < 0) {
+          return [...previous, nextApproval]
+        }
+
+        const copy = [...previous]
+        copy[existing] = nextApproval
+        return copy
+      })
+      return
+    }
+
+    if (eventType === "approval.resolved") {
+      const actionId = String(payload.action_id ?? "")
+      if (actionId) {
+        setPendingApprovals((previous) =>
+          previous.filter((entry) => entry.actionId !== actionId),
+        )
+      }
+      return
+    }
+
     if (
       eventType === "item.started" ||
       eventType === "item.updated" ||
@@ -181,5 +315,3 @@ export function createTerminalEventHandler<TWriter extends TerminalOutputWriter>
     )
   }
 }
-
-

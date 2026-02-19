@@ -55,11 +55,16 @@ export const DEFAULT_MCP_SERVERS: McpServer[] = [
 
 export interface Session {
   id: string
+  threadId?: string
   name: string
   time: string
   active: boolean
   messageCount: number
   model: string
+  createdAt?: number | null
+  updatedAt?: number | null
+  sourceKind?: string | null
+  cwd?: string
 }
 
 export const DEFAULT_SESSIONS: Session[] = [

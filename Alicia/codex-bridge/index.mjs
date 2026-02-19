@@ -169,11 +169,15 @@ function createRuntime(child) {
     stdin: child.stdin,
     pending: new Map(),
     nextRequestId: 1,
+    nextApprovalId: 1,
     startPromise: null,
     started: false,
     closed: false,
     turnTrackers: new Map(),
     agentBuffers: new Map(),
+    rawCollabCalls: new Map(),
+    completedCollabCallIds: new Set(),
+    pendingApprovals: new Map(),
   };
 }
 
@@ -185,6 +189,425 @@ function normalizeStatus(status) {
   if (value === "failed") return "failed";
   if (value === "declined") return "declined";
   return value || "in_progress";
+}
+
+const AGENT_SPAWNER_MESSAGE_PREFIX = "__ALICIA_AGENT_SPAWNER__:";
+
+function normalizeCollabToolName(tool) {
+  const normalized = String(tool || "")
+    .trim()
+    .toLowerCase();
+
+  if (normalized === "spawnagent" || normalized === "spawn_agent") {
+    return "spawn_agent";
+  }
+  if (normalized === "sendinput" || normalized === "send_input") {
+    return "send_input";
+  }
+  if (normalized === "resumeagent" || normalized === "resume_agent") {
+    return "resume_agent";
+  }
+  if (normalized === "closeagent" || normalized === "close_agent") {
+    return "close_agent";
+  }
+  if (normalized === "wait") {
+    return "wait";
+  }
+
+  return normalized;
+}
+
+function isSupportedCollabTool(tool) {
+  return (
+    tool === "spawn_agent" ||
+    tool === "send_input" ||
+    tool === "resume_agent" ||
+    tool === "wait" ||
+    tool === "close_agent"
+  );
+}
+
+function parseJsonObjectString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    return asPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readCollabPromptFromArgs(args) {
+  if (!asPlainObject(args)) {
+    return "";
+  }
+
+  if (typeof args.message === "string" && args.message.trim().length > 0) {
+    return args.message.trim();
+  }
+
+  const items = Array.isArray(args.items) ? args.items : [];
+  for (const item of items) {
+    if (!asPlainObject(item)) {
+      continue;
+    }
+    const type = String(item.type || "").trim().toLowerCase();
+    if ((type === "text" || type === "input_text") && typeof item.text === "string") {
+      const text = item.text.trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+
+  return "";
+}
+
+function uniqueTrimmedStrings(values) {
+  const seen = new Set();
+  const ordered = [];
+  for (const raw of values) {
+    const value = String(raw || "").trim();
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    ordered.push(value);
+  }
+  return ordered;
+}
+
+function readCollabReceiverThreadIdsFromArgs(tool, args) {
+  if (!asPlainObject(args)) {
+    return [];
+  }
+
+  if (tool === "wait") {
+    const ids = Array.isArray(args.ids) ? args.ids : [];
+    return uniqueTrimmedStrings(ids);
+  }
+
+  if (typeof args.id === "string" && args.id.trim().length > 0) {
+    return [args.id.trim()];
+  }
+
+  return [];
+}
+
+function parseFunctionCallOutputBody(body) {
+  if (asPlainObject(body)) {
+    return body;
+  }
+
+  if (typeof body === "string") {
+    return parseJsonObjectString(body) ?? {};
+  }
+
+  if (Array.isArray(body)) {
+    const text = body
+      .map((entry) => {
+        if (!asPlainObject(entry)) {
+          return "";
+        }
+        const type = String(entry.type || "").trim().toLowerCase();
+        if ((type === "input_text" || type === "text") && typeof entry.text === "string") {
+          return entry.text;
+        }
+        return "";
+      })
+      .filter((entry) => entry.trim().length > 0)
+      .join("\n");
+    return parseJsonObjectString(text) ?? {};
+  }
+
+  return {};
+}
+
+function parseFunctionCallOutputPayload(output) {
+  const success = asPlainObject(output) && typeof output.success === "boolean" ? output.success : null;
+
+  let body = {};
+  if (asPlainObject(output)) {
+    if (Object.prototype.hasOwnProperty.call(output, "body")) {
+      body = parseFunctionCallOutputBody(output.body);
+    } else {
+      body = parseFunctionCallOutputBody(output);
+      if (Object.prototype.hasOwnProperty.call(body, "success")) {
+        delete body.success;
+      }
+    }
+  } else {
+    body = parseFunctionCallOutputBody(output);
+  }
+
+  return { body, success };
+}
+
+function isCollabFailureState(value) {
+  const normalized =
+    typeof value === "string"
+      ? value.trim().toLowerCase()
+      : asPlainObject(value) && typeof value.status === "string"
+        ? value.status.trim().toLowerCase()
+        : "";
+
+  return (
+    normalized === "failed" ||
+    normalized === "error" ||
+    normalized === "errored" ||
+    normalized === "notfound" ||
+    normalized === "not_found"
+  );
+}
+
+function deriveCollabReceiverThreadIds(tool, args, outputBody) {
+  const receiverIds = readCollabReceiverThreadIdsFromArgs(tool, args);
+
+  if (tool === "spawn_agent") {
+    const spawnedAgentId =
+      typeof outputBody.agent_id === "string"
+        ? outputBody.agent_id.trim()
+        : typeof outputBody.agentId === "string"
+          ? outputBody.agentId.trim()
+          : "";
+    if (spawnedAgentId) {
+      receiverIds.push(spawnedAgentId);
+    }
+  }
+
+  if (tool === "wait" && asPlainObject(outputBody.status)) {
+    receiverIds.push(...Object.keys(outputBody.status));
+  }
+
+  return uniqueTrimmedStrings(receiverIds);
+}
+
+function deriveCollabAgentsStates(tool, outputBody, receiverThreadIds) {
+  if (!asPlainObject(outputBody)) {
+    return {};
+  }
+
+  const states = {};
+
+  if (tool === "wait" && asPlainObject(outputBody.status)) {
+    for (const [agentId, status] of Object.entries(outputBody.status)) {
+      const key = String(agentId || "").trim();
+      if (!key) {
+        continue;
+      }
+      states[key] = status;
+    }
+    return states;
+  }
+
+  if (tool === "spawn_agent") {
+    const spawnedAgentId =
+      typeof outputBody.agent_id === "string"
+        ? outputBody.agent_id.trim()
+        : typeof outputBody.agentId === "string"
+          ? outputBody.agentId.trim()
+          : "";
+    if (spawnedAgentId) {
+      states[spawnedAgentId] = Object.prototype.hasOwnProperty.call(outputBody, "status")
+        ? outputBody.status
+        : "running";
+    }
+    return states;
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(outputBody, "status")) {
+    return states;
+  }
+
+  for (const receiverId of receiverThreadIds) {
+    states[receiverId] = outputBody.status;
+  }
+
+  return states;
+}
+
+function deriveCollabToolStatus(tool, outputBody, agentsStates, outputSuccess) {
+  if (outputSuccess === false) {
+    return "failed";
+  }
+
+  const stateValues = Object.values(agentsStates);
+
+  if (tool === "wait") {
+    const timedOut = Boolean(outputBody?.timed_out ?? outputBody?.timedOut);
+    if (timedOut && stateValues.length === 0) {
+      return "in_progress";
+    }
+  }
+
+  if (stateValues.some((value) => isCollabFailureState(value))) {
+    return "failed";
+  }
+
+  return "completed";
+}
+
+function inferCollabToolFromFunctionCallOutput(item, outputBody) {
+  const directTool = normalizeCollabToolName(item?.name || item?.tool);
+  if (isSupportedCollabTool(directTool)) {
+    return directTool;
+  }
+
+  if (!asPlainObject(outputBody)) {
+    return "";
+  }
+
+  const hasSpawnedAgent =
+    (typeof outputBody.agent_id === "string" && outputBody.agent_id.trim().length > 0) ||
+    (typeof outputBody.agentId === "string" && outputBody.agentId.trim().length > 0);
+  if (hasSpawnedAgent) {
+    return "spawn_agent";
+  }
+
+  if (
+    asPlainObject(outputBody.status) ||
+    Array.isArray(outputBody.receivers) ||
+    Array.isArray(outputBody.receiverIds) ||
+    Array.isArray(outputBody.receiver_ids) ||
+    Object.prototype.hasOwnProperty.call(outputBody, "timed_out") ||
+    Object.prototype.hasOwnProperty.call(outputBody, "timedOut")
+  ) {
+    return "wait";
+  }
+
+  return "";
+}
+
+function rememberCompletedCollabCall(runtime, callId) {
+  const key = String(callId || "").trim();
+  if (!key || !runtime?.completedCollabCallIds) {
+    return;
+  }
+
+  runtime.completedCollabCallIds.add(key);
+  if (runtime.completedCollabCallIds.size > 4096) {
+    const first = runtime.completedCollabCallIds.values().next().value;
+    if (first) {
+      runtime.completedCollabCallIds.delete(first);
+    }
+  }
+}
+
+function cacheRawCollabCall(runtime, callId, value) {
+  const key = String(callId || "").trim();
+  if (!key || !runtime?.rawCollabCalls) {
+    return;
+  }
+
+  runtime.rawCollabCalls.set(key, value);
+  if (runtime.rawCollabCalls.size > 4096) {
+    const first = runtime.rawCollabCalls.keys().next().value;
+    if (first) {
+      runtime.rawCollabCalls.delete(first);
+    }
+  }
+}
+
+function convertRawResponseItemToLegacy(runtime, item, context = {}) {
+  if (!asPlainObject(item)) {
+    return null;
+  }
+
+  const itemType = String(item.type || "").trim().toLowerCase();
+  if (itemType === "function_call") {
+    const tool = normalizeCollabToolName(item.name || item.tool);
+    if (!isSupportedCollabTool(tool)) {
+      return null;
+    }
+
+    const callId = String(item.call_id || item.callId || item.id || "").trim();
+    if (!callId) {
+      return null;
+    }
+
+    const parsedArguments =
+      asPlainObject(item.arguments) ? item.arguments : parseJsonObjectString(item.arguments) ?? {};
+    const senderThreadId =
+      normalizeThreadIdCandidate(context.senderThreadId) ||
+      normalizeThreadIdCandidate(context.threadId);
+    const receiverThreadIds = readCollabReceiverThreadIdsFromArgs(tool, parsedArguments);
+    const prompt = readCollabPromptFromArgs(parsedArguments);
+
+    cacheRawCollabCall(runtime, callId, {
+      callId,
+      tool,
+      senderThreadId,
+      receiverThreadIds,
+      prompt,
+      arguments: parsedArguments,
+    });
+
+    return null;
+  }
+
+  if (itemType !== "function_call_output") {
+    return null;
+  }
+
+  const callId = String(item.call_id || item.callId || item.id || "").trim();
+  if (!callId) {
+    return null;
+  }
+
+  if (runtime?.completedCollabCallIds?.has(callId)) {
+    runtime.rawCollabCalls?.delete(callId);
+    return null;
+  }
+
+  const { body: outputBody, success: outputSuccess } = parseFunctionCallOutputPayload(item.output);
+
+  const pending = runtime?.rawCollabCalls?.get(callId);
+  if (pending) {
+    runtime.rawCollabCalls.delete(callId);
+  }
+
+  const resolvedTool = isSupportedCollabTool(pending?.tool)
+    ? pending.tool
+    : inferCollabToolFromFunctionCallOutput(item, outputBody);
+  if (!isSupportedCollabTool(resolvedTool)) {
+    return null;
+  }
+
+  const receiverThreadIds = deriveCollabReceiverThreadIds(
+    resolvedTool,
+    pending?.arguments ?? {},
+    outputBody,
+  );
+  const agentsStates = deriveCollabAgentsStates(resolvedTool, outputBody, receiverThreadIds);
+  const status = deriveCollabToolStatus(
+    resolvedTool,
+    outputBody,
+    agentsStates,
+    outputSuccess,
+  );
+  const senderThreadId =
+    normalizeThreadIdCandidate(pending?.senderThreadId) ||
+    normalizeThreadIdCandidate(context.senderThreadId) ||
+    normalizeThreadIdCandidate(context.threadId);
+
+  return {
+    type: "collab_tool_call",
+    id: callId,
+    tool: resolvedTool,
+    status,
+    sender_thread_id: senderThreadId,
+    receiver_thread_ids: receiverThreadIds,
+    prompt: typeof pending?.prompt === "string" ? pending.prompt : "",
+    agents_states: agentsStates,
+  };
 }
 
 function convertThreadItemToLegacy(item) {
@@ -228,6 +651,44 @@ function convertThreadItemToLegacy(item) {
       arguments: item.arguments ?? {},
       result: item.result ?? null,
       error: item.error ?? null,
+    };
+  }
+
+  if (type === "collabAgentToolCall" || type === "collabToolCall") {
+    const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+      ? item.receiverThreadIds
+      : Array.isArray(item.receiver_thread_ids)
+        ? item.receiver_thread_ids
+        : typeof item.receiverThreadId === "string"
+          ? [item.receiverThreadId]
+          : typeof item.receiver_thread_id === "string"
+            ? [item.receiver_thread_id]
+            : typeof item.newThreadId === "string"
+              ? [item.newThreadId]
+              : typeof item.new_thread_id === "string"
+                ? [item.new_thread_id]
+                : [];
+
+    return {
+      type: "collab_tool_call",
+      id: item.id,
+      tool: normalizeCollabToolName(item.tool),
+      status: normalizeStatus(item.status),
+      sender_thread_id:
+        typeof item.senderThreadId === "string"
+          ? item.senderThreadId
+          : typeof item.sender_thread_id === "string"
+            ? item.sender_thread_id
+            : "",
+      receiver_thread_ids: receiverThreadIds
+        .map((entry) => String(entry || "").trim())
+        .filter((entry) => entry.length > 0),
+      prompt: typeof item.prompt === "string" ? item.prompt : "",
+      agents_states: asPlainObject(item.agentsStates)
+        ? item.agentsStates
+        : asPlainObject(item.agents_states)
+          ? item.agents_states
+          : {},
     };
   }
 
@@ -447,7 +908,7 @@ function normalizeInputItems(inputItems) {
       continue;
     }
 
-    if (type === "local_image" && typeof item.path === "string" && item.path.length > 0) {
+    if ((type === "local_image" || type === "localimage") && typeof item.path === "string" && item.path.length > 0) {
       normalized.push({
         type: "localImage",
         path: item.path,
@@ -471,12 +932,20 @@ function normalizeInputItems(inputItems) {
       continue;
     }
 
-    if (type === "image" && typeof item.imageUrl === "string" && item.imageUrl.length > 0) {
-      normalized.push({
-        type: "text",
-        text: `Image URL: ${item.imageUrl}`,
-      });
-      continue;
+    if (type === "image") {
+      const imageUrl =
+        typeof item.imageUrl === "string" && item.imageUrl.length > 0
+          ? item.imageUrl
+          : typeof item.url === "string" && item.url.length > 0
+            ? item.url
+            : "";
+      if (imageUrl) {
+        normalized.push({
+          type: "text",
+          text: `Image URL: ${imageUrl}`,
+        });
+        continue;
+      }
     }
   }
 
@@ -588,10 +1057,229 @@ function rejectPendingRequests(runtime, message) {
       });
     }
   }
+
+  for (const [actionId, pendingApproval] of runtime.pendingApprovals) {
+    runtime.pendingApprovals.delete(actionId);
+    pendingApproval.reject(new Error(message));
+  }
 }
 
 function asPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeApprovalKind(method) {
+  if (method === "item/commandExecution/requestApproval") {
+    return "command_execution";
+  }
+  if (method === "item/fileChange/requestApproval") {
+    return "file_change";
+  }
+  return null;
+}
+
+function makeApprovalActionId(runtime) {
+  const value = runtime.nextApprovalId;
+  runtime.nextApprovalId += 1;
+  return `approval-${value}`;
+}
+
+function approvalDecisionName(responsePayload) {
+  const decision = responsePayload?.decision;
+  if (typeof decision === "string") {
+    return decision;
+  }
+
+  if (asPlainObject(decision) && Object.prototype.hasOwnProperty.call(decision, "acceptWithExecpolicyAmendment")) {
+    return "acceptWithExecpolicyAmendment";
+  }
+
+  return "decline";
+}
+
+function normalizeCommandApprovalResult(decision, execpolicyAmendment) {
+  if (decision === "accept") {
+    return { decision: "accept" };
+  }
+  if (decision === "acceptForSession") {
+    return { decision: "acceptForSession" };
+  }
+  if (decision === "decline") {
+    return { decision: "decline" };
+  }
+  if (decision === "cancel") {
+    return { decision: "cancel" };
+  }
+  if (decision === "acceptWithExecpolicyAmendment") {
+    if (!Array.isArray(execpolicyAmendment) || execpolicyAmendment.length === 0) {
+      throw new Error("acceptWithExecpolicyAmendment requires execpolicyAmendment");
+    }
+    return {
+      decision: {
+        acceptWithExecpolicyAmendment: {
+          execpolicy_amendment: execpolicyAmendment,
+        },
+      },
+    };
+  }
+
+  throw new Error(`unsupported command approval decision: ${decision}`);
+}
+
+function normalizeFileChangeApprovalResult(decision) {
+  if (decision === "accept") {
+    return { decision: "accept" };
+  }
+  if (decision === "acceptForSession") {
+    return { decision: "acceptForSession" };
+  }
+  if (decision === "decline") {
+    return { decision: "decline" };
+  }
+  if (decision === "cancel") {
+    return { decision: "cancel" };
+  }
+
+  throw new Error(`unsupported file-change approval decision: ${decision}`);
+}
+
+function requestApproval(runtime, method, requestId, params, timeoutMs = 900_000) {
+  const kind = normalizeApprovalKind(method);
+  if (!kind) {
+    throw new Error(`approval is not supported for method: ${method}`);
+  }
+
+  const actionId = makeApprovalActionId(runtime);
+  const threadId = String(params.threadId || params.thread_id || "");
+  const turnId = String(params.turnId || params.turn_id || "");
+  const itemId = String(params.itemId || params.item_id || "");
+
+  const commandActions = Array.isArray(params.commandActions)
+    ? params.commandActions
+    : Array.isArray(params.command_actions)
+      ? params.command_actions
+      : [];
+
+  const proposedExecpolicyAmendment = Array.isArray(params.proposedExecpolicyAmendment)
+    ? params.proposedExecpolicyAmendment
+    : Array.isArray(params.proposed_execpolicy_amendment)
+      ? params.proposed_execpolicy_amendment
+      : [];
+
+  writeEvent({
+    type: "approval.requested",
+    action_id: actionId,
+    kind,
+    thread_id: threadId,
+    turn_id: turnId,
+    item_id: itemId,
+    reason: typeof params.reason === "string" ? params.reason : "",
+    command: typeof params.command === "string" ? params.command : "",
+    cwd: typeof params.cwd === "string" ? params.cwd : "",
+    command_actions: commandActions,
+    proposed_execpolicy_amendment: proposedExecpolicyAmendment,
+    grant_root: typeof params.grantRoot === "string"
+      ? params.grantRoot
+      : typeof params.grant_root === "string"
+        ? params.grant_root
+        : "",
+  });
+
+  return new Promise((resolve, reject) => {
+    let completed = false;
+
+    const timeout = setTimeout(() => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      runtime.pendingApprovals.delete(actionId);
+      reject(new Error("approval response timed out"));
+    }, timeoutMs);
+
+    const resolveApproval = (response) => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      clearTimeout(timeout);
+      runtime.pendingApprovals.delete(actionId);
+      resolve({
+        actionId,
+        kind,
+        requestId,
+        response,
+      });
+    };
+
+    const rejectApproval = (error) => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      clearTimeout(timeout);
+      runtime.pendingApprovals.delete(actionId);
+      reject(error);
+    };
+
+    runtime.pendingApprovals.set(actionId, {
+      actionId,
+      kind,
+      requestId,
+      resolve: resolveApproval,
+      reject: rejectApproval,
+    });
+  });
+}
+
+function resolveApprovalResponse(runtime, params = {}) {
+  const actionId = typeof params.actionId === "string"
+    ? params.actionId.trim()
+    : typeof params.action_id === "string"
+      ? params.action_id.trim()
+      : "";
+
+  if (!actionId) {
+    throw new Error("approval actionId is required");
+  }
+
+  const pendingApproval = runtime.pendingApprovals.get(actionId);
+  if (!pendingApproval) {
+    throw new Error(`approval action not found: ${actionId}`);
+  }
+
+  const remember = Boolean(params.remember);
+
+  let decision = typeof params.decision === "string" && params.decision.trim().length > 0
+    ? params.decision.trim()
+    : "decline";
+
+  if (remember && decision === "accept") {
+    decision = "acceptForSession";
+  }
+
+  const execpolicyAmendmentRaw = Array.isArray(params.execpolicyAmendment)
+    ? params.execpolicyAmendment
+    : Array.isArray(params.execpolicy_amendment)
+      ? params.execpolicy_amendment
+      : [];
+
+  const execpolicyAmendment = execpolicyAmendmentRaw
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean);
+
+  const response = pendingApproval.kind === "command_execution"
+    ? normalizeCommandApprovalResult(decision, execpolicyAmendment)
+    : normalizeFileChangeApprovalResult(decision);
+
+  pendingApproval.resolve(response);
+
+  return {
+    ok: true,
+    actionId,
+    kind: pendingApproval.kind,
+    decision: approvalDecisionName(response),
+  };
 }
 
 async function handleServerRequest(runtime, message) {
@@ -599,13 +1287,18 @@ async function handleServerRequest(runtime, message) {
   const params = asPlainObject(message.params) ? message.params : {};
 
   try {
-    if (method === "item/commandExecution/requestApproval") {
-      sendRuntimeResponse(runtime, message.id, { decision: "decline" });
-      return;
-    }
-
-    if (method === "item/fileChange/requestApproval") {
-      sendRuntimeResponse(runtime, message.id, { decision: "decline" });
+    if (
+      method === "item/commandExecution/requestApproval" ||
+      method === "item/fileChange/requestApproval"
+    ) {
+      const approval = await requestApproval(runtime, method, message.id, params);
+      sendRuntimeResponse(runtime, message.id, approval.response);
+      writeEvent({
+        type: "approval.resolved",
+        action_id: approval.actionId,
+        kind: approval.kind,
+        decision: approvalDecisionName(approval.response),
+      });
       return;
     }
 
@@ -643,6 +1336,18 @@ async function handleServerRequest(runtime, message) {
 
     sendRuntimeError(runtime, message.id, -32601, `unsupported server request: ${method}`);
   } catch (error) {
+    if (
+      method === "item/commandExecution/requestApproval" ||
+      method === "item/fileChange/requestApproval"
+    ) {
+      try {
+        sendRuntimeResponse(runtime, message.id, { decision: "decline" });
+      } catch {
+        // best effort
+      }
+      return;
+    }
+
     sendRuntimeError(
       runtime,
       message.id,
@@ -650,6 +1355,83 @@ async function handleServerRequest(runtime, message) {
       error instanceof Error ? error.message : String(error),
     );
   }
+}
+
+function asFiniteNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function normalizeTokenUsageBreakdown(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const totalTokens = asFiniteNumber(value.totalTokens ?? value.total_tokens);
+  const inputTokens = asFiniteNumber(value.inputTokens ?? value.input_tokens);
+  const cachedInputTokens = asFiniteNumber(value.cachedInputTokens ?? value.cached_input_tokens);
+  const outputTokens = asFiniteNumber(value.outputTokens ?? value.output_tokens);
+  const reasoningOutputTokens = asFiniteNumber(value.reasoningOutputTokens ?? value.reasoning_output_tokens);
+
+  if (
+    totalTokens == null ||
+    inputTokens == null ||
+    cachedInputTokens == null ||
+    outputTokens == null ||
+    reasoningOutputTokens == null
+  ) {
+    return null;
+  }
+
+  return {
+    total_tokens: totalTokens,
+    input_tokens: inputTokens,
+    cached_input_tokens: cachedInputTokens,
+    output_tokens: outputTokens,
+    reasoning_output_tokens: reasoningOutputTokens,
+  };
+}
+
+function normalizeTokenUsage(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const total = normalizeTokenUsageBreakdown(value.total);
+  const last = normalizeTokenUsageBreakdown(value.last);
+  if (!total || !last) {
+    return null;
+  }
+
+  const modelContextWindow = asFiniteNumber(value.modelContextWindow ?? value.model_context_window);
+
+  return {
+    total,
+    last,
+    model_context_window: modelContextWindow,
+  };
+}
+
+function normalizePlanStepStatus(status) {
+  const value = String(status || "pending");
+  if (value === "pending") {
+    return "pending";
+  }
+  if (value === "inProgress" || value === "in_progress") {
+    return "inProgress";
+  }
+  if (value === "completed") {
+    return "completed";
+  }
+  return "pending";
 }
 
 function handleNotification(runtime, method, params) {
@@ -666,29 +1448,119 @@ function handleNotification(runtime, method, params) {
     return;
   }
 
+  if (method === "thread/tokenUsage/updated") {
+    const threadId = String(payload.threadId || payload.thread_id || "");
+    const turnId = String(payload.turnId || payload.turn_id || "");
+    const tokenUsage = normalizeTokenUsage(payload.tokenUsage ?? payload.token_usage);
+
+    if (turnId && tokenUsage) {
+      const tracker = ensureTurnTracker(runtime, turnId);
+      if (tracker) {
+        tracker.usage = tokenUsage;
+      }
+    }
+
+    writeEvent({
+      type: "thread.token_usage.updated",
+      thread_id: threadId,
+      turn_id: turnId,
+      token_usage: tokenUsage,
+    });
+    return;
+  }
+
   if (method === "turn/started") {
     const turnId = String(payload.turn?.id || "");
+    const threadId = String(
+      payload.threadId || payload.thread_id || payload.turn?.threadId || payload.turn?.thread_id || "",
+    );
     ensureTurnTracker(runtime, turnId);
-    writeEvent({ type: "turn.started" });
+    writeEvent({
+      type: "turn.started",
+      thread_id: threadId,
+      turn_id: turnId,
+    });
+    return;
+  }
+
+  if (method === "turn/diff/updated") {
+    const threadId = String(payload.threadId || payload.thread_id || "");
+    const turnId = String(payload.turnId || payload.turn_id || "");
+    const diff = typeof payload.diff === "string" ? payload.diff : "";
+
+    writeEvent({
+      type: "turn.diff.updated",
+      thread_id: threadId,
+      turn_id: turnId,
+      diff,
+    });
+    return;
+  }
+
+  if (method === "turn/plan/updated") {
+    const threadId = String(payload.threadId || payload.thread_id || "");
+    const turnId = String(payload.turnId || payload.turn_id || "");
+    const explanation = typeof payload.explanation === "string" ? payload.explanation : null;
+    const rawPlan = Array.isArray(payload.plan) ? payload.plan : [];
+    const plan = rawPlan
+      .map((entry) => ({
+        step: typeof entry?.step === "string" ? entry.step : "",
+        status: normalizePlanStepStatus(entry?.status),
+      }))
+      .filter((entry) => entry.step.length > 0);
+
+    writeEvent({
+      type: "turn.plan.updated",
+      thread_id: threadId,
+      turn_id: turnId,
+      explanation,
+      plan,
+    });
     return;
   }
 
   if (method === "turn/completed") {
     const turn = asPlainObject(payload.turn) ? payload.turn : {};
     const turnId = String(turn.id || "");
+    const threadId = String(
+      payload.threadId || payload.thread_id || turn.threadId || turn.thread_id || "",
+    );
     const status = String(turn.status || "completed");
+    const usage = normalizeTokenUsage(turn.tokenUsage ?? turn.token_usage ?? turn.usage);
 
     if (status === "failed" || status === "interrupted") {
       const error = asPlainObject(turn.error)
         ? turn.error
         : { message: status === "interrupted" ? "turn interrupted" : "turn failed" };
-      writeEvent({ type: "turn.failed", error });
-      completeTurnTracker(runtime, turnId, { status: "failed", error });
+      writeEvent({
+        type: "turn.failed",
+        thread_id: threadId,
+        turn_id: turnId,
+        error,
+      });
+      completeTurnTracker(runtime, turnId, { status: "failed", usage, error });
       return;
     }
 
-    writeEvent({ type: "turn.completed" });
-    completeTurnTracker(runtime, turnId, { status: "completed" });
+    writeEvent({
+      type: "turn.completed",
+      thread_id: threadId,
+      turn_id: turnId,
+    });
+    completeTurnTracker(runtime, turnId, { status: "completed", usage });
+    return;
+  }
+
+  if (method === "rawResponseItem/completed" || method === "codex/event/raw_response_item") {
+    const responseItem = payload.item ?? payload.responseItem ?? payload.response_item;
+    const rawItem = convertRawResponseItemToLegacy(runtime, responseItem, {
+      threadId: payload.threadId || payload.thread_id || payload.conversationId || payload.conversation_id,
+      senderThreadId: payload.senderThreadId || payload.sender_thread_id,
+    });
+    if (rawItem) {
+      rememberCompletedCollabCall(runtime, rawItem.id);
+      writeEvent({ type: "item.completed", item: rawItem });
+    }
     return;
   }
 
@@ -714,6 +1586,13 @@ function handleNotification(runtime, method, params) {
           if (tracker && typeof item.text === "string") {
             tracker.finalResponse = item.text;
           }
+        }
+      }
+      if (item.type === "collab_tool_call") {
+        const collabCallId = String(item.id || "").trim();
+        if (collabCallId) {
+          rememberCompletedCollabCall(runtime, collabCallId);
+          runtime.rawCollabCalls.delete(collabCallId);
         }
       }
       writeEvent({ type: "item.completed", item });
@@ -954,13 +1833,585 @@ async function shutdownAppServer() {
   }
 }
 
+function normalizeThreadIdCandidate(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim();
+}
+
+function findThreadStateByCodexThreadId(codexThreadId) {
+  const key = normalizeThreadIdCandidate(codexThreadId);
+  if (!key) {
+    return null;
+  }
+
+  for (const threadState of state.threads.values()) {
+    if (!threadState || typeof threadState !== "object") {
+      continue;
+    }
+
+    if (normalizeThreadIdCandidate(threadState.codexThreadId) === key) {
+      return threadState;
+    }
+  }
+
+  return null;
+}
+
+function resolveThreadStateByAnyId(threadId) {
+  const key = normalizeThreadIdCandidate(threadId);
+  if (!key) {
+    return null;
+  }
+
+  const byLocalId = state.threads.get(key);
+  if (byLocalId) {
+    return byLocalId;
+  }
+
+  return findThreadStateByCodexThreadId(key);
+}
+
+function resolveThreadRef(threadId, workspace, allowRaw = false) {
+  const requestedThreadId = normalizeThreadIdCandidate(threadId);
+  if (!requestedThreadId) {
+    throw new Error("threadId is required");
+  }
+
+  const threadState = resolveThreadStateByAnyId(requestedThreadId);
+  if (threadState) {
+    return {
+      threadState,
+      threadId: threadState.threadId,
+      codexThreadId:
+        normalizeThreadIdCandidate(threadState.codexThreadId) || requestedThreadId,
+      workspace:
+        typeof threadState.workspace === "string" && threadState.workspace.length > 0
+          ? threadState.workspace
+          : typeof workspace === "string" && workspace.length > 0
+            ? workspace
+            : process.cwd(),
+    };
+  }
+
+  if (!allowRaw) {
+    throw new Error(`thread not found: ${requestedThreadId}`);
+  }
+
+  return {
+    threadState: null,
+    threadId: requestedThreadId,
+    codexThreadId: requestedThreadId,
+    workspace:
+      typeof workspace === "string" && workspace.length > 0 ? workspace : process.cwd(),
+  };
+}
+
+function normalizeThreadSource(source) {
+  if (typeof source === "string" && source.trim().length > 0) {
+    return source.trim();
+  }
+
+  if (!asPlainObject(source)) {
+    return "unknown";
+  }
+
+  const subAgent = source.subAgent ?? source.sub_agent;
+  if (typeof subAgent === "string" && subAgent.trim().length > 0) {
+    return `subAgent:${subAgent.trim()}`;
+  }
+
+  if (asPlainObject(subAgent)) {
+    if (asPlainObject(subAgent.threadSpawn ?? subAgent.thread_spawn)) {
+      return "subAgent:threadSpawn";
+    }
+
+    if (typeof subAgent.other === "string" && subAgent.other.trim().length > 0) {
+      return `subAgent:other:${subAgent.other.trim()}`;
+    }
+
+    return "subAgent";
+  }
+
+  return "unknown";
+}
+
+function normalizeHistoryRole(role) {
+  const normalized = String(role || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "user") {
+    return "user";
+  }
+  if (normalized === "assistant" || normalized === "agent") {
+    return "agent";
+  }
+  if (normalized === "system") {
+    return "system";
+  }
+  return null;
+}
+
+function normalizeUserInputToText(input) {
+  if (!asPlainObject(input)) {
+    return "";
+  }
+
+  const inputType = String(input.type || "").trim();
+  if (inputType === "text") {
+    return typeof input.text === "string" ? input.text : "";
+  }
+
+  if (inputType === "mention") {
+    const path = typeof input.path === "string" ? input.path.trim() : "";
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (path) {
+      return `@${path}`;
+    }
+    if (name) {
+      return `@${name}`;
+    }
+    return "@mention";
+  }
+
+  if (inputType === "skill") {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    return name ? `[skill] ${name}` : "[skill]";
+  }
+
+  if (inputType === "localImage" || inputType === "local_image") {
+    const path = typeof input.path === "string" ? input.path.trim() : "";
+    return path ? `[local_image] ${path}` : "[local_image]";
+  }
+
+  if (inputType === "image") {
+    const url = typeof input.url === "string" ? input.url.trim() : "";
+    return url ? `[image] ${url}` : "[image]";
+  }
+
+  return "";
+}
+
+function historyStatusToAgentState(status, fallback = "running") {
+  const normalized = String(status || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "pendinginit" || normalized === "pending init") {
+    return "pending init";
+  }
+  if (normalized === "inprogress" || normalized === "in_progress" || normalized === "running") {
+    return "running";
+  }
+  if (normalized === "completed" || normalized === "done" || normalized === "shutdown") {
+    return "done";
+  }
+  if (
+    normalized === "failed" ||
+    normalized === "errored" ||
+    normalized === "error" ||
+    normalized === "notfound" ||
+    normalized === "not_found"
+  ) {
+    return "error";
+  }
+  return fallback;
+}
+
+function historyToolStatusFallback(status) {
+  const normalized = String(status || "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "failed") {
+    return "error";
+  }
+  if (normalized === "completed") {
+    return "done";
+  }
+  return "running";
+}
+
+function historyReadStringArray(source, keys) {
+  if (!asPlainObject(source)) {
+    return [];
+  }
+
+  for (const key of keys) {
+    const raw = source[key];
+    if (Array.isArray(raw)) {
+      const values = raw
+        .map((entry) => String(entry || "").trim())
+        .filter((entry) => entry.length > 0);
+      if (values.length > 0) {
+        return values;
+      }
+    }
+
+    const single = String(raw || "").trim();
+    if (single.length > 0) {
+      return [single];
+    }
+  }
+
+  return [];
+}
+
+function historyUniqueStrings(values) {
+  const ordered = [];
+  const seen = new Set();
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    ordered.push(normalized);
+  }
+  return ordered;
+}
+
+function historyReadStateMap(item) {
+  if (!asPlainObject(item)) {
+    return {};
+  }
+
+  if (asPlainObject(item.agentsStates)) {
+    return item.agentsStates;
+  }
+  if (asPlainObject(item.agents_states)) {
+    return item.agents_states;
+  }
+  if (asPlainObject(item.agentStates)) {
+    return item.agentStates;
+  }
+  if (asPlainObject(item.agent_states)) {
+    return item.agent_states;
+  }
+
+  return {};
+}
+
+function encodeAgentSpawnerMessage(payload) {
+  return `${AGENT_SPAWNER_MESSAGE_PREFIX}${JSON.stringify(payload)}`;
+}
+
+function buildAgentSpawnerPayloadFromHistoryItem(item) {
+  if (!asPlainObject(item)) {
+    return null;
+  }
+
+  const tool = normalizeCollabToolName(item.tool);
+  if (!tool) {
+    return null;
+  }
+
+  const callId =
+    normalizeThreadIdCandidate(item.id) ||
+    String(item.call_id || item.callId || "").trim() ||
+    "collab-call";
+  const senderThreadId = String(item.senderThreadId || item.sender_thread_id || "").trim();
+  const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
+  const fallbackStatus = historyToolStatusFallback(item.status);
+
+  const receiverIds = historyReadStringArray(item, [
+    "receiverThreadIds",
+    "receiver_thread_ids",
+    "receiverThreadId",
+    "receiver_thread_id",
+    "newThreadId",
+    "new_thread_id",
+  ]);
+
+  const states = historyReadStateMap(item);
+  const stateKeys = Object.keys(states)
+    .map((entry) => String(entry || "").trim())
+    .filter((entry) => entry.length > 0);
+
+  const agentIds = historyUniqueStrings([...receiverIds, ...stateKeys]);
+
+  const agents = agentIds.map((agentId) => {
+    const rawState = states[agentId];
+    const stateObject = asPlainObject(rawState) ? rawState : null;
+    const stateValue = stateObject && Object.prototype.hasOwnProperty.call(stateObject, "status")
+      ? stateObject.status
+      : rawState;
+
+    return {
+      callId,
+      agentId,
+      status: historyStatusToAgentState(stateValue, fallbackStatus),
+      prompt,
+      ownership: senderThreadId ? `${senderThreadId} -> ${agentId}` : agentId,
+    };
+  });
+
+  let waiting = null;
+  if (tool === "wait") {
+    const receivers = historyUniqueStrings([
+      ...agentIds,
+      ...historyReadStringArray(item, ["receivers", "receiverIds", "receiver_ids"]),
+    ]);
+
+    if (receivers.length > 0) {
+      waiting = {
+        callId,
+        receivers,
+      };
+    }
+  }
+
+  if (agents.length === 0 && !waiting) {
+    return null;
+  }
+
+  const payload = { agents };
+  if (waiting) {
+    payload.waiting = waiting;
+  }
+
+  return payload;
+}
+
+function formatStructuredHistoryItem(item) {
+  if (!asPlainObject(item)) {
+    return null;
+  }
+
+  const itemType = String(item.type || "").trim();
+
+  if (itemType === "commandExecution" || itemType === "command_execution") {
+    const command = String(item.command || "command").trim() || "command";
+    const status = normalizeStatus(item.status);
+    const output =
+      typeof item.aggregatedOutput === "string"
+        ? item.aggregatedOutput
+        : typeof item.aggregated_output === "string"
+          ? item.aggregated_output
+          : "";
+    return `[command:${status}] ${command}${output ? `\n${output}` : ""}`;
+  }
+
+  if (itemType === "mcpToolCall" || itemType === "mcp_tool_call") {
+    const tool = String(item.tool || "tool").trim() || "tool";
+    const status = normalizeStatus(item.status);
+    return `[mcp:${status}] ${tool}`;
+  }
+
+  if (itemType === "fileChange" || itemType === "file_change") {
+    return "[file_change] changes applied";
+  }
+
+  if (itemType === "reasoning") {
+    const text =
+      typeof item.text === "string"
+        ? item.text
+        : [
+            Array.isArray(item.summary) ? item.summary.join("\n") : "",
+            Array.isArray(item.content) ? item.content.join("\n") : "",
+          ]
+            .filter(Boolean)
+            .join("\n");
+    return text.trim().length > 0 ? `[reasoning]\n${text}` : "[reasoning]";
+  }
+
+  if (itemType === "error") {
+    return `[error] ${String(item.message || "unknown")}`;
+  }
+
+  if (itemType === "webSearch" || itemType === "web_search") {
+    const query = String(item.query || "").trim();
+    return query ? `[web_search] ${query}` : "[web_search]";
+  }
+
+  if (itemType === "imageView" || itemType === "image_view") {
+    const path = String(item.path || "").trim();
+    return path ? `[image_view] ${path}` : "[image_view]";
+  }
+
+  if (
+    itemType === "collabAgentToolCall" ||
+    itemType === "collabToolCall" ||
+    itemType === "collab_tool_call"
+  ) {
+    const payload = buildAgentSpawnerPayloadFromHistoryItem(item);
+    if (payload) {
+      return encodeAgentSpawnerMessage(payload);
+    }
+
+    const tool = normalizeCollabToolName(item.tool) || "collab";
+    const status = normalizeStatus(item.status);
+    return `[collab:${status}] ${tool}`;
+  }
+
+  return null;
+}
+
+function summarizeThreadItemForHistory(item) {
+  if (!asPlainObject(item)) {
+    return null;
+  }
+
+  const itemType = String(item.type || "").trim();
+  if (itemType === "userMessage" || itemType === "user_message") {
+    const contentItems = Array.isArray(item.content) ? item.content : [];
+    const content = contentItems
+      .map((entry) => normalizeUserInputToText(entry))
+      .filter((entry) => entry.trim().length > 0)
+      .join("\n")
+      .trim();
+    if (!content) {
+      return null;
+    }
+    return { role: "user", content };
+  }
+
+  if (itemType === "agentMessage" || itemType === "agent_message") {
+    const text = typeof item.text === "string" ? item.text.trim() : "";
+    if (!text) {
+      return null;
+    }
+    return { role: "agent", content: text };
+  }
+
+  const structured = formatStructuredHistoryItem(item);
+  if (structured && structured.trim().length > 0) {
+    return { role: "system", content: structured };
+  }
+
+  const role = normalizeHistoryRole(item.role);
+  const content = typeof item.content === "string" ? item.content.trim() : "";
+  if (role && content) {
+    return { role, content };
+  }
+
+  return null;
+}
+
+function summarizeThreadItemsForHistory(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    return [];
+  }
+
+  const mapped = items
+    .map((entry) => summarizeThreadItemForHistory(entry))
+    .filter((entry) => entry !== null);
+
+  if (mapped.length === 0) {
+    return [];
+  }
+
+  const deduped = [];
+  for (const entry of mapped) {
+    const previous = deduped[deduped.length - 1];
+    if (previous && previous.role === entry.role && previous.content === entry.content) {
+      continue;
+    }
+    deduped.push(entry);
+  }
+
+  return deduped;
+}
+
+function normalizeThreadTurn(turn) {
+  if (!asPlainObject(turn)) {
+    return null;
+  }
+
+  const id = normalizeThreadIdCandidate(turn.id);
+  if (!id) {
+    return null;
+  }
+
+  const historyItems = [];
+  if (Array.isArray(turn.messages)) {
+    historyItems.push(...turn.messages);
+  }
+  if (Array.isArray(turn.items)) {
+    historyItems.push(...turn.items);
+  }
+  const historyMessages = summarizeThreadItemsForHistory(historyItems);
+
+  const normalized = {
+    id,
+    status: normalizeStatus(turn.status),
+    itemCount: Array.isArray(turn.items) ? turn.items.length : 0,
+  };
+
+  if (historyMessages.length > 0) {
+    normalized.messages = historyMessages;
+  }
+
+  return normalized;
+}
+
+function normalizeThreadRecord(thread, options = {}) {
+  if (!asPlainObject(thread)) {
+    return null;
+  }
+
+  const codexThreadId = normalizeThreadIdCandidate(thread.id);
+  if (!codexThreadId) {
+    return null;
+  }
+
+  const mappedThread = resolveThreadStateByAnyId(codexThreadId);
+  const preferredThreadId = normalizeThreadIdCandidate(options.preferredThreadId);
+  const id = preferredThreadId || mappedThread?.threadId || codexThreadId;
+
+  const normalizedTurns = Array.isArray(thread.turns)
+    ? thread.turns.map(normalizeThreadTurn).filter((entry) => entry !== null)
+    : [];
+
+  const explicitTurnCount = asFiniteNumber(thread.turnCount ?? thread.turn_count);
+  const turnCount =
+    explicitTurnCount == null
+      ? normalizedTurns.length
+      : Math.max(0, Math.trunc(explicitTurnCount));
+
+  const modelProvider =
+    typeof options.modelProvider === "string" && options.modelProvider.trim().length > 0
+      ? options.modelProvider.trim()
+      : typeof thread.modelProvider === "string"
+        ? thread.modelProvider
+        : typeof thread.model_provider === "string"
+          ? thread.model_provider
+          : "";
+
+  const cwd =
+    typeof options.cwd === "string" && options.cwd.trim().length > 0
+      ? options.cwd.trim()
+      : typeof thread.cwd === "string"
+        ? thread.cwd
+        : "";
+
+  const normalized = {
+    id,
+    codexThreadId,
+    preview: typeof thread.preview === "string" ? thread.preview : "",
+    modelProvider,
+    createdAt: asFiniteNumber(thread.createdAt ?? thread.created_at) ?? 0,
+    updatedAt: asFiniteNumber(thread.updatedAt ?? thread.updated_at) ?? 0,
+    cwd,
+    path: typeof thread.path === "string" ? thread.path : null,
+    source: normalizeThreadSource(thread.source),
+    turnCount,
+  };
+
+  if (options.includeTurns || normalizedTurns.length > 0) {
+    normalized.turns = normalizedTurns;
+  }
+
+  return normalized;
+}
+
 function getThreadOrThrow(threadId) {
-  const key = String(threadId || "");
+  const key = normalizeThreadIdCandidate(threadId);
   if (!key) {
     throw new Error("threadId is required");
   }
 
-  const threadState = state.threads.get(key);
+  const threadState = resolveThreadStateByAnyId(key);
   if (!threadState) {
     throw new Error(`thread not found: ${key}`);
   }
@@ -991,17 +2442,15 @@ async function createOrResumeCodexThread(runtime, runtimeConfig, workspace, code
 }
 
 async function handleThreadOpen(params = {}) {
-  const requestedThreadId =
-    typeof params.threadId === "string" && params.threadId.length > 0
-      ? params.threadId
-      : `thread-${state.nextThreadId++}`;
+  const providedThreadId = normalizeThreadIdCandidate(params.threadId);
+  const requestedThreadId = providedThreadId || `thread-${state.nextThreadId++}`;
 
   const workspace =
     typeof params.workspace === "string" && params.workspace.length > 0
       ? params.workspace
       : process.cwd();
 
-  const existing = state.threads.get(requestedThreadId);
+  const existing = resolveThreadStateByAnyId(requestedThreadId);
   if (existing) {
     return {
       threadId: existing.threadId,
@@ -1020,7 +2469,7 @@ async function handleThreadOpen(params = {}) {
   const codexThreadIdHint =
     typeof params.codexThreadId === "string" && params.codexThreadId.length > 0
       ? params.codexThreadId
-      : null;
+      : providedThreadId || null;
 
   const codexThreadId = await createOrResumeCodexThread(
     runtime,
@@ -1057,7 +2506,7 @@ function isPlainJsonObject(value) {
 }
 
 async function handleTurnRun(params = {}) {
-  const threadState = getThreadOrThrow(params.threadId);
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
   const runtimeConfig = normalizeConfigPatch({
     ...state.config,
     ...(params.runtimeConfig || {}),
@@ -1066,17 +2515,25 @@ async function handleTurnRun(params = {}) {
   const workspace =
     typeof params.workspace === "string" && params.workspace.length > 0
       ? params.workspace
-      : threadState.workspace;
+      : threadRef.workspace;
 
   const runtime = await ensureAppServer();
   const inputItems = normalizeInputItems(params.inputItems);
 
-  if (!threadState.codexThreadId) {
-    threadState.codexThreadId = await createOrResumeCodexThread(runtime, runtimeConfig, workspace, null);
+  let codexThreadId = threadRef.codexThreadId;
+
+  if (threadRef.threadState && !normalizeThreadIdCandidate(threadRef.threadState.codexThreadId)) {
+    codexThreadId = await createOrResumeCodexThread(runtime, runtimeConfig, workspace, null);
+    threadRef.threadState.codexThreadId = codexThreadId;
+    threadRef.threadState.workspace = workspace;
+  }
+
+  if (!codexThreadId) {
+    throw new Error("failed to resolve codex thread id");
   }
 
   const turnParams = buildTurnStartParams({
-    threadId: threadState.codexThreadId,
+    threadId: codexThreadId,
     input: inputItems,
     runtimeConfig,
     workspace,
@@ -1096,10 +2553,355 @@ async function handleTurnRun(params = {}) {
   const completion = await waitForTurnCompletion(runtime, turnId);
 
   return {
-    threadId: threadState.threadId,
-    codexThreadId: threadState.codexThreadId,
+    threadId: threadRef.threadId,
+    codexThreadId,
     finalResponse: completion.finalResponse || "",
     usage: completion.usage,
+  };
+}
+
+function buildThreadListParams(params = {}) {
+  const normalized = {};
+
+  if (typeof params.cursor === "string") {
+    normalized.cursor = params.cursor;
+  } else if (params.cursor === null) {
+    normalized.cursor = null;
+  }
+
+  const limit = asFiniteNumber(params.limit);
+  if (limit != null && limit > 0) {
+    normalized.limit = Math.trunc(limit);
+  }
+
+  if (typeof params.sortKey === "string" && params.sortKey.trim().length > 0) {
+    normalized.sortKey = params.sortKey.trim();
+  }
+
+  const normalizeStringArray = (value) => {
+    if (!Array.isArray(value)) {
+      return null;
+    }
+
+    return value
+      .map((entry) => String(entry || "").trim())
+      .filter((entry) => entry.length > 0);
+  };
+
+  const modelProviders = normalizeStringArray(params.modelProviders);
+  if (modelProviders) {
+    normalized.modelProviders = modelProviders;
+  }
+
+  const sourceKinds = normalizeStringArray(params.sourceKinds);
+  if (sourceKinds) {
+    normalized.sourceKinds = sourceKinds;
+  }
+
+  if (typeof params.archived === "boolean") {
+    normalized.archived = params.archived;
+  } else if (params.archived === null) {
+    normalized.archived = null;
+  }
+
+  const cwd =
+    typeof params.cwd === "string" && params.cwd.trim().length > 0
+      ? params.cwd.trim()
+      : typeof params.workspace === "string" && params.workspace.trim().length > 0
+        ? params.workspace.trim()
+        : "";
+  if (cwd) {
+    normalized.cwd = cwd;
+  }
+
+  return normalized;
+}
+
+async function handleThreadList(params = {}) {
+  const runtime = await ensureAppServer();
+
+  const result = await sendRuntimeRequest(runtime, "thread/list", buildThreadListParams(params));
+  const data = Array.isArray(result?.data)
+    ? result.data
+      .map((thread) => normalizeThreadRecord(thread))
+      .filter((thread) => thread !== null)
+    : [];
+
+  const nextCursor =
+    typeof result?.nextCursor === "string" && result.nextCursor.trim().length > 0
+      ? result.nextCursor
+      : null;
+
+  return {
+    data,
+    nextCursor,
+  };
+}
+
+async function handleThreadRead(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+  const includeTurns = params.includeTurns === undefined ? true : Boolean(params.includeTurns);
+
+  const result = await sendRuntimeRequest(runtime, "thread/read", {
+    threadId: threadRef.codexThreadId,
+    includeTurns,
+  });
+
+  const thread = normalizeThreadRecord(result?.thread, {
+    preferredThreadId: threadRef.threadId,
+    includeTurns,
+  });
+  if (!thread) {
+    throw new Error("thread/read returned an invalid thread");
+  }
+
+  if (threadRef.threadState) {
+    threadRef.threadState.codexThreadId = thread.codexThreadId;
+    if (thread.cwd) {
+      threadRef.threadState.workspace = thread.cwd;
+    }
+  }
+
+  return { thread };
+}
+
+async function handleThreadArchive(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  await sendRuntimeRequest(runtime, "thread/archive", {
+    threadId: threadRef.codexThreadId,
+  });
+
+  return {
+    id: threadRef.threadId,
+    codexThreadId: threadRef.codexThreadId,
+    archived: true,
+  };
+}
+
+async function handleThreadUnarchive(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  const result = await sendRuntimeRequest(runtime, "thread/unarchive", {
+    threadId: threadRef.codexThreadId,
+  });
+
+  const thread = normalizeThreadRecord(result?.thread, {
+    preferredThreadId: threadRef.threadId,
+    includeTurns: Array.isArray(result?.thread?.turns),
+  });
+  if (!thread) {
+    throw new Error("thread/unarchive returned an invalid thread");
+  }
+
+  if (threadRef.threadState) {
+    threadRef.threadState.codexThreadId = thread.codexThreadId;
+    if (thread.cwd) {
+      threadRef.threadState.workspace = thread.cwd;
+    }
+  }
+
+  return { thread };
+}
+
+async function handleThreadCompactStart(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  await sendRuntimeRequest(runtime, "thread/compact/start", {
+    threadId: threadRef.codexThreadId,
+  });
+
+  return {
+    ok: true,
+    threadId: threadRef.threadId,
+    codexThreadId: threadRef.codexThreadId,
+  };
+}
+
+async function handleThreadRollback(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  const numTurns = asFiniteNumber(params.numTurns ?? params.num_turns);
+  if (numTurns == null || numTurns < 1) {
+    throw new Error("numTurns must be a number greater than or equal to 1");
+  }
+
+  const result = await sendRuntimeRequest(runtime, "thread/rollback", {
+    threadId: threadRef.codexThreadId,
+    numTurns: Math.trunc(numTurns),
+  });
+
+  const thread = normalizeThreadRecord(result?.thread, {
+    preferredThreadId: threadRef.threadId,
+    includeTurns: true,
+  });
+  if (!thread) {
+    throw new Error("thread/rollback returned an invalid thread");
+  }
+
+  if (threadRef.threadState) {
+    threadRef.threadState.codexThreadId = thread.codexThreadId;
+    if (thread.cwd) {
+      threadRef.threadState.workspace = thread.cwd;
+    }
+  }
+
+  return { thread };
+}
+
+function buildThreadForkParams(params = {}, codexThreadId) {
+  const requestParams = {
+    threadId: codexThreadId,
+  };
+
+  if (typeof params.path === "string" && params.path.trim().length > 0) {
+    requestParams.path = params.path.trim();
+  }
+
+  if (typeof params.model === "string" && params.model.trim().length > 0) {
+    requestParams.model = params.model.trim();
+  }
+
+  if (typeof params.modelProvider === "string" && params.modelProvider.trim().length > 0) {
+    requestParams.modelProvider = params.modelProvider.trim();
+  }
+
+  const cwd =
+    typeof params.cwd === "string" && params.cwd.trim().length > 0
+      ? params.cwd.trim()
+      : typeof params.workspace === "string" && params.workspace.trim().length > 0
+        ? params.workspace.trim()
+        : "";
+  if (cwd) {
+    requestParams.cwd = cwd;
+  }
+
+  if (typeof params.approvalPolicy === "string" && params.approvalPolicy.trim().length > 0) {
+    requestParams.approvalPolicy = params.approvalPolicy.trim();
+  }
+
+  if (typeof params.sandbox === "string" && params.sandbox.trim().length > 0) {
+    requestParams.sandbox = params.sandbox.trim();
+  }
+
+  if (isPlainJsonObject(params.config)) {
+    requestParams.config = params.config;
+  }
+
+  if (typeof params.baseInstructions === "string" && params.baseInstructions.length > 0) {
+    requestParams.baseInstructions = params.baseInstructions;
+  }
+
+  if (typeof params.developerInstructions === "string" && params.developerInstructions.length > 0) {
+    requestParams.developerInstructions = params.developerInstructions;
+  }
+
+  if (typeof params.persistExtendedHistory === "boolean") {
+    requestParams.persistExtendedHistory = params.persistExtendedHistory;
+  }
+
+  return requestParams;
+}
+
+async function handleThreadFork(params = {}) {
+  const runtime = await ensureAppServer();
+  const sourceThread = resolveThreadRef(params.threadId, params.workspace, true);
+
+  const result = await sendRuntimeRequest(
+    runtime,
+    "thread/fork",
+    buildThreadForkParams(params, sourceThread.codexThreadId),
+  );
+
+  const thread = normalizeThreadRecord(result?.thread, {
+    modelProvider:
+      typeof result?.modelProvider === "string" ? result.modelProvider : undefined,
+    cwd: typeof result?.cwd === "string" ? result.cwd : undefined,
+    includeTurns: true,
+  });
+  if (!thread) {
+    throw new Error("thread/fork returned an invalid thread");
+  }
+
+  const requestedThreadId = normalizeThreadIdCandidate(
+    params.newThreadId ?? params.forkedThreadId ?? params.targetThreadId,
+  );
+  const localThreadId = requestedThreadId || thread.codexThreadId;
+
+  const threadState = {
+    threadId: localThreadId,
+    codexThreadId: thread.codexThreadId,
+    workspace: thread.cwd || sourceThread.workspace,
+  };
+  state.threads.set(localThreadId, threadState);
+
+  return {
+    thread: {
+      ...thread,
+      id: localThreadId,
+    },
+  };
+}
+
+async function handleTurnSteer(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  const expectedTurnId = normalizeThreadIdCandidate(
+    params.expectedTurnId ?? params.expected_turn_id ?? params.turnId,
+  );
+  if (!expectedTurnId) {
+    throw new Error("expectedTurnId is required");
+  }
+
+  const inputItems = Array.isArray(params.inputItems)
+    ? params.inputItems
+    : Array.isArray(params.input)
+      ? params.input
+      : Array.isArray(params.input_items)
+        ? params.input_items
+        : [];
+
+  const result = await sendRuntimeRequest(runtime, "turn/steer", {
+    threadId: threadRef.codexThreadId,
+    input: normalizeInputItems(inputItems),
+    expectedTurnId,
+  });
+
+  const turnId = normalizeThreadIdCandidate(result?.turnId) || expectedTurnId;
+  ensureTurnTracker(runtime, turnId);
+
+  return {
+    threadId: threadRef.threadId,
+    codexThreadId: threadRef.codexThreadId,
+    turnId,
+  };
+}
+
+async function handleTurnInterrupt(params = {}) {
+  const runtime = await ensureAppServer();
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+
+  const turnId = normalizeThreadIdCandidate(params.turnId ?? params.turn_id);
+  if (!turnId) {
+    throw new Error("turnId is required");
+  }
+
+  await sendRuntimeRequest(runtime, "turn/interrupt", {
+    threadId: threadRef.codexThreadId,
+    turnId,
+  });
+
+  return {
+    ok: true,
+    threadId: threadRef.threadId,
+    codexThreadId: threadRef.codexThreadId,
+    turnId,
   };
 }
 
@@ -1249,6 +3051,16 @@ async function handleConfigSet(params = {}) {
   return { ...state.config };
 }
 
+async function handleApprovalRespond(params = {}) {
+  const runtime = state.appServer;
+  if (!runtime || runtime.closed) {
+    throw new Error("app-server is not running");
+  }
+
+  const requestParams = asPlainObject(params) ? params : {};
+  return resolveApprovalResponse(runtime, requestParams);
+}
+
 async function dispatchRequest(method, params) {
   switch (method) {
     case "health": {
@@ -1259,8 +3071,28 @@ async function dispatchRequest(method, params) {
       return handleThreadOpen(params);
     case "thread.close":
       return handleThreadClose(params);
+    case "thread.list":
+      return handleThreadList(params);
+    case "thread.read":
+      return handleThreadRead(params);
+    case "thread.archive":
+      return handleThreadArchive(params);
+    case "thread.unarchive":
+      return handleThreadUnarchive(params);
+    case "thread.compact.start":
+      return handleThreadCompactStart(params);
+    case "thread.rollback":
+      return handleThreadRollback(params);
+    case "thread.fork":
+      return handleThreadFork(params);
     case "turn.run":
       return handleTurnRun(params);
+    case "turn.steer":
+      return handleTurnSteer(params);
+    case "turn.interrupt":
+      return handleTurnInterrupt(params);
+    case "approval.respond":
+      return handleApprovalRespond(params);
     case "mcp.warmup":
       return handleMcpWarmup();
     case "mcp.list":
@@ -1336,7 +3168,13 @@ async function main() {
   });
 
   for await (const line of rl) {
-    await handleLine(line);
+    void handleLine(line).catch((error) => {
+      writeEvent({
+        type: "error",
+        message:
+          error instanceof Error ? error.stack || error.message : String(error),
+      });
+    });
   }
 }
 
@@ -1347,6 +3185,11 @@ main().catch((error) => {
   });
   process.exit(1);
 });
+
+
+
+
+
 
 
 

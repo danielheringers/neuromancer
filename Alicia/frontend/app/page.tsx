@@ -13,22 +13,28 @@ import { SessionPicker } from "@/components/alicia/session-picker"
 import { TerminalPane } from "@/components/alicia/terminal-pane"
 import { type AliciaState } from "@/lib/alicia-types"
 import {
+  codexApprovalRespond,
   codexBridgeStop,
   isTauriRuntime,
   pickImageFile,
   pickMentionFile,
   terminalResize,
   terminalWrite,
+  type ApprovalDecision,
   type CodexModel,
   type RuntimeCodexConfig,
 } from "@/lib/tauri-bridge"
 import {
   INITIAL_ALICIA_STATE,
+  parseUnifiedDiffFiles,
+  type ApprovalRequestState,
   type Message,
   readModelsCache,
   type RuntimeState,
   type TerminalTab,
   timestampNow,
+  type TurnDiffState,
+  type TurnPlanState,
 } from "@/lib/alicia-runtime-helpers"
 import {
   ResizableHandle,
@@ -43,16 +49,34 @@ import { useAliciaTerminalRuntime } from "@/hooks/use-alicia-terminal-runtime"
 import { useAliciaActions } from "@/hooks/use-alicia-actions"
 import { useAliciaBootstrap } from "@/hooks/use-alicia-bootstrap"
 import { useAliciaRuntimeCore } from "@/hooks/use-alicia-runtime-core"
+import {
+  parseReasoningSystemMessage,
+  parseUsageSystemMessage,
+  type UsageStats,
+} from "@/lib/runtime-statusline"
+import {
+  encodeAgentSpawnerPayload,
+  mergeAgentSpawnerPayloads,
+  parseAgentSpawnerPayload,
+} from "@/lib/agent-spawner-events"
 
 export default function AliciaTerminal() {
   const [initializing, setInitializing] = useState(true)
-  const [initializingStatus, setInitializingStatus] = useState("Initializing Alicia runtime...")
+  const [initializingStatus, setInitializingStatus] = useState(
+    "Initializing Alicia runtime...",
+  )
   const [bootLogs, setBootLogs] = useState<string[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [isThinking, setIsThinking] = useState(false)
+  const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequestState[]>([])
+  const [turnDiff, setTurnDiff] = useState<TurnDiffState | null>(null)
+  const [turnPlan, setTurnPlan] = useState<TurnPlanState | null>(null)
   const [pendingImages, setPendingImages] = useState<string[]>([])
   const [pendingMentions, setPendingMentions] = useState<string[]>([])
-  const [sessionPickerMode, setSessionPickerMode] = useState<"resume" | "fork" | "list">("list")
+  const [sessionPickerMode, setSessionPickerMode] = useState<
+    "resume" | "fork" | "list"
+  >("list")
+  const [sessionsPanelLoading, setSessionsPanelLoading] = useState(false)
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([])
   const [activeTerminalId, setActiveTerminalId] = useState<number | null>(null)
   const [aliciaState, setAliciaState] = useState<AliciaState>(INITIAL_ALICIA_STATE)
@@ -71,6 +95,7 @@ export default function AliciaTerminal() {
 
   const idRef = useRef(1)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const shouldAutoScrollRef = useRef(true)
   const terminalContainerRef = useRef<HTMLDivElement>(null)
   const codexUnlistenRef = useRef<(() => void) | null>(null)
   const terminalUnlistenRef = useRef<(() => void) | null>(null)
@@ -94,6 +119,7 @@ export default function AliciaTerminal() {
     setModelsCachedAt(cached.cachedAt)
     setModelsFromCache(true)
   }, [])
+
   const nextMessageId = useCallback(() => {
     idRef.current += 1
     return idRef.current
@@ -104,27 +130,163 @@ export default function AliciaTerminal() {
       if (!content.trim()) {
         return
       }
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: nextMessageId(),
-          type,
-          content,
-          timestamp: timestampNow(),
-        },
-      ])
+
+      const timestamp = timestampNow()
+      setMessages((prev) => {
+        if (type !== "system" || prev.length === 0) {
+          return [
+            ...prev,
+            {
+              id: nextMessageId(),
+              type,
+              content,
+              timestamp,
+            },
+          ]
+        }
+
+        const incomingSpawner = parseAgentSpawnerPayload(content)
+        const last = prev[prev.length - 1]
+        if (!incomingSpawner || last.type !== "system") {
+          return [
+            ...prev,
+            {
+              id: nextMessageId(),
+              type,
+              content,
+              timestamp,
+            },
+          ]
+        }
+
+        const previousSpawner = parseAgentSpawnerPayload(last.content)
+        if (!previousSpawner) {
+          return [
+            ...prev,
+            {
+              id: nextMessageId(),
+              type,
+              content,
+              timestamp,
+            },
+          ]
+        }
+
+        const mergedPayload = mergeAgentSpawnerPayloads(
+          previousSpawner,
+          incomingSpawner,
+        )
+        const mergedContent = encodeAgentSpawnerPayload(mergedPayload)
+
+        return [
+          ...prev.slice(0, -1),
+          {
+            ...last,
+            content: mergedContent,
+            timestamp,
+          },
+        ]
+      })
     },
     [nextMessageId],
   )
 
+  const turnDiffFiles = useMemo(
+    () => parseUnifiedDiffFiles(turnDiff?.diff ?? ""),
+    [turnDiff],
+  )
+
+  const statusSignals = useMemo(() => {
+    let usage: UsageStats | null = null
+    let reasoning: string | null = null
+
+    for (const message of messages) {
+      if (message.type !== "system") {
+        continue
+      }
+
+      const parsedUsage = parseUsageSystemMessage(message.content)
+      if (parsedUsage) {
+        usage = parsedUsage
+        continue
+      }
+
+      const parsedReasoning = parseReasoningSystemMessage(message.content)
+      if (parsedReasoning) {
+        reasoning = parsedReasoning
+      }
+    }
+
+    return { usage, reasoning }
+  }, [messages])
+  const isNearBottom = useCallback((container: HTMLDivElement) => {
+    const thresholdPx = 96
+    const remaining =
+      container.scrollHeight - container.scrollTop - container.clientHeight
+    return remaining <= thresholdPx
+  }, [])
+
+  const scrollConversationToBottom = useCallback((force = false) => {
+    const container = scrollRef.current
+    if (!container) {
+      return
+    }
+
+    if (!force && !shouldAutoScrollRef.current) {
+      return
+    }
+
+    container.scrollTop = container.scrollHeight
+    shouldAutoScrollRef.current = true
+  }, [])
+
+  useEffect(() => {
+    const container = scrollRef.current
+    if (!container) {
+      return
+    }
+
+    const syncAutoScroll = () => {
+      shouldAutoScrollRef.current = isNearBottom(container)
+    }
+
+    scrollConversationToBottom(true)
+    syncAutoScroll()
+    container.addEventListener("scroll", syncAutoScroll, { passive: true })
+
+    return () => {
+      container.removeEventListener("scroll", syncAutoScroll)
+    }
+  }, [initializing, isNearBottom, scrollConversationToBottom])
+
+  useEffect(() => {
+    const frameId = window.requestAnimationFrame(() => {
+      scrollConversationToBottom()
+    })
+
+    return () => {
+      window.cancelAnimationFrame(frameId)
+    }
+  }, [
+    messages,
+    isThinking,
+    pendingApprovals.length,
+    turnDiff?.turnId,
+    turnPlan?.turnId,
+    scrollConversationToBottom,
+  ])
+
   const appendBootLog = useCallback((message: string) => {
     const now = new Date()
-    const stamp = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
+    const stamp = `${String(now.getHours()).padStart(2, "0")}:${String(now
+      .getMinutes())
+      .padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`
     setBootLogs((prev) => [...prev.slice(-19), `${stamp} ${message}`])
   }, [])
 
   const {
     setActiveSessionEntry,
+    refreshThreadList,
     refreshMcpServers,
     refreshModelsCatalog,
     openModelPanel,
@@ -154,14 +316,33 @@ export default function AliciaTerminal() {
     setActiveTerminalId,
   })
 
+  const openSessionPanel = useCallback(
+    (mode: "resume" | "fork" | "list") => {
+      setSessionPickerMode(mode)
+      setAliciaState((prev) => ({ ...prev, activePanel: "sessions" }))
+      setSessionsPanelLoading(true)
+      void refreshThreadList({
+        activeThreadId: threadIdRef.current,
+        notifyOnError: false,
+      }).finally(() => {
+        setSessionsPanelLoading(false)
+      })
+    },
+    [refreshThreadList],
+  )
+
   const handleCodexEvent = useMemo(
     () =>
       createCodexEventHandler({
         addMessage,
         setRuntime,
         setIsThinking,
+        setPendingApprovals,
+        setTurnDiff,
+        setTurnPlan,
         seenEventSeqRef,
         streamedAgentTextRef,
+        threadIdRef,
       }),
     [addMessage],
   )
@@ -193,6 +374,7 @@ export default function AliciaTerminal() {
     setActiveSessionEntry,
     ensureBridgeSession,
     refreshModelsCatalog,
+    refreshThreadList,
     refreshMcpServers,
     createTerminalTab,
     onBootLog: appendBootLog,
@@ -204,6 +386,7 @@ export default function AliciaTerminal() {
     handleModelSelect,
     handlePermissionSelect,
     handleSessionSelect,
+    sessionActionPending,
   } = useAliciaActions({
     addMessage,
     ensureBridgeSession,
@@ -211,16 +394,66 @@ export default function AliciaTerminal() {
     pendingMentions,
     setPendingImages,
     setPendingMentions,
+    setMessages,
+    setPendingApprovals,
+    setTurnDiff,
+    setTurnPlan,
     setIsThinking,
     threadIdRef,
     openModelPanel,
+    openSessionPanel,
     refreshMcpServers,
+    refreshThreadList,
     setAliciaState,
-    setSessionPickerMode,
     setRuntime,
     runtimeConfigRef,
     availableModels,
   })
+
+  const handleTerminalResize = useCallback(
+    async (terminalId: number, cols: number, rows: number) => {
+      try {
+        await terminalResize(terminalId, cols, rows)
+      } catch {
+        // best effort
+      }
+    },
+    [],
+  )
+
+  const handleTerminalWrite = useCallback(
+    async (terminalId: number, data: string) => {
+      try {
+        await terminalWrite(terminalId, data)
+      } catch {
+        // best effort
+      }
+    },
+    [],
+  )
+
+  useAliciaTerminalRuntime({
+    initializing,
+    activeTerminalId,
+    activeTerminalRef,
+    terminalContainerRef,
+    terminalBuffersRef,
+    xtermRef,
+    fitAddonRef,
+    onTerminalResize: handleTerminalResize,
+    onTerminalWrite: handleTerminalWrite,
+  })
+
+  const handleApprovalDecision = useCallback(
+    async (actionId: string, decision: ApprovalDecision) => {
+      try {
+        await codexApprovalRespond({ actionId, decision })
+      } catch (error) {
+        addMessage("system", `[approval] failed: ${String(error)}`)
+      }
+    },
+    [addMessage],
+  )
 
   if (initializing) {
     return (
@@ -232,7 +465,9 @@ export default function AliciaTerminal() {
           </div>
           <div className="p-4 font-mono text-xs text-terminal-fg/75 max-h-64 overflow-y-auto">
             {bootLogs.length === 0 ? (
-              <div className="text-terminal-fg/45">Aguardando logs de inicializacao...</div>
+              <div className="text-terminal-fg/45">
+                Aguardando logs de inicializacao...
+              </div>
             ) : (
               bootLogs.map((line, index) => (
                 <div key={`boot-log-${index}`} className="leading-relaxed">
@@ -245,6 +480,7 @@ export default function AliciaTerminal() {
       </div>
     )
   }
+
   return (
     <div className="h-screen w-screen flex flex-col bg-background overflow-hidden">
       <TitleBar connected={runtime.connected} workspace={runtime.workspace} />
@@ -260,24 +496,39 @@ export default function AliciaTerminal() {
                 void openModelPanel(true)
                 return
               }
-              if (panel === "sessions") setSessionPickerMode("list")
+              if (panel === "sessions") {
+                void openSessionPanel("list")
+                return
+              }
               setAliciaState((prev) => ({ ...prev, activePanel: panel }))
             }}
             onStartSession={() => {
               threadIdRef.current = null
+              setPendingApprovals([])
+              setTurnDiff(null)
+              setTurnPlan(null)
               void ensureBridgeSession(true)
             }}
             onStopSession={() => {
               void codexBridgeStop()
-              setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
+              setPendingApprovals([])
+              setTurnDiff(null)
+              setTurnPlan(null)
+              setRuntime((prev) => ({
+                ...prev,
+                state: "idle",
+                sessionId: null,
+                pid: null,
+              }))
             }}
             onResumeSession={() => {
-              setSessionPickerMode("resume")
-              setAliciaState((prev) => ({ ...prev, activePanel: "sessions" }))
+              void openSessionPanel("resume")
             }}
             onForkSession={() => {
-              setSessionPickerMode("fork")
-              setAliciaState((prev) => ({ ...prev, activePanel: "sessions" }))
+              void openSessionPanel("fork")
+            }}
+            onSelectSession={(sessionId) => {
+              void handleSessionSelect(sessionId, "switch")
             }}
           />
         </ResizablePanel>
@@ -292,6 +543,9 @@ export default function AliciaTerminal() {
                 isThinking={isThinking}
                 pendingImages={pendingImages}
                 pendingMentions={pendingMentions}
+                pendingApprovals={pendingApprovals}
+                turnDiffFiles={turnDiffFiles}
+                turnPlan={turnPlan}
                 runtimeState={runtime.state}
                 scrollRef={scrollRef}
                 onSubmit={handleSubmit}
@@ -310,6 +564,7 @@ export default function AliciaTerminal() {
                 onRemoveMention={(index) => {
                   setPendingMentions((prev) => prev.filter((_, i) => i !== index))
                 }}
+                onApprovalDecision={handleApprovalDecision}
               />
             </ResizablePanel>
             <ResizableHandle withHandle />
@@ -338,12 +593,18 @@ export default function AliciaTerminal() {
           state: runtime.state,
           sessionId: runtime.sessionId,
         }}
+        usage={statusSignals.usage}
+        reasoning={statusSignals.reasoning}
+        isThinking={isThinking}
         onOpenPanel={(panel) => {
           if (panel === "model") {
             void openModelPanel(true)
             return
           }
-          if (panel === "sessions") setSessionPickerMode("list")
+          if (panel === "sessions") {
+            void openSessionPanel("list")
+            return
+          }
           setAliciaState((prev) => ({ ...prev, activePanel: panel }))
         }}
       />
@@ -381,9 +642,14 @@ export default function AliciaTerminal() {
         <SessionPicker
           sessions={aliciaState.sessions}
           mode={sessionPickerMode}
+          loading={sessionsPanelLoading}
+          busyAction={sessionActionPending}
           onSelect={handleSessionSelect}
           onNewSession={() => {
             threadIdRef.current = null
+            setPendingApprovals([])
+            setTurnDiff(null)
+            setTurnPlan(null)
             void ensureBridgeSession(true)
           }}
           onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
@@ -392,17 +658,5 @@ export default function AliciaTerminal() {
     </div>
   )
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 

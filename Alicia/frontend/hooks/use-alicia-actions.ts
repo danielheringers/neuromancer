@@ -1,19 +1,37 @@
-import { useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from "react"
+import {
+  useCallback,
+  useState,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react"
 import {
   APPROVAL_PRESETS,
   type AliciaState,
   type ApprovalPreset,
   type ReasoningEffort,
 } from "@/lib/alicia-types"
-import { type Message, type RuntimeState } from "@/lib/alicia-runtime-helpers"
+import {
+  isRuntimeCommandUnavailable,
+  mapThreadTurnsToMessages,
+  type ApprovalRequestState,
+  type Message,
+  type RuntimeState,
+  type TurnDiffState,
+  type TurnPlanState,
+} from "@/lib/alicia-runtime-helpers"
 import {
   codexBridgeStop,
   codexConfigSet,
+  codexThreadFork,
+  codexThreadOpen,
+  codexThreadRead,
   codexTurnRun,
   runCodexCommand,
   sendCodexInput,
   type CodexInputItem,
   type CodexModel,
+  type CodexThreadRecord,
   type RuntimeCodexConfig,
 } from "@/lib/tauri-bridge"
 
@@ -24,12 +42,20 @@ interface UseAliciaActionsParams {
   pendingMentions: string[]
   setPendingImages: Dispatch<SetStateAction<string[]>>
   setPendingMentions: Dispatch<SetStateAction<string[]>>
+  setMessages: Dispatch<SetStateAction<Message[]>>
+  setPendingApprovals: Dispatch<SetStateAction<ApprovalRequestState[]>>
+  setTurnDiff: Dispatch<SetStateAction<TurnDiffState | null>>
+  setTurnPlan: Dispatch<SetStateAction<TurnPlanState | null>>
   setIsThinking: Dispatch<SetStateAction<boolean>>
   threadIdRef: MutableRefObject<string | null>
   openModelPanel: (notifyOnError?: boolean) => Promise<void>
+  openSessionPanel: (mode: "resume" | "fork" | "list") => void
   refreshMcpServers: () => Promise<void>
+  refreshThreadList: (options?: {
+    activeThreadId?: string | null
+    notifyOnError?: boolean
+  }) => Promise<CodexThreadRecord[]>
   setAliciaState: Dispatch<SetStateAction<AliciaState>>
-  setSessionPickerMode: Dispatch<SetStateAction<"resume" | "fork" | "list">>
   setRuntime: Dispatch<SetStateAction<RuntimeState>>
   runtimeConfigRef: MutableRefObject<RuntimeCodexConfig | null>
   availableModels: CodexModel[]
@@ -42,27 +68,40 @@ export function useAliciaActions({
   pendingMentions,
   setPendingImages,
   setPendingMentions,
+  setMessages,
+  setPendingApprovals,
+  setTurnDiff,
+  setTurnPlan,
   setIsThinking,
   threadIdRef,
   openModelPanel,
+  openSessionPanel,
   refreshMcpServers,
+  refreshThreadList,
   setAliciaState,
-  setSessionPickerMode,
   setRuntime,
   runtimeConfigRef,
   availableModels,
 }: UseAliciaActionsParams) {
+  const [sessionActionPending, setSessionActionPending] = useState<{
+    sessionId: string
+    action: "resume" | "fork" | "switch"
+  } | null>(null)
   const handleSubmit = useCallback(
     async (value: string) => {
       const text = value.trim()
-      if (!text && pendingMentions.length === 0 && pendingImages.length === 0) return
+      if (!text && pendingMentions.length === 0 && pendingImages.length === 0) {
+        return
+      }
 
       const preview = [text, pendingMentions.join(" "), pendingImages.join(" ")]
         .filter(Boolean)
         .join("\n")
       addMessage("user", preview)
 
-      if (!(await ensureBridgeSession(false))) return
+      if (!(await ensureBridgeSession(false))) {
+        return
+      }
 
       const inputItems: CodexInputItem[] = []
       if (text) inputItems.push({ type: "text", text })
@@ -76,7 +115,9 @@ export function useAliciaActions({
           threadId: threadIdRef.current ?? undefined,
           inputItems,
         })
-        if (result.threadId) threadIdRef.current = result.threadId
+        if (result.threadId) {
+          threadIdRef.current = result.threadId
+        }
         setPendingImages([])
         setPendingMentions([])
       } catch (error) {
@@ -112,13 +153,11 @@ export function useAliciaActions({
         return
       }
       if (command === "/resume") {
-        setSessionPickerMode("resume")
-        setAliciaState((prev) => ({ ...prev, activePanel: "sessions" }))
+        openSessionPanel("resume")
         return
       }
       if (command === "/fork") {
-        setSessionPickerMode("fork")
-        setAliciaState((prev) => ({ ...prev, activePanel: "sessions" }))
+        openSessionPanel("fork")
         return
       }
       if (command === "/new") {
@@ -139,7 +178,12 @@ export function useAliciaActions({
       }
       if (command === "/quit" || command === "/exit") {
         await codexBridgeStop()
-        setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
+        setRuntime((prev) => ({
+          ...prev,
+          state: "idle",
+          sessionId: null,
+          pid: null,
+        }))
         return
       }
       await handleSubmit(command)
@@ -149,10 +193,10 @@ export function useAliciaActions({
       ensureBridgeSession,
       handleSubmit,
       openModelPanel,
+      openSessionPanel,
       refreshMcpServers,
       setAliciaState,
       setRuntime,
-      setSessionPickerMode,
       threadIdRef,
     ],
   )
@@ -233,15 +277,112 @@ export function useAliciaActions({
   )
 
   const handleSessionSelect = useCallback(
-    async (_sessionId: string, action: "resume" | "fork" | "switch") => {
-      if (action === "fork") {
-        await runCodexCommand(["fork", "--last"])
-      } else {
-        await runCodexCommand(["resume", "--last"])
+    async (sessionId: string, action: "resume" | "fork" | "switch") => {
+      const selectedThreadId = sessionId.trim()
+      if (!selectedThreadId || sessionActionPending) {
+        return
       }
-      setAliciaState((prev) => ({ ...prev, activePanel: null }))
+
+      setSessionActionPending({ sessionId: selectedThreadId, action })
+      let historyMessages: Message[] = []
+      let historyError: string | null = null
+
+      try {
+        if (!(await ensureBridgeSession(false))) {
+          return
+        }
+
+        if (action === "fork") {
+          let nextThreadId: string | null = null
+
+          try {
+            const forked = await codexThreadFork({
+              threadId: selectedThreadId,
+              persistExtendedHistory: false,
+            })
+            nextThreadId =
+              (typeof forked.thread?.id === "string" && forked.thread.id.trim()) ||
+              (typeof forked.threadId === "string" && forked.threadId.trim()) ||
+              null
+          } catch (error) {
+            if (!isRuntimeCommandUnavailable(error)) {
+              throw error
+            }
+
+            await runCodexCommand(["fork", selectedThreadId])
+            const refreshed = await refreshThreadList({ notifyOnError: false })
+            nextThreadId = refreshed[0]?.id ?? null
+          }
+
+          if (nextThreadId) {
+            const opened = await codexThreadOpen(nextThreadId)
+            threadIdRef.current = opened.threadId || nextThreadId
+          } else {
+            threadIdRef.current = null
+          }
+        } else {
+          const opened = await codexThreadOpen(selectedThreadId)
+          threadIdRef.current = opened.threadId || selectedThreadId
+        }
+
+        const threadToRead = threadIdRef.current ?? selectedThreadId
+        if (threadToRead) {
+          try {
+            const history = await codexThreadRead({
+              threadId: threadToRead,
+              includeTurns: true,
+            })
+            const turns = Array.isArray(history.thread.turns)
+              ? history.thread.turns
+              : []
+            historyMessages = mapThreadTurnsToMessages(turns)
+          } catch (error) {
+            const message = String(error ?? "")
+            const includeTurnsUnavailable = message.includes(
+              "includeTurns is unavailable before first user message",
+            )
+            if (
+              !includeTurnsUnavailable &&
+              !isRuntimeCommandUnavailable(error)
+            ) {
+              historyError = `[session] history sync failed: ${message}`
+            }
+          }
+        }
+
+        setMessages(historyMessages)
+        setIsThinking(false)
+        setPendingApprovals([])
+        setTurnDiff(null)
+        setTurnPlan(null)
+        setAliciaState((prev) => ({ ...prev, activePanel: null }))
+        void refreshThreadList({
+          activeThreadId: threadIdRef.current,
+          notifyOnError: false,
+        })
+
+        if (historyError) {
+          addMessage("system", historyError)
+        }
+      } catch (error) {
+        addMessage("system", `[session] ${action} failed: ${String(error)}`)
+      } finally {
+        setSessionActionPending(null)
+      }
     },
-    [setAliciaState],
+    [
+      addMessage,
+      ensureBridgeSession,
+      refreshThreadList,
+      sessionActionPending,
+      setAliciaState,
+      setIsThinking,
+      setMessages,
+      setPendingApprovals,
+      setTurnDiff,
+      setTurnPlan,
+      threadIdRef,
+    ],
   )
 
   return {
@@ -250,5 +391,7 @@ export function useAliciaActions({
     handleModelSelect,
     handlePermissionSelect,
     handleSessionSelect,
+    sessionActionPending,
   }
 }
+

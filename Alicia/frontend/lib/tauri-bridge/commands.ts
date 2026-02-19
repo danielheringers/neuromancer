@@ -1,11 +1,30 @@
 import { invoke } from '@tauri-apps/api/core'
 
 import type {
+  CodexApprovalRespondRequest,
   CodexHelpSnapshot,
   CodexModelListResponse,
+  CodexThreadArchiveRequest,
+  CodexThreadArchiveResponse,
+  CodexThreadCompactStartRequest,
+  CodexThreadCompactStartResponse,
+  CodexThreadForkRequest,
+  CodexThreadForkResponse,
+  CodexThreadListRequest,
+  CodexThreadListResponse,
   CodexThreadOpenResponse,
+  CodexThreadReadRequest,
+  CodexThreadReadResponse,
+  CodexThreadRollbackRequest,
+  CodexThreadRollbackResponse,
+  CodexThreadUnarchiveRequest,
+  CodexThreadUnarchiveResponse,
+  CodexTurnInterruptRequest,
+  CodexTurnInterruptResponse,
   CodexTurnRunRequest,
   CodexTurnRunResponse,
+  CodexTurnSteerRequest,
+  CodexTurnSteerResponse,
   McpServerListResponse,
   McpStartupWarmupResponse,
   RunCodexCommandResponse,
@@ -51,10 +70,74 @@ export async function codexTurnRun(
   return invoke<CodexTurnRunResponse>('codex_turn_run', { request })
 }
 
+export async function codexTurnSteer(
+  request: CodexTurnSteerRequest,
+): Promise<CodexTurnSteerResponse> {
+  return invoke<CodexTurnSteerResponse>('codex_turn_steer', { request })
+}
+
+export async function codexTurnInterrupt(
+  request: CodexTurnInterruptRequest,
+): Promise<CodexTurnInterruptResponse> {
+  return invoke<CodexTurnInterruptResponse>('codex_turn_interrupt', { request })
+}
+
 export async function codexThreadOpen(
   threadId?: string,
 ): Promise<CodexThreadOpenResponse> {
   return invoke<CodexThreadOpenResponse>('codex_thread_open', { threadId })
+}
+
+export async function codexThreadList(
+  request?: CodexThreadListRequest,
+): Promise<CodexThreadListResponse> {
+  return invoke<CodexThreadListResponse>('codex_thread_list', { request })
+}
+
+export async function codexThreadRead(
+  request: CodexThreadReadRequest,
+): Promise<CodexThreadReadResponse> {
+  return invoke<CodexThreadReadResponse>('codex_thread_read', { request })
+}
+
+export async function codexThreadArchive(
+  request: CodexThreadArchiveRequest,
+): Promise<CodexThreadArchiveResponse> {
+  return invoke<CodexThreadArchiveResponse>('codex_thread_archive', { request })
+}
+
+export async function codexThreadUnarchive(
+  request: CodexThreadUnarchiveRequest,
+): Promise<CodexThreadUnarchiveResponse> {
+  return invoke<CodexThreadUnarchiveResponse>('codex_thread_unarchive', {
+    request,
+  })
+}
+
+export async function codexThreadCompactStart(
+  request: CodexThreadCompactStartRequest,
+): Promise<CodexThreadCompactStartResponse> {
+  return invoke<CodexThreadCompactStartResponse>('codex_thread_compact_start', {
+    request,
+  })
+}
+
+export async function codexThreadRollback(
+  request: CodexThreadRollbackRequest,
+): Promise<CodexThreadRollbackResponse> {
+  return invoke<CodexThreadRollbackResponse>('codex_thread_rollback', { request })
+}
+
+export async function codexThreadFork(
+  request: CodexThreadForkRequest,
+): Promise<CodexThreadForkResponse> {
+  return invoke<CodexThreadForkResponse>('codex_thread_fork', { request })
+}
+
+export async function codexApprovalRespond(
+  request: CodexApprovalRespondRequest,
+): Promise<void> {
+  await invoke('codex_approval_respond', { request })
 }
 
 export async function sendCodexInput(text: string): Promise<void> {

@@ -1,4 +1,9 @@
-import { useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from "react"
+import {
+  useEffect,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react"
 
 import { type AliciaState } from "@/lib/alicia-types"
 import {
@@ -18,6 +23,7 @@ import {
   loadCodexDefaultConfig,
   type CodexModel,
   type CodexRuntimeEvent,
+  type CodexThreadRecord,
   type RuntimeCodexConfig,
   type TerminalRuntimeEvent,
 } from "@/lib/tauri-bridge"
@@ -35,9 +41,17 @@ interface UseAliciaBootstrapParams {
   setAliciaState: Dispatch<SetStateAction<AliciaState>>
   setInitializingStatus: Dispatch<SetStateAction<string>>
   setInitializing: Dispatch<SetStateAction<boolean>>
-  setActiveSessionEntry: (sessionId: number, model?: string) => void
+  setActiveSessionEntry: (
+    sessionId: number,
+    model?: string,
+    threadId?: string | null,
+  ) => void
   ensureBridgeSession: (forceNew?: boolean) => Promise<boolean>
   refreshModelsCatalog: (notifyOnError?: boolean) => Promise<CodexModel[]>
+  refreshThreadList: (options?: {
+    activeThreadId?: string | null
+    notifyOnError?: boolean
+  }) => Promise<CodexThreadRecord[]>
   refreshMcpServers: () => Promise<void>
   createTerminalTab: (cwd?: string) => Promise<boolean>
   onBootLog?: (message: string) => void
@@ -59,6 +73,7 @@ export function useAliciaBootstrap({
   setActiveSessionEntry,
   ensureBridgeSession,
   refreshModelsCatalog,
+  refreshThreadList,
   refreshMcpServers,
   createTerminalTab,
   onBootLog,
@@ -84,7 +99,10 @@ export function useAliciaBootstrap({
         setBootStatus("Initializing Alicia runtime...")
         if (!isTauriRuntime()) {
           setRuntime((prev) => ({ ...prev, connected: false }))
-          addMessage("system", "Alicia running in web mode. Launch with Tauri for full runtime.")
+          addMessage(
+            "system",
+            "Alicia running in web mode. Launch with Tauri for full runtime.",
+          )
           reportBoot("Running in web mode; Tauri runtime unavailable")
           return
         }
@@ -122,13 +140,20 @@ export function useAliciaBootstrap({
 
         let hasActiveSession = status.sessionId != null
         if (status.sessionId != null) {
-          setActiveSessionEntry(status.sessionId, normalizeConfig(status.runtimeConfig).model)
+          setActiveSessionEntry(
+            status.sessionId,
+            normalizeConfig(status.runtimeConfig).model,
+          )
         } else {
           setBootStatus("Starting Codex session...")
           hasActiveSession = await ensureBridgeSession(false)
         }
 
         if (hasActiveSession) {
+          setBootStatus("Loading session history...")
+          await refreshThreadList({ notifyOnError: false })
+          reportBoot("Thread list synchronized")
+
           setBootStatus("Loading MCP servers...")
           try {
             const warmup = await codexWaitForMcpStartup()

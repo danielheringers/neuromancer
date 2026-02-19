@@ -146,6 +146,155 @@ export interface CodexThreadOpenResponse {
   threadId: string
 }
 
+export type CodexThreadSortKey = 'created_at' | 'updated_at'
+
+export interface CodexThreadSource {
+  kind: string
+}
+
+export interface CodexThreadHistoryMessage {
+  role: 'user' | 'agent' | 'system'
+  content: string
+}
+
+export interface CodexThreadTurn {
+  id: string
+  status: string
+  itemCount: number
+  messages?: CodexThreadHistoryMessage[]
+}
+
+export interface CodexThreadRecord {
+  id: string
+  codexThreadId?: string
+  preview: string
+  modelProvider: string
+  createdAt: number
+  updatedAt: number
+  path?: string | null
+  cwd?: string
+  cliVersion?: string
+  source?: CodexThreadSource | string | null
+  turnCount?: number
+  turns?: CodexThreadTurn[]
+}
+
+export interface CodexThreadListRequest {
+  cursor?: string | null
+  limit?: number | null
+  sortKey?: CodexThreadSortKey | null
+  modelProviders?: string[] | null
+  sourceKinds?: string[] | null
+  archived?: boolean | null
+  cwd?: string | null
+}
+
+export interface CodexThreadListResponse {
+  data: CodexThreadRecord[]
+  nextCursor: string | null
+}
+
+export interface CodexThreadReadRequest {
+  threadId: string
+  includeTurns?: boolean
+}
+
+export interface CodexThreadReadResponse {
+  thread: CodexThreadRecord
+}
+
+export interface CodexThreadArchiveRequest {
+  threadId: string
+}
+
+export interface CodexThreadArchiveResponse {
+  id: string
+  codexThreadId: string
+  archived: boolean
+}
+
+export interface CodexThreadUnarchiveRequest {
+  threadId: string
+}
+
+export interface CodexThreadUnarchiveResponse {
+  thread: CodexThreadRecord
+}
+
+export interface CodexThreadCompactStartRequest {
+  threadId: string
+}
+
+export interface CodexThreadCompactStartResponse {
+  ok: boolean
+  threadId: string
+  codexThreadId: string
+}
+
+export interface CodexThreadRollbackRequest {
+  threadId: string
+  numTurns: number
+}
+
+export interface CodexThreadRollbackResponse {
+  thread: CodexThreadRecord
+}
+
+export interface CodexThreadForkRequest {
+  threadId: string
+  path?: string | null
+  model?: string | null
+  modelProvider?: string | null
+  cwd?: string | null
+  persistExtendedHistory?: boolean
+}
+
+export interface CodexThreadForkResponse {
+  thread: CodexThreadRecord
+  threadId?: string
+  model?: string
+  modelProvider?: string
+  cwd?: string
+}
+
+export interface CodexTurnSteerRequest {
+  threadId: string
+  inputItems: CodexInputItem[]
+  expectedTurnId: string
+}
+
+export interface CodexTurnSteerResponse {
+  threadId: string
+  codexThreadId: string
+  turnId: string
+}
+
+export interface CodexTurnInterruptRequest {
+  threadId: string
+  turnId: string
+}
+
+export interface CodexTurnInterruptResponse {
+  ok: boolean
+  threadId: string
+  codexThreadId: string
+  turnId: string
+}
+
+export type ApprovalDecision =
+  | 'accept'
+  | 'acceptForSession'
+  | 'decline'
+  | 'cancel'
+  | 'acceptWithExecpolicyAmendment'
+
+export interface CodexApprovalRespondRequest {
+  actionId: string
+  decision: ApprovalDecision
+  remember?: boolean
+  execpolicyAmendment?: string[]
+}
+
 export interface CodexStructuredEventPayload {
   sessionId: number
   seq: number

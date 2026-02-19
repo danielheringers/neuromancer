@@ -39,3 +39,30 @@ Run commands from the indicated directory.
 - Keep commits atomic and runnable.
 - PRs should include: problem statement, solution summary, validation steps, and linked issue/execplan.
 - Include screenshots/GIFs for frontend/Tauri UI changes and call out config/security-impacting updates explicitly.
+
+## Multi-Agent Playbook (AlicIA)
+- Use explicit multi-agent orchestration for maintenance tasks in `alicia/*`.
+- Always define ownership boundaries before implementation:
+  - `alicia-frontend` owns only `alicia/frontend/**`.
+  - `alicia-backend` owns only `alicia/backend/**`.
+  - `alicia-codex-bridge` owns only `alicia/codex-bridge/**`.
+- Follow this execution sequence:
+  1. Spawn `alicia-planner` (read-only) for plan, impacted files, risks, and validation checklist.
+  2. Spawn implementers in parallel (`alicia-frontend`, `alicia-backend`, `alicia-codex-bridge`) only when each has relevant scope.
+  3. Spawn `alicia-test` to run lint/build/tests relevant to the changed scope.
+  4. Spawn `alicia-reviewer` (read-only) for final bug/regression/security review.
+  5. Wait for all agents, then publish a consolidated summary with findings, validations, and next actions.
+- If one subproject depends on another, state the expected contract first (API/event/schema) before editing.
+
+## Default prompt template:
+Use multi-agent with the AlicIA team.
+
+Workflow:
+1) Spawn `alicia-planner` (read-only) to produce plan, risks, and touched files.
+2) Spawn implementation agents in parallel with strict ownership:
+- `alicia-frontend` -> only `alicia/frontend/**`
+- `alicia-backend` -> only `alicia/backend/**`
+- `alicia-codex-bridge` -> only `alicia/codex-bridge/**`
+3) Spawn `alicia-test` to validate lint/build/tests for affected scopes.
+4) Spawn `alicia-reviewer` (read-only) for final correctness/security/regression review.
+5) Wait for all agents and consolidate final output with changed files, validations run, findings, and next steps.
