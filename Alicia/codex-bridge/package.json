@@ -1,0 +1,14 @@
+{
+  "name": "alicia-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@openai/codex": "^0.104.0",
+    "@openai/codex-sdk": "file:../../codex/sdk/typescript"
+  }
+}

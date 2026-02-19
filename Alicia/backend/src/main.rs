@@ -1,13 +1,20 @@
+use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::oneshot;
+use tokio::time::{timeout, Duration};
 
 const CODEX_HELP_CLI_TREE: &str = r#"codex
   exec (alias: e)
@@ -160,11 +167,94 @@ struct RunCodexCommandResponse {
     success: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupWarmupResponse {
+    ready_servers: Vec<String>,
+    total_ready: usize,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexInputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    text: Option<String>,
+    path: Option<String>,
+    image_url: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnRunRequest {
+    thread_id: Option<String>,
+    input_items: Vec<CodexInputItem>,
+    output_schema: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTurnRunResponse {
+    accepted: bool,
+    session_id: u64,
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadOpenResponse {
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalCreateRequest {
+    cwd: Option<String>,
+    shell: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalCreateResponse {
+    terminal_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalWriteRequest {
+    terminal_id: u64,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalResizeRequest {
+    terminal_id: u64,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalKillRequest {
+    terminal_id: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StreamEventPayload {
     session_id: u64,
     chunk: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexStructuredEventPayload {
+    session_id: u64,
+    seq: u64,
+    event: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +267,22 @@ struct LifecycleEventPayload {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalDataPayload {
+    terminal_id: u64,
+    seq: u64,
+    chunk: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalExitPayload {
+    terminal_id: u64,
+    seq: u64,
+    exit_code: Option<i32>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexHelpSnapshot {
@@ -185,19 +291,65 @@ struct CodexHelpSnapshot {
     key_flags: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexReasoningEffortOption {
+    reasoning_effort: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexModel {
+    id: String,
+    model: String,
+    display_name: String,
+    description: String,
+    supported_reasoning_efforts: Vec<CodexReasoningEffortOption>,
+    default_reasoning_effort: String,
+    supports_personality: bool,
+    is_default: bool,
+    upgrade: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexModelListResponse {
+    data: Vec<CodexModel>,
+}
+
+type BridgePendingMap = HashMap<u64, oneshot::Sender<Result<Value, String>>>;
+
+struct BridgeProcess {
+    child: Child,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Arc<Mutex<BridgePendingMap>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+struct TerminalSession {
+    terminal_id: u64,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
 struct ActiveSession {
     session_id: u64,
     pid: Option<u32>,
     binary: String,
     cwd: PathBuf,
-    env_overrides: HashMap<String, String>,
     thread_id: Option<String>,
     busy: bool,
+    bridge: BridgeProcess,
 }
 struct AppState {
     active_session: Mutex<Option<ActiveSession>>,
     next_session_id: AtomicU64,
     runtime_config: Mutex<RuntimeCodexConfig>,
+    next_event_seq: Arc<AtomicU64>,
+    next_terminal_id: AtomicU64,
+    terminals: Mutex<HashMap<u64, TerminalSession>>,
 }
 
 impl Default for AppState {
@@ -206,6 +358,9 @@ impl Default for AppState {
             active_session: Mutex::new(None),
             next_session_id: AtomicU64::new(1),
             runtime_config: Mutex::new(RuntimeCodexConfig::default()),
+            next_event_seq: Arc::new(AtomicU64::new(1)),
+            next_terminal_id: AtomicU64::new(1),
+            terminals: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -215,22 +370,6 @@ fn lock_active_session(state: &AppState) -> Result<MutexGuard<'_, Option<ActiveS
         .active_session
         .lock()
         .map_err(|_| "active session lock poisoned".to_string())
-}
-
-fn clear_session_if_current(app: &AppHandle, session_id: u64) -> Result<bool, String> {
-    let state = app.state::<AppState>();
-    let mut guard = lock_active_session(state.inner())?;
-
-    if guard
-        .as_ref()
-        .map(|active| active.session_id == session_id)
-        .unwrap_or(false)
-    {
-        *guard = None;
-        return Ok(true);
-    }
-
-    Ok(false)
 }
 
 fn lock_runtime_config(state: &AppState) -> Result<MutexGuard<'_, RuntimeCodexConfig>, String> {
@@ -726,47 +865,6 @@ fn resolve_codex_launch(binary: &str, args: &[String]) -> Result<(String, Vec<St
     Ok((resolved_binary.to_string_lossy().to_string(), args.to_vec()))
 }
 
-fn build_exec_turn_args(
-    config: &RuntimeCodexConfig,
-    thread_id: Option<&str>,
-    prompt: &str,
-) -> Vec<String> {
-    let normalized = normalize_runtime_config(config.clone());
-    let mut args = vec![
-        "exec".to_string(),
-        "--json".to_string(),
-        "--skip-git-repo-check".to_string(),
-        "--sandbox".to_string(),
-        normalized.sandbox.clone(),
-    ];
-
-    if normalized.model != "default" {
-        args.push("--model".to_string());
-        args.push(normalized.model);
-    }
-
-    if normalized.reasoning != "default" {
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort={}", normalized.reasoning));
-    }
-
-
-    args.push("-c".to_string());
-    args.push(format!("web_search={}", normalized.web_search_mode));
-
-    if normalized.web_search_mode == "live" {
-        args.push("--search".to_string());
-    }
-
-    if let Some(thread_id) = thread_id {
-        args.push("resume".to_string());
-        args.push(thread_id.to_string());
-    }
-
-    args.push(prompt.to_string());
-    args
-}
-
 fn emit_lifecycle(
     app: &AppHandle,
     status: &'static str,
@@ -798,195 +896,319 @@ fn emit_stderr(app: &AppHandle, session_id: u64, chunk: String) {
     emit_stream(app, "codex://stderr", session_id, chunk);
 }
 
-#[derive(Default)]
-struct ParsedExecJsonOutput {
-    thread_id: Option<String>,
-    stdout_chunks: Vec<String>,
-    stderr_chunks: Vec<String>,
+fn emit_codex_event(
+    app: &AppHandle,
+    session_id: u64,
+    event: Value,
+    event_seq: &Arc<AtomicU64>,
+) {
+    let seq = event_seq.fetch_add(1, Ordering::Relaxed);
+    let payload = CodexStructuredEventPayload {
+        session_id,
+        seq,
+        event,
+    };
+    let _ = app.emit("codex://event", payload);
 }
 
-fn push_if_not_blank(target: &mut Vec<String>, value: Option<&str>) {
-    if let Some(value) = value {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            target.push(trimmed.to_string());
+fn emit_terminal_data(app: &AppHandle, terminal_id: u64, event_seq: &Arc<AtomicU64>, chunk: String) {
+    let seq = event_seq.fetch_add(1, Ordering::Relaxed);
+    let payload = TerminalDataPayload {
+        terminal_id,
+        seq,
+        chunk,
+    };
+    let _ = app.emit("terminal://data", payload);
+}
+
+fn emit_terminal_exit(
+    app: &AppHandle,
+    terminal_id: u64,
+    event_seq: &Arc<AtomicU64>,
+    exit_code: Option<i32>,
+) {
+    let seq = event_seq.fetch_add(1, Ordering::Relaxed);
+    let payload = TerminalExitPayload {
+        terminal_id,
+        seq,
+        exit_code,
+    };
+    let _ = app.emit("terminal://exit", payload);
+}
+
+fn fail_pending_requests(pending: &Arc<Mutex<BridgePendingMap>>, message: &str) {
+    if let Ok(mut guard) = pending.lock() {
+        let mut senders = Vec::with_capacity(guard.len());
+        for (_, tx) in guard.drain() {
+            senders.push(tx);
+        }
+        drop(guard);
+        for tx in senders {
+            let _ = tx.send(Err(message.to_string()));
         }
     }
 }
 
-fn parse_exec_item_completed(item: &serde_json::Value, parsed: &mut ParsedExecJsonOutput) {
-    let item_type = item.get("type").and_then(|value| value.as_str()).unwrap_or_default();
-
-    match item_type {
-        "agent_message" => {
-            push_if_not_blank(
-                &mut parsed.stdout_chunks,
-                item.get("text").and_then(|value| value.as_str()),
-            );
+fn resolve_bridge_entrypoint() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("ALICIA_CODEX_BRIDGE_ENTRY") {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return Some(candidate);
         }
-        "command_execution" => {
-            push_if_not_blank(
-                &mut parsed.stdout_chunks,
-                item.get("aggregated_output").and_then(|value| value.as_str()),
-            );
+    }
 
-            let status = item
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
+    let mut candidates = Vec::<PathBuf>::new();
 
-            if status == "failed" || status == "declined" {
-                let command = item
-                    .get("command")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("command");
-                let exit_code = item
-                    .get("exit_code")
-                    .and_then(|value| value.as_i64())
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
+    if let Ok(cwd) = env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            candidates.push(ancestor.join("alicia").join("codex-bridge").join("index.mjs"));
+            candidates.push(ancestor.join("codex-bridge").join("index.mjs"));
+        }
+    }
 
-                parsed
-                    .stderr_chunks
-                    .push(format!("[command] {command} failed (exit={exit_code})"));
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            for ancestor in parent.ancestors() {
+                candidates.push(ancestor.join("alicia").join("codex-bridge").join("index.mjs"));
+                candidates.push(ancestor.join("codex-bridge").join("index.mjs"));
             }
         }
-        "error" => {
-            push_if_not_blank(
-                &mut parsed.stderr_chunks,
-                item.get("message").and_then(|value| value.as_str()),
-            );
-        }
-        _ => {}
     }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
-fn parse_exec_json_event(event: &serde_json::Value, parsed: &mut ParsedExecJsonOutput) {
-    let event_type = event
-        .get("type")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-
-    match event_type {
-        "thread.started" => {
-            if let Some(thread_id) = event.get("thread_id").and_then(|value| value.as_str()) {
-                parsed.thread_id = Some(thread_id.to_string());
-            }
-        }
-        "item.completed" => {
-            if let Some(item) = event.get("item") {
-                parse_exec_item_completed(item, parsed);
-            }
-        }
-        "turn.failed" => {
-            push_if_not_blank(
-                &mut parsed.stderr_chunks,
-                event
-                    .get("error")
-                    .and_then(|value| value.get("message"))
-                    .and_then(|value| value.as_str()),
-            );
-        }
-        "error" => {
-            push_if_not_blank(
-                &mut parsed.stderr_chunks,
-                event.get("message").and_then(|value| value.as_str()),
-            );
-        }
-        _ => {}
-    }
-}
-
-fn parse_exec_jsonl_output(stdout: &str) -> ParsedExecJsonOutput {
-    let mut parsed = ParsedExecJsonOutput::default();
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(event) => parse_exec_json_event(&event, &mut parsed),
-            Err(_) => continue,
-        }
-    }
-
-    parsed
-}
-
-fn strip_ansi_and_normalize_lines(raw: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut in_escape = false;
-
-    for ch in raw.chars() {
-        if in_escape {
-            if ('@'..='~').contains(&ch) {
-                in_escape = false;
-            }
-            continue;
-        }
-
-        if ch == '\u{1b}' {
-            in_escape = true;
-            continue;
-        }
-
-        match ch {
-            '\r' => current.clear(),
-            '\n' => {
-                let trimmed = current.trim();
-                if !trimmed.is_empty() {
-                    lines.push(trimmed.to_string());
-                }
-                current.clear();
-            }
-            _ if ch.is_control() && ch != '\t' => {}
-            _ => current.push(ch),
-        }
-    }
-
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        lines.push(trimmed.to_string());
-    }
-
-    lines
-}
-
-fn run_exec_turn(
-    binary: &str,
+fn spawn_bridge_process(
+    app: &AppHandle,
+    session_id: u64,
     cwd: &Path,
     env_overrides: &HashMap<String, String>,
-    runtime_config: &RuntimeCodexConfig,
-    thread_id: Option<&str>,
-    prompt: &str,
-) -> Result<RunCodexCommandResponse, String> {
-    let args = build_exec_turn_args(runtime_config, thread_id, prompt);
-    let (program, resolved_args) = resolve_codex_launch(binary, &args)?;
+    binary: &str,
+    event_seq: Arc<AtomicU64>,
+) -> Result<BridgeProcess, String> {
+    let node_binary = resolve_binary_path("node")
+        .ok_or_else(|| "node runtime not found. Install Node.js to run codex bridge.".to_string())?;
+    let bridge_entry = resolve_bridge_entrypoint().ok_or_else(|| {
+        "codex bridge entrypoint not found. Expected `alicia/codex-bridge/index.mjs`.".to_string()
+    })?;
 
-    let mut command = Command::new(program);
-    command.args(resolved_args);
+    let mut command = Command::new(node_binary);
+    command.arg(bridge_entry);
     command.current_dir(cwd);
-
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env("ALICIA_CODEX_BIN", binary);
     for (key, value) in env_overrides {
         command.env(key, value);
     }
 
-    let output = command.output().map_err(|error| {
+    let mut child = command.spawn().map_err(|error| {
         if error.kind() == ErrorKind::NotFound {
-            format!("failed to run codex exec command: executable not found ({error})")
+            format!("failed to launch codex bridge: executable not found ({error})")
         } else {
-            format!("failed to run codex exec command: {error}")
+            format!("failed to launch codex bridge: {error}")
         }
     })?;
 
-    Ok(RunCodexCommandResponse {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        status: output.status.code().unwrap_or(-1),
-        success: output.status.success(),
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to capture codex bridge stdin".to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture codex bridge stdout".to_string())?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture codex bridge stderr".to_string())?;
+
+    let pending = Arc::new(Mutex::new(HashMap::<
+        u64,
+        oneshot::Sender<Result<Value, String>>,
+    >::new()));
+
+    let pending_stdout = Arc::clone(&pending);
+    let app_stdout = app.clone();
+    let event_seq_stdout = Arc::clone(&event_seq);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(child_stdout);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(value) => value,
+                Err(error) => {
+                    emit_stderr(
+                        &app_stdout,
+                        session_id,
+                        format!("[bridge] failed to read stdout: {error}"),
+                    );
+                    break;
+                }
+            };
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            let raw = line.trim();
+            if raw.is_empty() {
+                continue;
+            }
+
+            let parsed = match serde_json::from_str::<Value>(raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    emit_stderr(
+                        &app_stdout,
+                        session_id,
+                        format!("[bridge] invalid json message: {error}"),
+                    );
+                    continue;
+                }
+            };
+
+            let message_type = parsed
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+
+            if message_type == "response" {
+                let response_id = parsed.get("id").and_then(|value| value.as_u64()).unwrap_or(0);
+                let ok = parsed.get("ok").and_then(|value| value.as_bool()).unwrap_or(false);
+                let sender = if let Ok(mut guard) = pending_stdout.lock() {
+                    guard.remove(&response_id)
+                } else {
+                    None
+                };
+
+                if let Some(tx) = sender {
+                    if ok {
+                        let result = parsed.get("result").cloned().unwrap_or(Value::Null);
+                        let _ = tx.send(Ok(result));
+                    } else {
+                        let error = parsed
+                            .get("error")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("codex bridge request failed")
+                            .to_string();
+                        let _ = tx.send(Err(error));
+                    }
+                }
+                continue;
+            }
+
+            if message_type == "event" {
+                if let Some(event) = parsed.get("event").cloned() {
+                    emit_codex_event(&app_stdout, session_id, event, &event_seq_stdout);
+                }
+                continue;
+            }
+
+            emit_stderr(
+                &app_stdout,
+                session_id,
+                format!("[bridge] unsupported message type: {message_type}"),
+            );
+        }
+
+        fail_pending_requests(&pending_stdout, "codex bridge stdout closed");
+    });
+
+    let pending_stderr = Arc::clone(&pending);
+    let app_stderr = app.clone();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(child_stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                emit_stderr(&app_stderr, session_id, format!("[bridge] {trimmed}"));
+            }
+        }
+        fail_pending_requests(&pending_stderr, "codex bridge stderr closed");
+    });
+
+    Ok(BridgeProcess {
+        child,
+        stdin: Arc::new(Mutex::new(child_stdin)),
+        pending,
+        next_request_id: Arc::new(AtomicU64::new(1)),
+    })
+}
+
+async fn bridge_request(
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Arc<Mutex<BridgePendingMap>>,
+    next_request_id: Arc<AtomicU64>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = oneshot::channel::<Result<Value, String>>();
+    {
+        let mut guard = pending
+            .lock()
+            .map_err(|_| "bridge pending lock poisoned".to_string())?;
+        guard.insert(request_id, tx);
+    }
+
+    let payload = json!({
+        "type": "request",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    });
+    let serialized = serde_json::to_string(&payload)
+        .map_err(|error| format!("failed to serialize bridge request: {error}"))?;
+
+    {
+        let mut writer = stdin
+            .lock()
+            .map_err(|_| "bridge stdin lock poisoned".to_string())?;
+        writer
+            .write_all(serialized.as_bytes())
+            .map_err(|error| format!("failed to write bridge request: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to finish bridge request: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("failed to flush bridge request: {error}"))?;
+    }
+
+    match timeout(Duration::from_secs(600), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_closed)) => Err("bridge response channel closed".to_string()),
+        Err(_elapsed) => {
+            if let Ok(mut guard) = pending.lock() {
+                guard.remove(&request_id);
+            }
+            Err("bridge request timed out".to_string())
+        }
+    }
+}
+
+fn runtime_config_to_json(config: &RuntimeCodexConfig, binary: &str) -> Value {
+    json!({
+        "model": config.model,
+        "reasoning": config.reasoning,
+        "approvalPolicy": config.approval_policy,
+        "sandbox": config.sandbox,
+        "profile": config.profile,
+        "webSearchMode": config.web_search_mode,
+        "binary": binary,
     })
 }
 
@@ -1009,62 +1231,6 @@ fn finish_session_turn(app: &AppHandle, session_id: u64, discovered_thread_id: O
     if let Some(thread_id) = discovered_thread_id {
         active.thread_id = Some(thread_id);
     }
-}
-
-#[tauri::command]
-async fn start_codex_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    config: Option<StartCodexSessionConfig>,
-) -> Result<StartCodexSessionResponse, String> {
-    {
-        let active_guard = lock_active_session(state.inner())?;
-        if active_guard.is_some() {
-            return Err("an active codex session is already running".to_string());
-        }
-    }
-
-    let config = config.unwrap_or_default();
-
-    if config.args.as_ref().is_some_and(|args| !args.is_empty()) {
-        return Err("custom start args are not supported in non-TUI mode".to_string());
-    }
-
-    let binary = config
-        .binary
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(default_codex_binary);
-
-    let cwd = config
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    if !cwd.exists() {
-        return Err(format!("session cwd does not exist: {}", cwd.display()));
-    }
-
-    let env_overrides = config.env.unwrap_or_default();
-    let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
-    let pid = Some(0);
-
-    {
-        let mut guard = lock_active_session(state.inner())?;
-        *guard = Some(ActiveSession {
-            session_id,
-            pid,
-            binary,
-            cwd,
-            env_overrides,
-            thread_id: None,
-            busy: false,
-        });
-    }
-
-    emit_lifecycle(&app, "started", Some(session_id), pid, None, None);
-
-    Ok(StartCodexSessionResponse { session_id, pid: 0 })
 }
 
 #[tauri::command]
@@ -1109,6 +1275,21 @@ fn update_codex_config(
     Ok(runtime.clone())
 }
 
+#[tauri::command]
+fn codex_config_get(state: State<'_, AppState>) -> Result<RuntimeCodexConfig, String> {
+    Ok(lock_runtime_config(state.inner())?.clone())
+}
+
+#[tauri::command]
+fn codex_config_set(
+    state: State<'_, AppState>,
+    patch: RuntimeCodexConfig,
+) -> Result<RuntimeCodexConfig, String> {
+    let mut runtime = lock_runtime_config(state.inner())?;
+    *runtime = normalize_runtime_config(patch);
+    Ok(runtime.clone())
+}
+
 fn parse_slash_command(prompt: &str) -> Option<(&str, &str)> {
     let trimmed = prompt.trim();
     if !trimmed.starts_with('/') {
@@ -1121,12 +1302,766 @@ fn parse_slash_command(prompt: &str) -> Option<(&str, &str)> {
     Some((command, args))
 }
 
+#[derive(Debug, Clone)]
+struct StatusRateLimitWindow {
+    used_percent: f64,
+    window_minutes: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct StatusRateLimitSnapshot {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    primary: Option<StatusRateLimitWindow>,
+    secondary: Option<StatusRateLimitWindow>,
+}
+
+fn parse_rate_limit_window(value: &Value) -> Option<StatusRateLimitWindow> {
+    let object = value.as_object()?;
+    let used_percent = object
+        .get("usedPercent")
+        .and_then(Value::as_f64)
+        .or_else(|| object.get("used_percent").and_then(Value::as_f64))?;
+    let window_minutes = object
+        .get("windowDurationMins")
+        .and_then(Value::as_i64)
+        .or_else(|| object.get("window_minutes").and_then(Value::as_i64));
+    let resets_at = object
+        .get("resetsAt")
+        .and_then(Value::as_i64)
+        .or_else(|| object.get("resets_at").and_then(Value::as_i64));
+
+    Some(StatusRateLimitWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
+}
+
+fn parse_rate_limit_snapshot(value: &Value) -> Option<StatusRateLimitSnapshot> {
+    let object = value.as_object()?;
+    let limit_id = object
+        .get("limitId")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("limit_id").and_then(Value::as_str))
+        .map(|value| value.to_string());
+    let limit_name = object
+        .get("limitName")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("limit_name").and_then(Value::as_str))
+        .map(|value| value.to_string());
+    let primary = object.get("primary").and_then(parse_rate_limit_window);
+    let secondary = object.get("secondary").and_then(parse_rate_limit_window);
+
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+
+    Some(StatusRateLimitSnapshot {
+        limit_id,
+        limit_name,
+        primary,
+        secondary,
+    })
+}
+
+fn pick_rate_limit_snapshot(result: &Value) -> Option<StatusRateLimitSnapshot> {
+    let object = result.as_object()?;
+
+    if let Some(snapshot) = object.get("rateLimits").and_then(parse_rate_limit_snapshot) {
+        return Some(snapshot);
+    }
+
+    let by_limit_id = object.get("rateLimitsByLimitId")?.as_object()?;
+
+    let mut first_snapshot: Option<StatusRateLimitSnapshot> = None;
+    for (key, value) in by_limit_id {
+        if let Some(mut snapshot) = parse_rate_limit_snapshot(value) {
+            if snapshot.limit_id.is_none() {
+                snapshot.limit_id = Some(key.clone());
+            }
+            if snapshot
+                .limit_id
+                .as_ref()
+                .map(|id| id.starts_with("codex"))
+                .unwrap_or(false)
+            {
+                return Some(snapshot);
+            }
+            if first_snapshot.is_none() {
+                first_snapshot = Some(snapshot);
+            }
+        }
+    }
+
+    first_snapshot
+}
+
+fn extract_rate_limits_from_app_server_message(message: &Value) -> Option<StatusRateLimitSnapshot> {
+    if message
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| method == "account/rateLimits/updated")
+    {
+        return message
+            .get("params")
+            .and_then(|params| params.get("rateLimits"))
+            .and_then(parse_rate_limit_snapshot);
+    }
+
+    if message
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id == "alicia-rate-limits")
+    {
+        return message.get("result").and_then(pick_rate_limit_snapshot);
+    }
+
+    None
+}
+
+fn write_json_line(stdin: &mut ChildStdin, payload: &Value) -> Result<(), String> {
+    let serialized =
+        serde_json::to_string(payload).map_err(|error| format!("failed to encode json-rpc payload: {error}"))?;
+    writeln!(stdin, "{serialized}")
+        .map_err(|error| format!("failed to write json-rpc payload to app-server stdin: {error}"))?;
+    stdin
+        .flush()
+        .map_err(|error| format!("failed to flush app-server stdin: {error}"))
+}
+
+fn parse_reasoning_effort_option(value: &Value) -> Option<CodexReasoningEffortOption> {
+    let object = value.as_object()?;
+    let reasoning_effort = object
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("reasoning_effort").and_then(Value::as_str))?
+        .trim()
+        .to_string();
+
+    if reasoning_effort.is_empty() {
+        return None;
+    }
+
+    let description = object
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| reasoning_effort.clone());
+
+    Some(CodexReasoningEffortOption {
+        reasoning_effort,
+        description,
+    })
+}
+
+fn parse_codex_model(value: &Value) -> Option<CodexModel> {
+    let object = value.as_object()?;
+    let id = object.get("id").and_then(Value::as_str)?.trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| id.clone());
+
+    let display_name = object
+        .get("displayName")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("display_name").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| model.clone());
+
+    let description = object
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_default();
+
+    let mut supported_reasoning_efforts = Vec::new();
+    let mut seen_efforts = HashSet::new();
+    if let Some(options) = object
+        .get("supportedReasoningEfforts")
+        .or_else(|| object.get("supported_reasoning_efforts"))
+        .and_then(Value::as_array)
+    {
+        for option in options {
+            if let Some(parsed) = parse_reasoning_effort_option(option) {
+                if seen_efforts.insert(parsed.reasoning_effort.clone()) {
+                    supported_reasoning_efforts.push(parsed);
+                }
+            }
+        }
+    }
+
+    let default_reasoning_effort = object
+        .get("defaultReasoningEffort")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("default_reasoning_effort").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            supported_reasoning_efforts
+                .first()
+                .map(|entry| entry.reasoning_effort.clone())
+        })
+        .unwrap_or_else(|| "medium".to_string());
+
+    let supports_personality = object
+        .get("supportsPersonality")
+        .and_then(Value::as_bool)
+        .or_else(|| object.get("supports_personality").and_then(Value::as_bool))
+        .unwrap_or(false);
+
+    let is_default = object
+        .get("isDefault")
+        .and_then(Value::as_bool)
+        .or_else(|| object.get("is_default").and_then(Value::as_bool))
+        .unwrap_or(false);
+
+    let upgrade = object
+        .get("upgrade")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Some(CodexModel {
+        id,
+        model,
+        display_name,
+        description,
+        supported_reasoning_efforts,
+        default_reasoning_effort,
+        supports_personality,
+        is_default,
+        upgrade,
+    })
+}
+
+fn parse_model_list_result(result: &Value) -> Result<(Vec<CodexModel>, Option<String>), String> {
+    let object = result
+        .as_object()
+        .ok_or_else(|| "model/list result was not a JSON object".to_string())?;
+
+    let data = object
+        .get("data")
+        .or_else(|| object.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "model/list result missing `data` array".to_string())?;
+
+    let mut parsed = Vec::new();
+    for entry in data {
+        if let Some(model) = parse_codex_model(entry) {
+            parsed.push(model);
+        }
+    }
+
+    let next_cursor = object
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("next_cursor").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    Ok((parsed, next_cursor))
+}
+
+fn fetch_models_for_picker(binary: &str, cwd: &Path) -> Result<Vec<CodexModel>, String> {
+    let app_server_args = vec!["app-server".to_string()];
+    let (program, resolved_args) = resolve_codex_launch(binary, &app_server_args)?;
+
+    let mut command = Command::new(program);
+    command.args(resolved_args);
+    command.current_dir(cwd);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            format!("failed to spawn app-server for model/list: executable not found ({error})")
+        } else {
+            format!("failed to spawn app-server for model/list: {error}")
+        }
+    })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to capture app-server stdin for model/list".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture app-server stdout for model/list".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = match reader.read_line(&mut line) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                let _ = tx.send(parsed);
+            }
+        }
+    });
+
+    let result: Result<Vec<CodexModel>, String> = (|| {
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "method": "initialize",
+                "id": "alicia-models-init",
+                "params": {
+                    "clientInfo": {
+                        "name": "alicia-models",
+                        "title": "Alicia Model Picker",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {
+                        "experimentalApi": false,
+                    },
+                },
+            }),
+        )?;
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "method": "initialized",
+                "params": {},
+            }),
+        )?;
+
+        let mut all_models = Vec::<CodexModel>::new();
+        let mut seen_model_ids = HashSet::<String>::new();
+        let mut cursor: Option<String> = None;
+        let mut page: u32 = 0;
+
+        loop {
+            page += 1;
+            let request_id = format!("alicia-model-list-{page}");
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "method": "model/list",
+                    "id": request_id.clone(),
+                    "params": {
+                        "limit": 100,
+                        "cursor": cursor.clone(),
+                    },
+                }),
+            )?;
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let response_message = loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err("timed out waiting for model/list response from app-server".to_string());
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let message = rx
+                    .recv_timeout(remaining)
+                    .map_err(|_| "timed out waiting for model/list response from app-server".to_string())?;
+
+                if message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == request_id)
+                {
+                    break message;
+                }
+            };
+
+            if let Some(error_value) = response_message.get("error") {
+                let message = error_value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error_value.as_str())
+                    .unwrap_or("unknown app-server model/list error");
+                return Err(format!("model/list request failed: {message}"));
+            }
+
+            let result_value = response_message
+                .get("result")
+                .ok_or_else(|| "model/list response missing `result`".to_string())?;
+
+            let (page_models, next_cursor) = parse_model_list_result(result_value)?;
+            for model in page_models {
+                if seen_model_ids.insert(model.id.clone()) {
+                    all_models.push(model);
+                }
+            }
+
+            if let Some(next_cursor) = next_cursor {
+                cursor = Some(next_cursor);
+            } else {
+                break;
+            }
+        }
+
+        Ok(all_models)
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn fetch_mcp_statuses_for_startup(binary: &str, cwd: &Path) -> Result<Vec<String>, String> {
+    let app_server_args = vec!["app-server".to_string()];
+    let (program, resolved_args) = resolve_codex_launch(binary, &app_server_args)?;
+
+    let mut command = Command::new(program);
+    command.args(resolved_args);
+    command.current_dir(cwd);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            format!("failed to spawn app-server for MCP warmup: executable not found ({error})")
+        } else {
+            format!("failed to spawn app-server for MCP warmup: {error}")
+        }
+    })?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to capture app-server stdin for MCP warmup".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture app-server stdout for MCP warmup".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = match reader.read_line(&mut line) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                let _ = tx.send(parsed);
+            }
+        }
+    });
+
+    let result: Result<Vec<String>, String> = (|| {
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "method": "initialize",
+                "id": "alicia-mcp-init",
+                "params": {
+                    "clientInfo": {
+                        "name": "alicia-mcp-startup",
+                        "title": "Alicia MCP Startup",
+                        "version": "0.1.0",
+                    },
+                    "capabilities": {
+                        "experimentalApi": false,
+                    },
+                },
+            }),
+        )?;
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "method": "initialized",
+                "params": {},
+            }),
+        )?;
+
+        let mut ready_servers = HashSet::<String>::new();
+        let mut cursor: Option<String> = None;
+        let mut page: u32 = 0;
+
+        loop {
+            page += 1;
+            let request_id = format!("alicia-mcp-status-{page}");
+            write_json_line(
+                &mut stdin,
+                &json!({
+                    "method": "mcpServerStatus/list",
+                    "id": request_id.clone(),
+                    "params": {
+                        "limit": 100,
+                        "cursor": cursor.clone(),
+                    },
+                }),
+            )?;
+
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let response_message = loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(
+                        "timed out waiting for mcpServerStatus/list response from app-server"
+                            .to_string(),
+                    );
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                let message = rx.recv_timeout(remaining).map_err(|_| {
+                    "timed out waiting for mcpServerStatus/list response from app-server"
+                        .to_string()
+                })?;
+
+                if message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == request_id)
+                {
+                    break message;
+                }
+            };
+
+            if let Some(error_value) = response_message.get("error") {
+                let message = error_value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error_value.as_str())
+                    .unwrap_or("unknown app-server mcpServerStatus/list error");
+                return Err(format!("mcpServerStatus/list request failed: {message}"));
+            }
+
+            let result_value = response_message
+                .get("result")
+                .ok_or_else(|| "mcpServerStatus/list response missing `result`".to_string())?;
+
+            if let Some(entries) = result_value.get("data").and_then(Value::as_array) {
+                for entry in entries {
+                    if let Some(name) = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        ready_servers.insert(name.to_string());
+                    }
+                }
+            }
+
+            let next_cursor = result_value
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .or_else(|| result_value.get("next_cursor").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+
+            if let Some(next_cursor) = next_cursor {
+                cursor = Some(next_cursor);
+            } else {
+                break;
+            }
+        }
+
+        let mut ready_servers = ready_servers.into_iter().collect::<Vec<_>>();
+        ready_servers.sort();
+        Ok(ready_servers)
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+fn fetch_rate_limits_for_status(binary: &str, cwd: &Path) -> Option<StatusRateLimitSnapshot> {
+    let app_server_args = vec!["app-server".to_string()];
+    let (program, resolved_args) = resolve_codex_launch(binary, &app_server_args).ok()?;
+
+    let mut command = Command::new(program);
+    command.args(resolved_args);
+    command.current_dir(cwd);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+
+    let (tx, rx) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = match reader.read_line(&mut line) {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                let _ = tx.send(parsed);
+            }
+        }
+    });
+
+    let initialize_request = json!({
+        "method": "initialize",
+        "id": "alicia-init",
+        "params": {
+            "clientInfo": {
+                "name": "alicia-status",
+                "title": "Alicia Status",
+                "version": "0.1.0",
+            },
+            "capabilities": {
+                "experimentalApi": false,
+            },
+        },
+    });
+    let initialized_notification = json!({
+        "method": "initialized",
+        "params": {},
+    });
+    let read_limits_request = json!({
+        "method": "account/rateLimits/read",
+        "id": "alicia-rate-limits",
+    });
+
+    for payload in [initialize_request, initialized_notification, read_limits_request] {
+        let serialized = serde_json::to_string(&payload).ok()?;
+        if writeln!(stdin, "{serialized}").is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    }
+    let _ = stdin.flush();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut snapshot: Option<StatusRateLimitSnapshot> = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let Ok(message) = rx.recv_timeout(remaining) else {
+            break;
+        };
+
+        if let Some(parsed) = extract_rate_limits_from_app_server_message(&message) {
+            snapshot = Some(parsed);
+            if message
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == "alicia-rate-limits")
+            {
+                break;
+            }
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    snapshot
+}
+
+fn format_limit_window_label(window_minutes: Option<i64>) -> String {
+    match window_minutes.unwrap_or(0) {
+        300 => "5h".to_string(),
+        10080 => "week".to_string(),
+        value if value > 0 => format!("{value}m"),
+        _ => "window".to_string(),
+    }
+}
+
+fn format_limit_reset_eta(resets_at: Option<i64>) -> String {
+    let Some(target_epoch) = resets_at else {
+        return "n/a".to_string();
+    };
+
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64);
+
+    let Some(now_epoch) = now_epoch else {
+        return "n/a".to_string();
+    };
+
+    let seconds_remaining = (target_epoch - now_epoch).max(0);
+    if seconds_remaining == 0 {
+        return "now".to_string();
+    }
+
+    let hours = seconds_remaining / 3600;
+    let minutes = (seconds_remaining % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn format_rate_limit_window_status(window: &StatusRateLimitWindow) -> String {
+    let used = window.used_percent.clamp(0.0, 100.0);
+    let remaining = (100.0 - used).clamp(0.0, 100.0);
+    let reset_eta = format_limit_reset_eta(window.resets_at);
+
+    format!(
+        "{:.0}% remaining ({:.0}% used), resets in {reset_eta}",
+        remaining, used
+    )
+}
+
 fn format_non_tui_status(
     session_id: u64,
     pid: Option<u32>,
     thread_id: Option<&str>,
     cwd: &Path,
     runtime: &RuntimeCodexConfig,
+    rate_limits: Option<&StatusRateLimitSnapshot>,
 ) -> String {
     let pid_display = pid
         .map(|value| value.to_string())
@@ -1135,15 +2070,239 @@ fn format_non_tui_status(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("n/a");
 
-    format!(
-        "/status (non-TUI compatibility)\nmode: exec --json\nsession: #{session_id} (pid {pid_display})\nthread: {thread_display}\nworkspace: {}\nmodel: {}\nreasoning: {}\napproval: {}\nsandbox: {}\nweb search: {}\n\nNote: the full TUI rate-limit/context dashboard is unavailable in non-TUI mode.",
-        cwd.display(),
-        runtime.model,
-        runtime.reasoning,
-        runtime.approval_policy,
-        runtime.sandbox,
-        runtime.web_search_mode,
+    let mut lines = vec![
+        "/status".to_string(),
+        "mode: sdk-bridge".to_string(),
+        format!("session: #{session_id} (pid {pid_display})"),
+        format!("thread: {thread_display}"),
+        format!("workspace: {}", cwd.display()),
+        format!("model: {}", runtime.model),
+        format!("reasoning: {}", runtime.reasoning),
+        format!("approval: {}", runtime.approval_policy),
+        format!("sandbox: {}", runtime.sandbox),
+        format!("web search: {}", runtime.web_search_mode),
+    ];
+
+    if let Some(snapshot) = rate_limits {
+        if let Some(limit_id) = snapshot.limit_id.as_deref() {
+            lines.push(format!("limit id: {limit_id}"));
+        }
+        if let Some(limit_name) = snapshot.limit_name.as_deref() {
+            lines.push(format!("limit name: {limit_name}"));
+        }
+        if let Some(primary) = snapshot.primary.as_ref() {
+            lines.push(format!(
+                "remaining {}: {}",
+                format_limit_window_label(primary.window_minutes),
+                format_rate_limit_window_status(primary)
+            ));
+        }
+        if let Some(secondary) = snapshot.secondary.as_ref() {
+            lines.push(format!(
+                "remaining {}: {}",
+                format_limit_window_label(secondary.window_minutes),
+                format_rate_limit_window_status(secondary)
+            ));
+        }
+        if snapshot.primary.is_none() && snapshot.secondary.is_none() {
+            lines.push("rate limits: unavailable".to_string());
+        }
+    } else {
+        lines.push("rate limits: unavailable".to_string());
+    }
+
+    lines.join("\n")
+}
+
+async fn schedule_turn_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CodexTurnRunRequest,
+) -> Result<CodexTurnRunResponse, String> {
+    let runtime_config = lock_runtime_config(state.inner())?.clone();
+    let CodexTurnRunRequest {
+        thread_id: requested_thread_id,
+        input_items,
+        output_schema,
+    } = request;
+
+    let (session_id, pid, binary, cwd, initial_thread_id, stdin, pending, next_request_id) = {
+        let mut guard = lock_active_session(state.inner())?;
+        let active = guard
+            .as_mut()
+            .ok_or_else(|| "no active codex session".to_string())?;
+
+        if active.busy {
+            return Err("codex session is still processing the previous turn".to_string());
+        }
+
+        active.busy = true;
+
+        (
+            active.session_id,
+            active.pid,
+            active.binary.clone(),
+            active.cwd.clone(),
+            active.thread_id.clone(),
+            Arc::clone(&active.bridge.stdin),
+            Arc::clone(&active.bridge.pending),
+            Arc::clone(&active.bridge.next_request_id),
+        )
+    };
+
+    let response = CodexTurnRunResponse {
+        accepted: true,
+        session_id,
+        thread_id: initial_thread_id.clone(),
+    };
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result: Result<String, String> = async {
+            let mut thread_id = requested_thread_id.or(initial_thread_id);
+            if thread_id.as_ref().map(|value| value.trim().is_empty()).unwrap_or(true) {
+                let open_result = bridge_request(
+                    Arc::clone(&stdin),
+                    Arc::clone(&pending),
+                    Arc::clone(&next_request_id),
+                    "thread.open",
+                    json!({
+                        "workspace": cwd.to_string_lossy().to_string(),
+                        "runtimeConfig": runtime_config_to_json(&runtime_config, &binary),
+                    }),
+                )
+                .await?;
+                thread_id = open_result
+                    .get("threadId")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string());
+            }
+
+            let thread_id = thread_id.ok_or_else(|| "failed to establish thread id".to_string())?;
+            let mut run_params = serde_json::Map::new();
+            run_params.insert("threadId".to_string(), Value::String(thread_id.clone()));
+            run_params.insert(
+                "workspace".to_string(),
+                Value::String(cwd.to_string_lossy().to_string()),
+            );
+            run_params.insert(
+                "runtimeConfig".to_string(),
+                runtime_config_to_json(&runtime_config, &binary),
+            );
+            run_params.insert("inputItems".to_string(), json!(input_items));
+            if let Some(schema) = output_schema {
+                run_params.insert("outputSchema".to_string(), schema);
+            }
+
+            let run_result = bridge_request(
+                Arc::clone(&stdin),
+                Arc::clone(&pending),
+                Arc::clone(&next_request_id),
+                "turn.run",
+                Value::Object(run_params),
+            )
+            .await?;
+
+            let returned_thread_id = run_result
+                .get("threadId")
+                .and_then(|value| value.as_str())
+                .unwrap_or(&thread_id)
+                .to_string();
+            Ok(returned_thread_id)
+        }
+        .await;
+
+        match result {
+            Ok(returned_thread_id) => {
+                finish_session_turn(&app_for_task, session_id, Some(returned_thread_id));
+            }
+            Err(error) => {
+                emit_lifecycle(
+                    &app_for_task,
+                    "error",
+                    Some(session_id),
+                    pid,
+                    None,
+                    Some(error),
+                );
+                finish_session_turn(&app_for_task, session_id, None);
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+#[tauri::command]
+async fn codex_turn_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CodexTurnRunRequest,
+) -> Result<CodexTurnRunResponse, String> {
+    if request.input_items.is_empty() {
+        return Err("input_items cannot be empty".to_string());
+    }
+    if request
+        .output_schema
+        .as_ref()
+        .is_some_and(|schema| !schema.is_object())
+    {
+        return Err("output_schema must be a plain JSON object".to_string());
+    }
+    schedule_turn_run(app, state, request).await
+}
+
+#[tauri::command]
+async fn codex_thread_open(
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+) -> Result<CodexThreadOpenResponse, String> {
+    let runtime_config = lock_runtime_config(state.inner())?.clone();
+    let (binary, cwd, stdin, pending, next_request_id) = {
+        let guard = lock_active_session(state.inner())?;
+        let active = guard
+            .as_ref()
+            .ok_or_else(|| "no active codex session".to_string())?;
+
+        (
+            active.binary.clone(),
+            active.cwd.clone(),
+            Arc::clone(&active.bridge.stdin),
+            Arc::clone(&active.bridge.pending),
+            Arc::clone(&active.bridge.next_request_id),
+        )
+    };
+
+    let result = bridge_request(
+        stdin,
+        pending,
+        next_request_id,
+        "thread.open",
+        json!({
+            "threadId": thread_id,
+            "workspace": cwd.to_string_lossy().to_string(),
+            "runtimeConfig": runtime_config_to_json(&runtime_config, &binary),
+        }),
     )
+    .await?;
+
+    let opened_thread_id = result
+        .get("threadId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "bridge returned an invalid threadId".to_string())?
+        .to_string();
+
+    {
+        let mut guard = lock_active_session(state.inner())?;
+        let active = guard
+            .as_mut()
+            .ok_or_else(|| "no active codex session".to_string())?;
+        active.thread_id = Some(opened_thread_id.clone());
+    }
+
+    Ok(CodexThreadOpenResponse {
+        thread_id: opened_thread_id,
+    })
 }
 
 #[tauri::command]
@@ -1160,7 +2319,7 @@ async fn send_codex_input(
     let runtime_config = lock_runtime_config(state.inner())?.clone();
     let slash_command = parse_slash_command(&prompt);
 
-    let (session_id, pid, binary, cwd, env_overrides, thread_id) = {
+    let (session_id, pid, thread_id, cwd, binary, slash_status_requested) = {
         let mut guard = lock_active_session(state.inner())?;
         let active = guard
             .as_mut()
@@ -1172,129 +2331,148 @@ async fn send_codex_input(
 
         if let Some((command, _args)) = slash_command {
             if command.eq_ignore_ascii_case("/status") {
-                let chunk = format_non_tui_status(
+                (
                     active.session_id,
                     active.pid,
-                    active.thread_id.as_deref(),
-                    &active.cwd,
-                    &runtime_config,
-                );
-                emit_stdout(&app, active.session_id, chunk);
+                    active.thread_id.clone(),
+                    active.cwd.clone(),
+                    active.binary.clone(),
+                    true,
+                )
             } else {
                 emit_stderr(
                     &app,
                     active.session_id,
                     format!(
-                        "slash command `{command}` is not available in non-TUI mode. Supported compatibility command: /status"
+                        "slash command `{command}` is not available in SDK bridge mode. Supported compatibility command: /status"
                     ),
                 );
+                return Ok(());
             }
-            return Ok(());
+        } else {
+            (
+                active.session_id,
+                active.pid,
+                active.thread_id.clone(),
+                active.cwd.clone(),
+                active.binary.clone(),
+                false,
+            )
         }
-
-        active.busy = true;
-
-        (
-            active.session_id,
-            active.pid,
-            active.binary.clone(),
-            active.cwd.clone(),
-            active.env_overrides.clone(),
-            active.thread_id.clone(),
-        )
     };
 
-    let app_for_task = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let run_result = tauri::async_runtime::spawn_blocking(move || {
-            run_exec_turn(
-                &binary,
-                &cwd,
-                &env_overrides,
-                &runtime_config,
-                thread_id.as_deref(),
-                &prompt,
-            )
-        })
-        .await;
+    if slash_status_requested {
+        let rate_limits = fetch_rate_limits_for_status(&binary, &cwd);
+        let chunk = format_non_tui_status(
+            session_id,
+            pid,
+            thread_id.as_deref(),
+            &cwd,
+            &runtime_config,
+            rate_limits.as_ref(),
+        );
+        emit_stdout(&app, session_id, chunk);
+        return Ok(());
+    }
 
-        let mut emitted_any_output = false;
+    let request = CodexTurnRunRequest {
+        thread_id,
+        input_items: vec![CodexInputItem {
+            item_type: "text".to_string(),
+            text: Some(prompt),
+            path: None,
+            image_url: None,
+            name: None,
+        }],
+        output_schema: None,
+    };
 
-        match run_result {
-            Ok(Ok(result)) => {
-                let parsed = parse_exec_jsonl_output(&result.stdout);
-                let discovered_thread_id = parsed.thread_id.clone();
-
-                for chunk in parsed.stdout_chunks {
-                    emit_stdout(&app_for_task, session_id, chunk);
-                    emitted_any_output = true;
-                }
-
-                for chunk in parsed.stderr_chunks {
-                    emit_stderr(&app_for_task, session_id, chunk);
-                    emitted_any_output = true;
-                }
-
-                for chunk in strip_ansi_and_normalize_lines(&result.stderr) {
-                    emit_stderr(&app_for_task, session_id, chunk);
-                    emitted_any_output = true;
-                }
-
-                if !result.success {
-                    emit_stderr(
-                        &app_for_task,
-                        session_id,
-                        format!("[exec] codex exited with status {}", result.status),
-                    );
-                    emit_lifecycle(
-                        &app_for_task,
-                        "error",
-                        Some(session_id),
-                        pid,
-                        Some(result.status),
-                        Some("codex exec failed".to_string()),
-                    );
-                    emitted_any_output = true;
-                }
-
-                finish_session_turn(&app_for_task, session_id, discovered_thread_id);
-            }
-            Ok(Err(error)) => {
-                emit_stderr(&app_for_task, session_id, error.clone());
-                emit_lifecycle(
-                    &app_for_task,
-                    "error",
-                    Some(session_id),
-                    pid,
-                    None,
-                    Some(error),
-                );
-                finish_session_turn(&app_for_task, session_id, None);
-                emitted_any_output = true;
-            }
-            Err(error) => {
-                let message = format!("failed to run codex exec task: {error}");
-                emit_stderr(&app_for_task, session_id, message.clone());
-                emit_lifecycle(
-                    &app_for_task,
-                    "error",
-                    Some(session_id),
-                    pid,
-                    None,
-                    Some(message),
-                );
-                finish_session_turn(&app_for_task, session_id, None);
-                emitted_any_output = true;
-            }
-        }
-
-        if !emitted_any_output {
-            // Wake frontend state machine even when no visible text was produced.
-            emit_stdout(&app_for_task, session_id, String::new());
-        }
-    });
-
+    let _ = cwd;
+    let _ = schedule_turn_run(app, state, request).await?;
     Ok(())
+}
+
+fn stop_bridge_process(mut bridge: BridgeProcess) {
+    let request_id = bridge.next_request_id.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut stdin) = bridge.stdin.lock() {
+        let request = json!({
+            "type": "request",
+            "id": request_id,
+            "method": "shutdown",
+            "params": {},
+        });
+        if let Ok(serialized) = serde_json::to_string(&request) {
+            let _ = stdin.write_all(serialized.as_bytes());
+            let _ = stdin.write_all(b"\n");
+            let _ = stdin.flush();
+        }
+    }
+
+    let _ = bridge.child.kill();
+    let _ = bridge.child.wait();
+    fail_pending_requests(&bridge.pending, "codex bridge stopped");
+}
+
+#[tauri::command]
+async fn start_codex_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: Option<StartCodexSessionConfig>,
+) -> Result<StartCodexSessionResponse, String> {
+    {
+        let active_guard = lock_active_session(state.inner())?;
+        if active_guard.is_some() {
+            return Err("an active codex session is already running".to_string());
+        }
+    }
+
+    let config = config.unwrap_or_default();
+    if config.args.as_ref().is_some_and(|args| !args.is_empty()) {
+        return Err("custom start args are not supported in bridge mode".to_string());
+    }
+
+    let binary = config
+        .binary
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_codex_binary);
+
+    let cwd = config
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    if !cwd.exists() {
+        return Err(format!("session cwd does not exist: {}", cwd.display()));
+    }
+
+    let env_overrides = config.env.unwrap_or_default();
+    let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
+    let bridge = spawn_bridge_process(
+        &app,
+        session_id,
+        &cwd,
+        &env_overrides,
+        &binary,
+        Arc::clone(&state.next_event_seq),
+    )?;
+    let pid = bridge.child.id();
+
+    {
+        let mut guard = lock_active_session(state.inner())?;
+        *guard = Some(ActiveSession {
+            session_id,
+            pid: Some(pid),
+            binary,
+            cwd,
+            thread_id: None,
+            busy: false,
+            bridge,
+        });
+    }
+
+    emit_lifecycle(&app, "started", Some(session_id), Some(pid), None, None);
+    Ok(StartCodexSessionResponse { session_id, pid })
 }
 
 #[tauri::command]
@@ -1312,34 +2490,267 @@ fn resize_codex_pty(
 }
 
 #[tauri::command]
-fn stop_codex_session(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let (session_id, pid, busy) = {
-        let guard = lock_active_session(state.inner())?;
+async fn stop_codex_session(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let active = {
+        let mut guard = lock_active_session(state.inner())?;
         let active = guard
             .as_ref()
             .ok_or_else(|| "no active codex session".to_string())?;
 
-        (active.session_id, active.pid, active.busy)
+        if active.busy {
+            return Err("cannot stop session while a turn is still running".to_string());
+        }
+
+        guard.take().ok_or_else(|| "no active codex session".to_string())?
     };
 
-    if busy {
-        return Err("cannot stop session while a turn is still running".to_string());
-    }
-
-    if clear_session_if_current(&app, session_id)? {
-        emit_lifecycle(
-            &app,
-            "stopped",
-            Some(session_id),
-            pid,
-            None,
-            Some("stopped by request".to_string()),
-        );
-    }
+    let session_id = active.session_id;
+    let pid = active.pid;
+    stop_bridge_process(active.bridge);
+    emit_lifecycle(
+        &app,
+        "stopped",
+        Some(session_id),
+        pid,
+        None,
+        Some("stopped by request".to_string()),
+    );
 
     Ok(())
 }
 
+#[tauri::command]
+async fn codex_bridge_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: Option<StartCodexSessionConfig>,
+) -> Result<StartCodexSessionResponse, String> {
+    start_codex_session(app, state, config).await
+}
+
+#[tauri::command]
+async fn codex_bridge_stop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    stop_codex_session(app, state).await
+}
+
+fn default_terminal_shell() -> String {
+    #[cfg(windows)]
+    {
+        if resolve_binary_path("pwsh.exe").is_some() || resolve_binary_path("pwsh").is_some() {
+            return "pwsh.exe".to_string();
+        }
+        if resolve_binary_path("powershell.exe").is_some()
+            || resolve_binary_path("powershell").is_some()
+        {
+            return "powershell.exe".to_string();
+        }
+        if let Ok(comspec) = env::var("COMSPEC") {
+            if !comspec.trim().is_empty() {
+                return comspec;
+            }
+        }
+        return "cmd.exe".to_string();
+    }
+    #[cfg(not(windows))]
+    {
+        env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    }
+}
+
+fn lock_terminals(
+    state: &AppState,
+) -> Result<MutexGuard<'_, HashMap<u64, TerminalSession>>, String> {
+    state
+        .terminals
+        .lock()
+        .map_err(|_| "terminal lock poisoned".to_string())
+}
+
+#[tauri::command]
+fn terminal_create(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: Option<TerminalCreateRequest>,
+) -> Result<TerminalCreateResponse, String> {
+    let request = request.unwrap_or(TerminalCreateRequest {
+        cwd: None,
+        shell: None,
+    });
+
+    let cwd = request
+        .cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if !cwd.exists() {
+        return Err(format!("terminal cwd does not exist: {}", cwd.display()));
+    }
+
+    let shell = request
+        .shell
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(default_terminal_shell);
+
+    let terminal_id = state.next_terminal_id.fetch_add(1, Ordering::Relaxed);
+    let event_seq = Arc::clone(&state.next_event_seq);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| format!("failed to create PTY: {error}"))?;
+
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&shell)
+        .to_ascii_lowercase();
+    let mut command = PtyCommandBuilder::new(shell.clone());
+    if shell_name.starts_with("pwsh") || shell_name.starts_with("powershell") {
+        command.arg("-NoLogo");
+    } else if shell_name == "cmd" || shell_name == "cmd.exe" {
+        command.arg("/Q");
+    }
+    command.cwd(&cwd);
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| format!("failed to spawn PTY process: {error}"))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| format!("failed to attach PTY reader: {error}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| format!("failed to attach PTY writer: {error}"))?;
+
+    let app_for_reader = app.clone();
+    let event_seq_for_reader = Arc::clone(&event_seq);
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    emit_terminal_exit(&app_for_reader, terminal_id, &event_seq_for_reader, None);
+                    break;
+                }
+                Ok(read) => {
+                    let chunk = String::from_utf8_lossy(&buf[..read]).to_string();
+                    emit_terminal_data(&app_for_reader, terminal_id, &event_seq_for_reader, chunk);
+                }
+                Err(error) => {
+                    emit_terminal_data(
+                        &app_for_reader,
+                        terminal_id,
+                        &event_seq_for_reader,
+                        format!("\r\n[terminal] read error: {error}\r\n"),
+                    );
+                    emit_terminal_exit(&app_for_reader, terminal_id, &event_seq_for_reader, None);
+                    break;
+                }
+            }
+        }
+    });
+
+    {
+        let mut terminals = lock_terminals(state.inner())?;
+        terminals.insert(
+            terminal_id,
+            TerminalSession {
+                terminal_id,
+                master: pair.master,
+                writer: Arc::new(Mutex::new(writer)),
+                child,
+            },
+        );
+    }
+
+    emit_terminal_data(
+        &app,
+        terminal_id,
+        &event_seq,
+        format!(
+            "[terminal] started {} in {}\r\n",
+            shell,
+            cwd.to_string_lossy()
+        ),
+    );
+
+    Ok(TerminalCreateResponse { terminal_id })
+}
+
+#[tauri::command]
+fn terminal_write(state: State<'_, AppState>, request: TerminalWriteRequest) -> Result<(), String> {
+    let writer = {
+        let terminals = lock_terminals(state.inner())?;
+        let terminal = terminals
+            .get(&request.terminal_id)
+            .ok_or_else(|| format!("terminal {} not found", request.terminal_id))?;
+        Arc::clone(&terminal.writer)
+    };
+
+    let mut guard = writer
+        .lock()
+        .map_err(|_| "terminal writer lock poisoned".to_string())?;
+    guard
+        .write_all(request.data.as_bytes())
+        .map_err(|error| format!("failed to write to terminal: {error}"))?;
+    guard
+        .flush()
+        .map_err(|error| format!("failed to flush terminal write: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_resize(state: State<'_, AppState>, request: TerminalResizeRequest) -> Result<(), String> {
+    let mut terminals = lock_terminals(state.inner())?;
+    let terminal = terminals
+        .get_mut(&request.terminal_id)
+        .ok_or_else(|| format!("terminal {} not found", request.terminal_id))?;
+
+    terminal
+        .master
+        .resize(PtySize {
+            rows: request.rows.max(1),
+            cols: request.cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| format!("failed to resize terminal: {error}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_kill(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: TerminalKillRequest,
+) -> Result<(), String> {
+    let mut terminal = {
+        let mut terminals = lock_terminals(state.inner())?;
+        terminals
+            .remove(&request.terminal_id)
+            .ok_or_else(|| format!("terminal {} not found", request.terminal_id))?
+    };
+
+    let _ = terminal.child.kill();
+    let _ = terminal.child.wait();
+    emit_terminal_exit(
+        &app,
+        terminal.terminal_id,
+        &state.next_event_seq,
+        Some(-1),
+    );
+    Ok(())
+}
 #[tauri::command]
 fn run_codex_command(args: Vec<String>, cwd: Option<String>) -> Result<RunCodexCommandResponse, String> {
     if args.is_empty() {
@@ -1375,6 +2786,49 @@ fn run_codex_command(args: Vec<String>, cwd: Option<String>) -> Result<RunCodexC
 }
 
 #[tauri::command]
+fn codex_models_list(state: State<'_, AppState>) -> Result<CodexModelListResponse, String> {
+    let (binary, cwd) = {
+        let active = lock_active_session(state.inner())?;
+        if let Some(session) = active.as_ref() {
+            (session.binary.clone(), session.cwd.clone())
+        } else {
+            (
+                default_codex_binary(),
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+        }
+    };
+
+    let models = fetch_models_for_picker(&binary, &cwd)?;
+    Ok(CodexModelListResponse { data: models })
+}
+
+#[tauri::command]
+fn codex_wait_for_mcp_startup(state: State<'_, AppState>) -> Result<McpStartupWarmupResponse, String> {
+    let (binary, cwd) = {
+        let active = lock_active_session(state.inner())?;
+        if let Some(session) = active.as_ref() {
+            (session.binary.clone(), session.cwd.clone())
+        } else {
+            (
+                default_codex_binary(),
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )
+        }
+    };
+
+    let started_at = Instant::now();
+    let ready_servers = fetch_mcp_statuses_for_startup(&binary, &cwd)?;
+    let total_ready = ready_servers.len();
+    let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+    Ok(McpStartupWarmupResponse {
+        ready_servers,
+        total_ready,
+        elapsed_ms,
+    })
+}
+#[tauri::command]
 fn pick_image_file() -> Option<String> {
     rfd::FileDialog::new()
         .add_filter(
@@ -1406,13 +2860,25 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             start_codex_session,
+            codex_bridge_start,
+            codex_bridge_stop,
+            codex_turn_run,
+            codex_thread_open,
             update_codex_config,
+            codex_config_get,
+            codex_config_set,
             codex_runtime_status,
             load_codex_default_config,
             send_codex_input,
             stop_codex_session,
             resize_codex_pty,
+            terminal_create,
+            terminal_write,
+            terminal_resize,
+            terminal_kill,
             run_codex_command,
+            codex_models_list,
+            codex_wait_for_mcp_startup,
             pick_image_file,
             pick_mention_file,
             codex_help_snapshot
@@ -1420,6 +2886,12 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+
+
+
+
+
 
 
 

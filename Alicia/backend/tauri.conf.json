@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AlicIA Codex Bridge",
+  "version": "0.1.0",
+  "identifier": "com.alicia.egui.integration",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ./frontend dev",
+    "devUrl": "http://localhost:3000",
+    "beforeBuildCommand": "pnpm --dir ./frontend build",
+    "frontendDist": "../frontend/out"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AlicIA",
+        "width": 1280,
+        "height": 800,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

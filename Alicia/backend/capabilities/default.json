@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default IPC capability for Alicia desktop runtime.",
+  "windows": ["*"],
+  "permissions": ["core:default"]
+}
