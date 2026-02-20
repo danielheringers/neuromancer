@@ -12,12 +12,111 @@ const DEFAULT_CONFIG = {
   binary: process.env.ALICIA_CODEX_BIN || "auto",
 };
 
+const BRIDGE_RUNTIME_METHODS = Object.freeze([
+  "thread.open",
+  "thread.close",
+  "thread.list",
+  "thread.read",
+  "thread.archive",
+  "thread.unarchive",
+  "thread.compact.start",
+  "thread.rollback",
+  "thread.fork",
+  "turn.run",
+  "review.start",
+  "turn.steer",
+  "turn.interrupt",
+  "approval.respond",
+  "mcp.warmup",
+  "mcp.list",
+  "mcp.login",
+  "mcp.reload",
+  "app.list",
+  "account.read",
+  "account.login.start",
+  "account.logout",
+  "account.rate_limits.read",
+  "account.rateLimits.read",
+  "config.get",
+  "config.set",
+]);
+
+const RUNTIME_METHOD_ALIASES = Object.freeze({
+  "account.rate_limits.read": ["account.rateLimits.read"],
+  "account.rateLimits.read": ["account.rate_limits.read"],
+});
+
+function createDefaultRuntimeCapabilities() {
+  return Object.fromEntries(BRIDGE_RUNTIME_METHODS.map((method) => [method, true]));
+}
+
+function parseRuntimeMethodsFlag(rawValue) {
+  const methods = new Set();
+  if (typeof rawValue !== "string" || rawValue.trim().length === 0) {
+    return methods;
+  }
+
+  for (const token of rawValue.split(/[\s,;]+/)) {
+    const method = token.trim();
+    if (!method || !BRIDGE_RUNTIME_METHODS.includes(method)) {
+      continue;
+    }
+    methods.add(method);
+  }
+
+  return methods;
+}
+
+const DISABLED_RUNTIME_METHODS = parseRuntimeMethodsFlag(
+  process.env.ALICIA_BRIDGE_DISABLE_RUNTIME_METHODS,
+);
+
 const state = {
   config: { ...DEFAULT_CONFIG },
   nextThreadId: 1,
   threads: new Map(),
   appServer: null,
+  runtimeCapabilities: createDefaultRuntimeCapabilities(),
 };
+
+function setRuntimeMethodCapability(method, supported) {
+  const normalizedMethod = typeof method === "string" ? method.trim() : "";
+  if (
+    !normalizedMethod ||
+    !Object.prototype.hasOwnProperty.call(state.runtimeCapabilities, normalizedMethod)
+  ) {
+    return;
+  }
+
+  state.runtimeCapabilities[normalizedMethod] = Boolean(supported);
+  const aliases = RUNTIME_METHOD_ALIASES[normalizedMethod] ?? [];
+  for (const alias of aliases) {
+    if (Object.prototype.hasOwnProperty.call(state.runtimeCapabilities, alias)) {
+      state.runtimeCapabilities[alias] = Boolean(supported);
+    }
+  }
+}
+
+for (const method of DISABLED_RUNTIME_METHODS) {
+  setRuntimeMethodCapability(method, false);
+}
+
+function isKnownRuntimeMethod(method) {
+  return Object.prototype.hasOwnProperty.call(state.runtimeCapabilities, method);
+}
+
+function getRuntimeCapabilitiesSnapshot() {
+  return { ...state.runtimeCapabilities };
+}
+
+function isUnsupportedMethodError(error) {
+  const message = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  return (
+    message.includes("unsupported method") ||
+    message.includes("unsupported server request") ||
+    message.includes("method not found")
+  );
+}
 
 let codexPathProbe = null;
 
@@ -161,6 +260,81 @@ function resolveCodexLaunch(binary) {
     command: trimmed,
     args: ["app-server"],
   };
+}
+
+function resolveCodexCliLaunch(binary, cliArgs = []) {
+  const trimmed = String(binary || "codex").trim();
+  const lowered = trimmed.toLowerCase();
+
+  if (lowered.endsWith(".mjs") || lowered.endsWith(".cjs") || lowered.endsWith(".js")) {
+    return {
+      command: process.execPath,
+      args: [trimmed, ...cliArgs],
+    };
+  }
+
+  if (process.platform === "win32" && (lowered.endsWith(".cmd") || lowered.endsWith(".bat"))) {
+    return {
+      command: "cmd",
+      args: ["/C", trimmed, ...cliArgs],
+    };
+  }
+
+  return {
+    command: trimmed,
+    args: cliArgs,
+  };
+}
+
+function runCodexCli(args, options = {}) {
+  const cliArgs = Array.isArray(args) ? args.map((entry) => String(entry)) : [];
+  if (cliArgs.length === 0) {
+    throw new Error("codex CLI invocation requires at least one argument");
+  }
+
+  const binary = resolveCodexBinary(state.config);
+  const launch = resolveCodexCliLaunch(binary, cliArgs);
+  const result = spawnSync(launch.command, launch.args, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  const status = typeof result.status === "number" ? result.status : -1;
+  const success = status === 0;
+
+  if (!success && options.allowFailure !== true) {
+    const detail = stderr.trim() || stdout.trim() || `codex exited with status ${status}`;
+    throw new Error(detail);
+  }
+
+  return {
+    stdout,
+    stderr,
+    status,
+    success,
+  };
+}
+
+function runCodexCliJson(args, options = {}) {
+  const result = runCodexCli(args, options);
+  const output = result.stdout.trim();
+  if (!output) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(output);
+  } catch (error) {
+    throw new Error(`failed to parse codex JSON output: ${String(error)}`);
+  }
 }
 
 function createRuntime(child) {
@@ -709,6 +883,22 @@ function convertThreadItemToLegacy(item) {
       type: "reasoning",
       id: item.id,
       text,
+    };
+  }
+
+  if (type === "enteredReviewMode") {
+    return {
+      type: "entered_review_mode",
+      id: item.id,
+      review: typeof item.review === "string" ? item.review : "",
+    };
+  }
+
+  if (type === "exitedReviewMode") {
+    return {
+      type: "exited_review_mode",
+      id: item.id,
+      review: typeof item.review === "string" ? item.review : "",
     };
   }
 
@@ -1340,11 +1530,12 @@ async function handleServerRequest(runtime, message) {
       method === "item/commandExecution/requestApproval" ||
       method === "item/fileChange/requestApproval"
     ) {
-      try {
-        sendRuntimeResponse(runtime, message.id, { decision: "decline" });
-      } catch {
-        // best effort
-      }
+      sendRuntimeError(
+        runtime,
+        message.id,
+        -32000,
+        error instanceof Error ? error.message : String(error),
+      );
       return;
     }
 
@@ -1548,6 +1739,75 @@ function handleNotification(runtime, method, params) {
       turn_id: turnId,
     });
     completeTurnTracker(runtime, turnId, { status: "completed", usage });
+    return;
+  }
+
+  if (method === "mcpServer/oauthLogin/completed") {
+    const name = typeof payload.name === "string" ? payload.name : "";
+    const success = Boolean(payload.success);
+    const error = typeof payload.error === "string" ? payload.error : null;
+
+    writeEvent({
+      type: "mcp.oauth_login.completed",
+      name,
+      success,
+      error,
+    });
+    return;
+  }
+
+  if (method === "account/updated") {
+    const authMode = normalizeAuthMode(payload.authMode ?? payload.auth_mode);
+
+    writeEvent({
+      type: "account.updated",
+      auth_mode: authMode,
+    });
+    return;
+  }
+
+  if (method === "account/login/completed") {
+    const loginId =
+      typeof payload.loginId === "string"
+        ? payload.loginId
+        : typeof payload.login_id === "string"
+          ? payload.login_id
+          : null;
+    const success = Boolean(payload.success);
+    const error = typeof payload.error === "string" ? payload.error : null;
+
+    writeEvent({
+      type: "account.login.completed",
+      login_id: loginId,
+      success,
+      error,
+    });
+    return;
+  }
+
+  if (method === "account/rateLimits/updated") {
+    const rateLimits = normalizeRateLimitSnapshot(
+      payload.rateLimits ?? payload.rate_limits,
+    );
+
+    writeEvent({
+      type: "account.rate_limits.updated",
+      rate_limits: rateLimits,
+    });
+    return;
+  }
+
+  if (method === "app/list/updated") {
+    const rawApps = Array.isArray(payload.data) ? payload.data : [];
+    const data = rawApps
+      .map((entry) => normalizeAppRecord(entry))
+      .filter((entry) => entry !== null)
+      .sort((left, right) => left.name.localeCompare(right.name));
+
+    writeEvent({
+      type: "app.list.updated",
+      data,
+    });
     return;
   }
 
@@ -1783,7 +2043,7 @@ async function ensureAppServer() {
         version: "0.1.0",
       },
       capabilities: {
-        experimentalApi: false,
+        experimentalApi: true,
       },
     }, 60_000);
 
@@ -2229,6 +2489,16 @@ function formatStructuredHistoryItem(item) {
     return path ? `[image_view] ${path}` : "[image_view]";
   }
 
+  if (itemType === "enteredReviewMode" || itemType === "entered_review_mode") {
+    const review = String(item.review || "").trim();
+    return review ? `[review] started: ${review}` : "[review] started";
+  }
+
+  if (itemType === "exitedReviewMode" || itemType === "exited_review_mode") {
+    const review = String(item.review || "").trim();
+    return review ? `[review] completed\n${review}` : "[review] completed";
+  }
+
   if (
     itemType === "collabAgentToolCall" ||
     itemType === "collabToolCall" ||
@@ -2505,6 +2775,63 @@ function isPlainJsonObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizeReviewDelivery(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "inline" || normalized === "detached") {
+    return normalized;
+  }
+
+  throw new Error("review delivery must be `inline` or `detached`");
+}
+
+function normalizeReviewTarget(value) {
+  if (!isPlainJsonObject(value)) {
+    return { type: "uncommittedChanges" };
+  }
+
+  const targetType = String(value.type || "").trim();
+  if (!targetType || targetType === "uncommittedChanges") {
+    return { type: "uncommittedChanges" };
+  }
+
+  if (targetType === "baseBranch") {
+    const branch = String(value.branch || "").trim();
+    if (!branch) {
+      throw new Error("review target baseBranch requires `branch`");
+    }
+    return { type: "baseBranch", branch };
+  }
+
+  if (targetType === "commit") {
+    const sha = String(value.sha || "").trim();
+    if (!sha) {
+      throw new Error("review target commit requires `sha`");
+    }
+    const title =
+      typeof value.title === "string" && value.title.trim().length > 0
+        ? value.title.trim()
+        : null;
+    return { type: "commit", sha, title };
+  }
+
+  if (targetType === "custom") {
+    const instructions = String(value.instructions || "").trim();
+    if (!instructions) {
+      throw new Error("review target custom requires `instructions`");
+    }
+    return { type: "custom", instructions };
+  }
+
+  throw new Error(`unsupported review target type: ${targetType}`);
+}
+
 async function handleTurnRun(params = {}) {
   const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
   const runtimeConfig = normalizeConfigPatch({
@@ -2555,6 +2882,52 @@ async function handleTurnRun(params = {}) {
   return {
     threadId: threadRef.threadId,
     codexThreadId,
+    finalResponse: completion.finalResponse || "",
+    usage: completion.usage,
+  };
+}
+
+async function handleReviewStart(params = {}) {
+  const threadRef = resolveThreadRef(params.threadId, params.workspace, true);
+  const runtime = await ensureAppServer();
+
+  const requestParams = {
+    threadId: threadRef.codexThreadId,
+    target: normalizeReviewTarget(params.target),
+  };
+
+  const delivery = normalizeReviewDelivery(params.delivery);
+  if (delivery) {
+    requestParams.delivery = delivery;
+  }
+
+  const result = await sendRuntimeRequest(runtime, "review/start", requestParams);
+  const turnId = String(result?.turn?.id || "");
+  if (!turnId) {
+    throw new Error("review/start returned no turn id");
+  }
+
+  const completion = await waitForTurnCompletion(runtime, turnId);
+
+  const reviewCodexThreadId =
+    normalizeThreadIdCandidate(result?.reviewThreadId ?? result?.review_thread_id) ||
+    threadRef.codexThreadId;
+
+  let reviewThreadState = resolveThreadStateByAnyId(reviewCodexThreadId);
+  if (!reviewThreadState) {
+    reviewThreadState = {
+      threadId: reviewCodexThreadId,
+      codexThreadId: reviewCodexThreadId,
+      workspace: threadRef.workspace,
+    };
+    state.threads.set(reviewThreadState.threadId, reviewThreadState);
+  }
+
+  return {
+    threadId: threadRef.threadId,
+    codexThreadId: threadRef.codexThreadId,
+    reviewThreadId: reviewThreadState.threadId,
+    reviewCodexThreadId: reviewThreadState.codexThreadId,
     finalResponse: completion.finalResponse || "",
     usage: completion.usage,
   };
@@ -2926,15 +3299,41 @@ function normalizeMcpTransport(value) {
   if (transport === "stdio" || transport === "sse" || transport === "streamable-http") {
     return transport;
   }
+  if (transport === "streamable_http") {
+    return "streamable-http";
+  }
   return "stdio";
 }
 
-function normalizeMcpStatusFromAuth(authStatus) {
-  const normalized = String(authStatus || "").trim();
-  if (normalized === "notLoggedIn") {
-    return "disconnected";
+function normalizeMcpAuthStatus(value) {
+  const normalized = String(value || "").trim();
+  if (normalized === "notLoggedIn" || normalized === "not_logged_in") {
+    return "not_logged_in";
   }
-  return "connected";
+  if (normalized === "bearerToken" || normalized === "bearer_token") {
+    return "bearer_token";
+  }
+  if (normalized === "oAuth" || normalized === "oauth" || normalized === "o_auth") {
+    return "oauth";
+  }
+  return "unsupported";
+}
+
+function normalizeMcpStatusFromAuth(authStatus) {
+  return authStatus === "not_logged_in" ? "disconnected" : "connected";
+}
+
+function describeMcpStatusFromAuth(authStatus) {
+  if (authStatus === "not_logged_in") {
+    return "OAuth required";
+  }
+  if (authStatus === "bearer_token") {
+    return "Using bearer token auth";
+  }
+  if (authStatus === "oauth") {
+    return "OAuth connected";
+  }
+  return null;
 }
 
 function extractMcpToolNames(tools) {
@@ -2950,6 +3349,196 @@ function extractMcpToolNames(tools) {
   return names;
 }
 
+function collectMcpCliServerMap() {
+  const servers = new Map();
+
+  let parsed = null;
+  try {
+    parsed = runCodexCliJson(["mcp", "list", "--json"], {
+      allowFailure: true,
+    });
+  } catch {
+    parsed = null;
+  }
+
+  if (!Array.isArray(parsed)) {
+    return servers;
+  }
+
+  for (const entry of parsed) {
+    if (!asPlainObject(entry)) {
+      continue;
+    }
+
+    const name = typeof entry.name === "string" ? entry.name.trim() : "";
+    if (!name) {
+      continue;
+    }
+
+    const transportConfig = asPlainObject(entry.transport) ? entry.transport : {};
+    const transport = normalizeMcpTransport(transportConfig.type);
+    const url =
+      typeof transportConfig.url === "string" && transportConfig.url.trim().length > 0
+        ? transportConfig.url.trim()
+        : undefined;
+    const authStatus = normalizeMcpAuthStatus(entry.auth_status ?? entry.authStatus);
+
+    servers.set(name, {
+      transport,
+      url,
+      authStatus,
+    });
+  }
+
+  return servers;
+}
+
+function normalizeAuthMode(value) {
+  const normalized = String(value || "").trim();
+  if (normalized === "apiKey" || normalized === "apikey" || normalized === "api_key") {
+    return "api_key";
+  }
+  if (normalized === "chatgpt") {
+    return "chatgpt";
+  }
+  if (
+    normalized === "chatgptAuthTokens" ||
+    normalized === "chatgptauthtokens" ||
+    normalized === "chatgpt_auth_tokens"
+  ) {
+    return "chatgpt_auth_tokens";
+  }
+  if (!normalized || normalized === "none" || normalized === "null") {
+    return "none";
+  }
+  return "unknown";
+}
+
+function normalizeAccountType(value) {
+  return normalizeAuthMode(value);
+}
+
+function normalizePlanType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeAppRecord(entry) {
+  if (!asPlainObject(entry)) {
+    return null;
+  }
+
+  const id = typeof entry.id === "string" ? entry.id.trim() : "";
+  const name = typeof entry.name === "string" ? entry.name.trim() : "";
+  if (!id || !name) {
+    return null;
+  }
+
+  const optionalString = (value) => {
+    if (typeof value !== "string") {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  };
+
+  return {
+    id,
+    name,
+    description: optionalString(entry.description),
+    logoUrl: optionalString(entry.logoUrl ?? entry.logo_url),
+    logoUrlDark: optionalString(entry.logoUrlDark ?? entry.logo_url_dark),
+    distributionChannel: optionalString(
+      entry.distributionChannel ?? entry.distribution_channel,
+    ),
+    installUrl: optionalString(entry.installUrl ?? entry.install_url),
+    isAccessible: Boolean(entry.isAccessible ?? entry.is_accessible),
+    isEnabled: Boolean(entry.isEnabled ?? entry.is_enabled),
+  };
+}
+
+function normalizeRateLimitWindow(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const usedPercent = asFiniteNumber(value.usedPercent ?? value.used_percent);
+  if (usedPercent == null) {
+    return null;
+  }
+
+  const windowDurationMins = asFiniteNumber(
+    value.windowDurationMins ?? value.window_duration_mins,
+  );
+  const resetsAt = asFiniteNumber(value.resetsAt ?? value.resets_at);
+
+  return {
+    usedPercent,
+    windowDurationMins:
+      windowDurationMins != null ? Math.trunc(windowDurationMins) : null,
+    resetsAt: resetsAt != null ? Math.trunc(resetsAt) : null,
+  };
+}
+
+function normalizeCreditsSnapshot(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const balance =
+    typeof value.balance === "string" && value.balance.trim().length > 0
+      ? value.balance.trim()
+      : null;
+
+  return {
+    hasCredits: Boolean(value.hasCredits ?? value.has_credits),
+    unlimited: Boolean(value.unlimited),
+    balance,
+  };
+}
+
+function normalizeRateLimitSnapshot(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const optionalString = (entry) =>
+    typeof entry === "string" && entry.trim().length > 0 ? entry.trim() : null;
+
+  return {
+    limitId: optionalString(value.limitId ?? value.limit_id),
+    limitName: optionalString(value.limitName ?? value.limit_name),
+    primary: normalizeRateLimitWindow(value.primary),
+    secondary: normalizeRateLimitWindow(value.secondary),
+    credits: normalizeCreditsSnapshot(value.credits),
+    planType: normalizePlanType(value.planType ?? value.plan_type),
+  };
+}
+
+function normalizeRateLimitsByLimitId(value) {
+  if (!asPlainObject(value)) {
+    return null;
+  }
+
+  const entries = Object.entries(value)
+    .map(([limitId, snapshot]) => {
+      const normalizedSnapshot = normalizeRateLimitSnapshot(snapshot);
+      if (!normalizedSnapshot) {
+        return null;
+      }
+      if (!normalizedSnapshot.limitId) {
+        normalizedSnapshot.limitId = limitId;
+      }
+      return [limitId, normalizedSnapshot];
+    })
+    .filter((entry) => entry !== null);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  return Object.fromEntries(entries);
+}
 async function collectMcpServerStatusEntries(runtime) {
   const entries = [];
   let cursor = null;
@@ -2977,7 +3566,6 @@ async function collectMcpServerStatusEntries(runtime) {
 
   return entries;
 }
-
 async function handleMcpWarmup() {
   const runtime = await ensureAppServer();
   const startedAt = Date.now();
@@ -3003,7 +3591,9 @@ async function handleMcpList() {
   const runtime = await ensureAppServer();
   const startedAt = Date.now();
   const entries = await collectMcpServerStatusEntries(runtime);
+  const cliServers = collectMcpCliServerMap();
   const seenIds = new Map();
+  const seenNames = new Set();
   const servers = [];
 
   for (const entry of entries) {
@@ -3012,21 +3602,50 @@ async function handleMcpList() {
       continue;
     }
 
+    const cliServer = cliServers.get(name);
+    const authStatus = cliServer?.authStatus ?? normalizeMcpAuthStatus(entry.authStatus);
+    const status = normalizeMcpStatusFromAuth(authStatus);
+    const statusReason = describeMcpStatusFromAuth(authStatus);
+
     const id = makeUniqueMcpServerId(normalizeMcpServerIdBase(name), seenIds);
     const tools = extractMcpToolNames(entry.tools);
-    const status = normalizeMcpStatusFromAuth(entry.authStatus);
-    const transport = normalizeMcpTransport(entry.transport);
-    const url = typeof entry?.url === "string" && entry.url.trim().length > 0
+    const transport = normalizeMcpTransport(cliServer?.transport ?? entry.transport);
+    const url = cliServer?.url ?? (typeof entry?.url === "string" && entry.url.trim().length > 0
       ? entry.url.trim()
-      : undefined;
+      : undefined);
 
     servers.push({
       id,
       name,
       transport,
       status,
+      statusReason,
+      authStatus,
       tools,
       url,
+    });
+
+    seenNames.add(name);
+  }
+
+  for (const [name, cliServer] of cliServers.entries()) {
+    if (seenNames.has(name)) {
+      continue;
+    }
+
+    const authStatus = normalizeMcpAuthStatus(cliServer.authStatus);
+    const status = normalizeMcpStatusFromAuth(authStatus);
+    const statusReason = describeMcpStatusFromAuth(authStatus);
+
+    servers.push({
+      id: makeUniqueMcpServerId(normalizeMcpServerIdBase(name), seenIds),
+      name,
+      transport: normalizeMcpTransport(cliServer.transport),
+      status,
+      statusReason,
+      authStatus,
+      tools: [],
+      url: cliServer.url,
     });
   }
 
@@ -3035,6 +3654,237 @@ async function handleMcpList() {
   return {
     data: servers,
     total: servers.length,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleMcpLogin(params = {}) {
+  const name = typeof params.name === "string" ? params.name.trim() : "";
+  if (!name) {
+    throw new Error("name is required");
+  }
+
+  const scopes = Array.isArray(params.scopes)
+    ? params.scopes
+      .map((entry) => String(entry || "").trim())
+      .filter((entry) => entry.length > 0)
+    : [];
+  const timeoutSecsRaw = asFiniteNumber(params.timeoutSecs ?? params.timeout_secs);
+  const timeoutSecs =
+    timeoutSecsRaw != null && timeoutSecsRaw > 0 ? Math.trunc(timeoutSecsRaw) : null;
+
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  const requestParams = { name };
+  if (scopes.length > 0) {
+    requestParams.scopes = scopes;
+  }
+  if (timeoutSecs != null) {
+    requestParams.timeoutSecs = timeoutSecs;
+  }
+
+  const result = await sendRuntimeRequest(
+    runtime,
+    "mcpServer/oauth/login",
+    requestParams,
+    120_000,
+  );
+
+  const authorizationUrl =
+    typeof result?.authorizationUrl === "string"
+      ? result.authorizationUrl
+      : typeof result?.authorization_url === "string"
+        ? result.authorization_url
+        : "";
+
+  return {
+    name,
+    authorizationUrl: authorizationUrl || null,
+    started: true,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleMcpReload() {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  await sendRuntimeRequest(runtime, "config/mcpServer/reload", {}, 90_000);
+
+  return {
+    reloaded: true,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleAppList(params = {}) {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  const requestParams = {};
+  if (typeof params.cursor === "string" && params.cursor.trim().length > 0) {
+    requestParams.cursor = params.cursor.trim();
+  }
+
+  const limit = asFiniteNumber(params.limit);
+  if (limit != null && limit > 0) {
+    requestParams.limit = Math.trunc(limit);
+  }
+
+  const threadId =
+    typeof params.threadId === "string"
+      ? params.threadId.trim()
+      : typeof params.thread_id === "string"
+        ? params.thread_id.trim()
+        : "";
+  if (threadId.length > 0) {
+    requestParams.threadId = threadId;
+  }
+
+  if (Boolean(params.forceRefetch ?? params.force_refetch)) {
+    requestParams.forceRefetch = true;
+  }
+
+  const result = await sendRuntimeRequest(runtime, "app/list", requestParams, 90_000);
+  const rawData = Array.isArray(result?.data) ? result.data : [];
+  const data = rawData
+    .map((entry) => normalizeAppRecord(entry))
+    .filter((entry) => entry !== null)
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const nextCursor =
+    typeof result?.nextCursor === "string" && result.nextCursor.trim().length > 0
+      ? result.nextCursor.trim()
+      : typeof result?.next_cursor === "string" && result.next_cursor.trim().length > 0
+        ? result.next_cursor.trim()
+        : null;
+
+  return {
+    data,
+    nextCursor,
+    total: data.length,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleAccountRead(params = {}) {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  const refreshToken = Boolean(params.refreshToken ?? params.refresh_token);
+  const result = await sendRuntimeRequest(
+    runtime,
+    "account/read",
+    { refreshToken },
+    90_000,
+  );
+
+  const accountPayload = asPlainObject(result?.account) ? result.account : null;
+  const account = accountPayload
+    ? {
+      type: normalizeAccountType(accountPayload.type),
+      email:
+        typeof accountPayload.email === "string" && accountPayload.email.trim().length > 0
+          ? accountPayload.email.trim()
+          : null,
+      planType: normalizePlanType(accountPayload.planType ?? accountPayload.plan_type),
+    }
+    : null;
+
+  const requiresOpenaiAuth = Boolean(
+    result?.requiresOpenaiAuth ?? result?.requires_openai_auth,
+  );
+  const authMode = account ? account.type : "none";
+
+  return {
+    account,
+    requiresOpenaiAuth,
+    authMode,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleAccountLoginStart(params = {}) {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  const requestedType = normalizeAccountType(params.type);
+  const requestParams = {};
+
+  if (requestedType === "chatgpt") {
+    requestParams.type = "chatgpt";
+  } else if (requestedType === "api_key") {
+    const apiKey =
+      typeof params.apiKey === "string"
+        ? params.apiKey.trim()
+        : typeof params.api_key === "string"
+          ? params.api_key.trim()
+          : "";
+    if (!apiKey) {
+      throw new Error("apiKey is required for type=apiKey");
+    }
+
+    requestParams.type = "apiKey";
+    requestParams.apiKey = apiKey;
+  } else {
+    throw new Error("unsupported account login type");
+  }
+
+  const result = await sendRuntimeRequest(
+    runtime,
+    "account/login/start",
+    requestParams,
+    120_000,
+  );
+
+  const loginType = normalizeAccountType(result?.type ?? requestParams.type);
+  const loginId =
+    typeof result?.loginId === "string"
+      ? result.loginId
+      : typeof result?.login_id === "string"
+        ? result.login_id
+        : null;
+  const authUrl =
+    typeof result?.authUrl === "string"
+      ? result.authUrl
+      : typeof result?.auth_url === "string"
+        ? result.auth_url
+        : null;
+
+  return {
+    type: loginType,
+    loginId,
+    authUrl,
+    started: true,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleAccountLogout() {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  await sendRuntimeRequest(runtime, "account/logout", {}, 90_000);
+
+  return {
+    loggedOut: true,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
+async function handleAccountRateLimitsRead() {
+  const runtime = await ensureAppServer();
+  const startedAt = Date.now();
+
+  const result = await sendRuntimeRequest(runtime, "account/rateLimits/read", {}, 90_000);
+  const rateLimits = normalizeRateLimitSnapshot(result?.rateLimits ?? result?.rate_limits);
+  const rateLimitsByLimitId = normalizeRateLimitsByLimitId(
+    result?.rateLimitsByLimitId ?? result?.rate_limits_by_limit_id,
+  );
+
+  return {
+    rateLimits,
+    rateLimitsByLimitId,
     elapsedMs: Date.now() - startedAt,
   };
 }
@@ -3062,52 +3912,93 @@ async function handleApprovalRespond(params = {}) {
 }
 
 async function dispatchRequest(method, params) {
-  switch (method) {
-    case "health": {
-      const runtime = await ensureAppServer();
-      return { ok: true, version: 2, pid: runtime.child.pid ?? null };
+  if (
+    method !== "capabilities.get" &&
+    isKnownRuntimeMethod(method) &&
+    state.runtimeCapabilities[method] === false
+  ) {
+    throw new Error(`unsupported method: ${method}`);
+  }
+
+  try {
+    switch (method) {
+      case "health": {
+        const runtime = await ensureAppServer();
+        return { ok: true, version: 2, pid: runtime.child.pid ?? null };
+      }
+      case "capabilities.get":
+        return {
+          methods: getRuntimeCapabilitiesSnapshot(),
+          disabledByFlag: Array.from(DISABLED_RUNTIME_METHODS.values()),
+        };
+      case "thread.open":
+        return handleThreadOpen(params);
+      case "thread.close":
+        return handleThreadClose(params);
+      case "thread.list":
+        return handleThreadList(params);
+      case "thread.read":
+        return handleThreadRead(params);
+      case "thread.archive":
+        return handleThreadArchive(params);
+      case "thread.unarchive":
+        return handleThreadUnarchive(params);
+      case "thread.compact.start":
+        return handleThreadCompactStart(params);
+      case "thread.rollback":
+        return handleThreadRollback(params);
+      case "thread.fork":
+        return handleThreadFork(params);
+      case "turn.run":
+        return handleTurnRun(params);
+      case "review.start":
+        return handleReviewStart(params);
+      case "turn.steer":
+        return handleTurnSteer(params);
+      case "turn.interrupt":
+        return handleTurnInterrupt(params);
+      case "approval.respond":
+        return handleApprovalRespond(params);
+      case "mcp.warmup":
+        return handleMcpWarmup();
+      case "mcp.list":
+        return handleMcpList();
+      case "mcp.login":
+        return handleMcpLogin(params);
+      case "mcp.reload":
+        return handleMcpReload();
+      case "app.list":
+        return handleAppList(params);
+      case "account.read":
+        return handleAccountRead(params);
+      case "account.login.start":
+        return handleAccountLoginStart(params);
+      case "account.logout":
+        return handleAccountLogout();
+      case "account.rate_limits.read":
+      case "account.rateLimits.read":
+        return handleAccountRateLimitsRead();
+      case "config.get":
+        return handleConfigGet();
+      case "config.set":
+        return handleConfigSet(params);
+      case "shutdown":
+        return { ok: true };
+      default:
+        throw new Error(`unsupported method: ${method}`);
     }
-    case "thread.open":
-      return handleThreadOpen(params);
-    case "thread.close":
-      return handleThreadClose(params);
-    case "thread.list":
-      return handleThreadList(params);
-    case "thread.read":
-      return handleThreadRead(params);
-    case "thread.archive":
-      return handleThreadArchive(params);
-    case "thread.unarchive":
-      return handleThreadUnarchive(params);
-    case "thread.compact.start":
-      return handleThreadCompactStart(params);
-    case "thread.rollback":
-      return handleThreadRollback(params);
-    case "thread.fork":
-      return handleThreadFork(params);
-    case "turn.run":
-      return handleTurnRun(params);
-    case "turn.steer":
-      return handleTurnSteer(params);
-    case "turn.interrupt":
-      return handleTurnInterrupt(params);
-    case "approval.respond":
-      return handleApprovalRespond(params);
-    case "mcp.warmup":
-      return handleMcpWarmup();
-    case "mcp.list":
-      return handleMcpList();
-    case "config.get":
-      return handleConfigGet();
-    case "config.set":
-      return handleConfigSet(params);
-    case "shutdown":
-      return { ok: true };
-    default:
+  } catch (error) {
+    if (
+      method !== "capabilities.get" &&
+      isKnownRuntimeMethod(method) &&
+      isUnsupportedMethodError(error)
+    ) {
+      setRuntimeMethodCapability(method, false);
       throw new Error(`unsupported method: ${method}`);
+    }
+    throw error;
   }
 }
-
 async function handleLine(rawLine) {
   const line = rawLine.trim();
   if (!line) {
@@ -3185,13 +4076,4 @@ main().catch((error) => {
   });
   process.exit(1);
 });
-
-
-
-
-
-
-
-
-
 

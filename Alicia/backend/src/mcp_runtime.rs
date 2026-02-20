@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -17,6 +17,8 @@ pub struct McpServerListEntry {
     pub name: String,
     pub transport: String,
     pub status: String,
+    pub status_reason: Option<String>,
+    pub auth_status: String,
     pub tools: Vec<String>,
     pub url: Option<String>,
 }
@@ -177,6 +179,31 @@ pub fn parse_mcp_server_list_bridge_result(
                         })
                         .unwrap_or_else(|| "connected".to_string());
 
+                    let auth_status = entry
+                        .get("authStatus")
+                        .or_else(|| entry.get("auth_status"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(|value| match value {
+                            "unsupported" | "not_logged_in" | "bearer_token" | "oauth" => {
+                                value.to_string()
+                            }
+                            "notLoggedIn" => "not_logged_in".to_string(),
+                            "bearerToken" => "bearer_token".to_string(),
+                            "oAuth" => "oauth".to_string(),
+                            _ => "unsupported".to_string(),
+                        })
+                        .unwrap_or_else(|| "unsupported".to_string());
+
+                    let status_reason = entry
+                        .get("statusReason")
+                        .or_else(|| entry.get("status_reason"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+
                     let mut tools = entry
                         .get("tools")
                         .and_then(Value::as_array)
@@ -205,6 +232,8 @@ pub fn parse_mcp_server_list_bridge_result(
                         name,
                         transport,
                         status,
+                        status_reason,
+                        auth_status,
                         tools,
                         url,
                     })
@@ -255,6 +284,8 @@ pub fn mcp_servers_from_names(names: Vec<String>, elapsed_ms: u64) -> McpServerL
                 name,
                 transport: "stdio".to_string(),
                 status: "connected".to_string(),
+                status_reason: None,
+                auth_status: "unsupported".to_string(),
                 tools: Vec::new(),
                 url: None,
             }
@@ -265,6 +296,98 @@ pub fn mcp_servers_from_names(names: Vec<String>, elapsed_ms: u64) -> McpServerL
     McpServerListResponse {
         total: data.len(),
         data,
+        elapsed_ms,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpLoginRequest {
+    pub name: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpLoginResponse {
+    pub name: String,
+    pub authorization_url: Option<String>,
+    pub started: bool,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpReloadResponse {
+    pub reloaded: bool,
+    pub elapsed_ms: u64,
+}
+
+pub fn parse_mcp_login_bridge_result(result: &Value, fallback_elapsed_ms: u64) -> McpLoginResponse {
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "server".to_string());
+
+    let authorization_url = result
+        .get("authorizationUrl")
+        .or_else(|| result.get("authorization_url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let started = result
+        .get("started")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let elapsed_ms = result
+        .get("elapsedMs")
+        .or_else(|| result.get("elapsed_ms"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|millis| u64::try_from(millis).ok()))
+                .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(fallback_elapsed_ms);
+
+    McpLoginResponse {
+        name,
+        authorization_url,
+        started,
+        elapsed_ms,
+    }
+}
+
+pub fn parse_mcp_reload_bridge_result(
+    result: &Value,
+    fallback_elapsed_ms: u64,
+) -> McpReloadResponse {
+    let reloaded = result
+        .get("reloaded")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let elapsed_ms = result
+        .get("elapsedMs")
+        .or_else(|| result.get("elapsed_ms"))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|millis| u64::try_from(millis).ok()))
+                .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
+        })
+        .unwrap_or(fallback_elapsed_ms);
+
+    McpReloadResponse {
+        reloaded,
         elapsed_ms,
     }
 }

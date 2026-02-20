@@ -15,6 +15,7 @@ import {
   ArrowDownLeft,
   Clock,
   Gauge,
+  AppWindow,
 } from "lucide-react"
 import {
   type AliciaState,
@@ -138,6 +139,24 @@ function formatElapsed(seconds: number): string {
   return `${minutes}:${String(remaining).padStart(2, "0")}`
 }
 
+function authModeLabel(mode: AliciaState["account"]["authMode"]): string {
+  if (mode === "chatgpt") return "chatgpt"
+  if (mode === "api_key") return "api-key"
+  if (mode === "chatgpt_auth_tokens") return "tokens"
+  if (mode === "none") return "logged-out"
+  return "unknown"
+}
+
+function authModeColor(mode: AliciaState["account"]["authMode"]): string {
+  if (mode === "chatgpt" || mode === "api_key" || mode === "chatgpt_auth_tokens") {
+    return "text-terminal-green"
+  }
+  if (mode === "none") {
+    return "text-terminal-gold"
+  }
+  return "text-muted-foreground"
+}
+
 function Separator() {
   return <div className="w-px h-3 bg-muted-foreground/10 mx-0.5" />
 }
@@ -200,6 +219,8 @@ export function StatusBar({
   const diagnosticsAdded = state.fileChanges.filter((entry) => entry.status === "added").length
   const approvalDescription =
     APPROVAL_PRESETS[state.approvalPreset]?.description || state.sandboxMode
+  const accountLabel = authModeLabel(state.account.authMode)
+  const accountColorClass = authModeColor(state.account.authMode)
 
   return (
     <div className="flex items-center justify-between h-7 bg-panel-bg border-t border-panel-border px-2 text-[10px] text-muted-foreground select-none shrink-0 gap-1">
@@ -266,6 +287,17 @@ export function StatusBar({
           <PlugZap className="w-3 h-3 text-terminal-purple" />
           <span>{connectedMcps.length}</span>
           <span className="text-muted-foreground/30">({totalTools})</span>
+        </button>
+
+        <Separator />
+
+        <button
+          onClick={() => onOpenPanel("apps")}
+          className="flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-muted-foreground/5 transition-colors"
+        >
+          <AppWindow className="w-3 h-3 text-terminal-cyan" />
+          <span className={accountColorClass}>{accountLabel}</span>
+          <span className="text-muted-foreground/30">({state.apps.length})</span>
         </button>
 
         <Separator />

@@ -1,3 +1,5 @@
+import type { RuntimeMethodCapabilities } from "@/lib/tauri-bridge/types"
+
 // ========================
 // Alicia shared types
 // ========================
@@ -40,8 +42,62 @@ export interface McpServer {
   name: string
   transport: "stdio" | "sse" | "streamable-http"
   status: "connected" | "disconnected" | "error" | "connecting"
+  statusReason?: string | null
+  authStatus?: "unsupported" | "not_logged_in" | "bearer_token" | "oauth"
   tools: string[]
   url?: string
+}
+
+export type AccountAuthMode =
+  | "none"
+  | "api_key"
+  | "chatgpt"
+  | "chatgpt_auth_tokens"
+  | "unknown"
+
+export interface ConnectedApp {
+  id: string
+  name: string
+  description?: string | null
+  logoUrl?: string | null
+  logoUrlDark?: string | null
+  distributionChannel?: string | null
+  installUrl?: string | null
+  isAccessible: boolean
+  isEnabled: boolean
+}
+
+export interface AccountProfile {
+  type: Exclude<AccountAuthMode, "none">
+  email?: string | null
+  planType?: string | null
+}
+
+export interface AccountRateLimitWindow {
+  usedPercent: number
+  windowDurationMins?: number | null
+  resetsAt?: number | null
+}
+
+export interface AccountCreditsSnapshot {
+  hasCredits: boolean
+  unlimited: boolean
+  balance?: string | null
+}
+
+export interface AccountRateLimitSnapshot {
+  limitId?: string | null
+  limitName?: string | null
+  primary?: AccountRateLimitWindow | null
+  secondary?: AccountRateLimitWindow | null
+  credits?: AccountCreditsSnapshot | null
+  planType?: string | null
+}
+
+export interface AccountState {
+  authMode: AccountAuthMode
+  requiresOpenaiAuth: boolean
+  account: AccountProfile | null
 }
 
 export const DEFAULT_MCP_SERVERS: McpServer[] = [
@@ -80,47 +136,49 @@ export interface SlashCommand {
   label: string
   description: string
   category: "model" | "session" | "config" | "agent" | "debug" | "system"
+  support: "supported" | "planned"
 }
 
+export const SUPPORTED_SLASH_COMMANDS: SlashCommand[] = [
+  { command: "/model", label: "Model", description: "Change model and reasoning effort", category: "model", support: "supported" },
+  { command: "/models", label: "Models", description: "Open available models from Codex runtime", category: "model", support: "supported" },
+  { command: "/approvals", label: "Approvals", description: "Configure approval policy", category: "config", support: "supported" },
+  { command: "/permissions", label: "Permissions", description: "Set permission preset", category: "config", support: "supported" },
+  { command: "/new", label: "New Session", description: "Start a new session", category: "session", support: "supported" },
+  { command: "/resume", label: "Resume", description: "Resume a previous session", category: "session", support: "supported" },
+  { command: "/fork", label: "Fork", description: "Fork current or previous session", category: "session", support: "supported" },
+  { command: "/agent", label: "Agent", description: "Switch agent mode", category: "agent", support: "supported" },
+  { command: "/review", label: "Review", description: "Request code review", category: "agent", support: "supported" },
+  { command: "/mcp", label: "MCP", description: "View MCP server status and tools", category: "debug", support: "supported" },
+  { command: "/apps", label: "Apps", description: "Manage connected apps", category: "debug", support: "supported" },
+  { command: "/status", label: "Status", description: "Show system status", category: "debug", support: "supported" },
+  { command: "/logout", label: "Logout", description: "Log out of current session", category: "system", support: "supported" },
+  { command: "/quit", label: "Quit", description: "Exit Alicia", category: "system", support: "supported" },
+  { command: "/exit", label: "Exit", description: "Exit Alicia", category: "system", support: "supported" },
+]
+
+export const PLANNED_SLASH_COMMANDS: SlashCommand[] = [
+  { command: "/sandbox-add-read-dir", label: "Sandbox Add Dir", description: "Add readable directory to sandbox", category: "config", support: "planned" },
+  { command: "/personality", label: "Personality", description: "Set agent personality", category: "config", support: "planned" },
+  { command: "/experimental", label: "Experimental", description: "Toggle experimental features", category: "config", support: "planned" },
+  { command: "/statusline", label: "Status Line", description: "Configure status line display", category: "config", support: "planned" },
+  { command: "/rename", label: "Rename", description: "Rename current session", category: "session", support: "planned" },
+  { command: "/compact", label: "Compact", description: "Compact conversation history", category: "session", support: "planned" },
+  { command: "/plan", label: "Plan", description: "Ask agent to create a plan", category: "agent", support: "planned" },
+  { command: "/collab", label: "Collab", description: "Collaborative mode with agent", category: "agent", support: "planned" },
+  { command: "/diff", label: "Diff", description: "Show current changes diff", category: "agent", support: "planned" },
+  { command: "/mention", label: "Mention", description: "Mention a file or symbol", category: "agent", support: "planned" },
+  { command: "/skills", label: "Skills", description: "List available skills", category: "agent", support: "planned" },
+  { command: "/init", label: "Init", description: "Initialize project context", category: "agent", support: "planned" },
+  { command: "/debug-config", label: "Debug Config", description: "Show current configuration", category: "debug", support: "planned" },
+  { command: "/ps", label: "Processes", description: "Show running background tasks", category: "debug", support: "planned" },
+  { command: "/clean", label: "Clean", description: "Clean session data", category: "system", support: "planned" },
+  { command: "/feedback", label: "Feedback", description: "Send feedback", category: "system", support: "planned" },
+]
+
 export const SLASH_COMMANDS: SlashCommand[] = [
-  // Model & Config
-  { command: "/model", label: "Model", description: "Change model and reasoning effort", category: "model" },
-  { command: "/models", label: "Models", description: "Open available models from Codex runtime", category: "model" },
-  { command: "/approvals", label: "Approvals", description: "Configure approval policy", category: "config" },
-  { command: "/permissions", label: "Permissions", description: "Set permission preset", category: "config" },
-  { command: "/sandbox-add-read-dir", label: "Sandbox Add Dir", description: "Add readable directory to sandbox", category: "config" },
-  { command: "/personality", label: "Personality", description: "Set agent personality", category: "config" },
-  { command: "/experimental", label: "Experimental", description: "Toggle experimental features", category: "config" },
-  { command: "/statusline", label: "Status Line", description: "Configure status line display", category: "config" },
-
-  // Session
-  { command: "/new", label: "New Session", description: "Start a new session", category: "session" },
-  { command: "/resume", label: "Resume", description: "Resume a previous session", category: "session" },
-  { command: "/fork", label: "Fork", description: "Fork current or previous session", category: "session" },
-  { command: "/rename", label: "Rename", description: "Rename current session", category: "session" },
-  { command: "/compact", label: "Compact", description: "Compact conversation history", category: "session" },
-
-  // Agent actions
-  { command: "/plan", label: "Plan", description: "Ask agent to create a plan", category: "agent" },
-  { command: "/collab", label: "Collab", description: "Collaborative mode with agent", category: "agent" },
-  { command: "/agent", label: "Agent", description: "Switch agent mode", category: "agent" },
-  { command: "/diff", label: "Diff", description: "Show current changes diff", category: "agent" },
-  { command: "/review", label: "Review", description: "Request code review", category: "agent" },
-  { command: "/mention", label: "Mention", description: "Mention a file or symbol", category: "agent" },
-  { command: "/skills", label: "Skills", description: "List available skills", category: "agent" },
-  { command: "/init", label: "Init", description: "Initialize project context", category: "agent" },
-
-  // Debug & System
-  { command: "/mcp", label: "MCP", description: "View MCP server status and tools", category: "debug" },
-  { command: "/status", label: "Status", description: "Show system status", category: "debug" },
-  { command: "/debug-config", label: "Debug Config", description: "Show current configuration", category: "debug" },
-  { command: "/ps", label: "Processes", description: "Show running background tasks", category: "debug" },
-  { command: "/apps", label: "Apps", description: "Manage connected apps", category: "debug" },
-  { command: "/clean", label: "Clean", description: "Clean session data", category: "system" },
-  { command: "/feedback", label: "Feedback", description: "Send feedback", category: "system" },
-  { command: "/logout", label: "Logout", description: "Log out of current session", category: "system" },
-  { command: "/quit", label: "Quit", description: "Exit Alicia", category: "system" },
-  { command: "/exit", label: "Exit", description: "Exit Alicia", category: "system" },
+  ...SUPPORTED_SLASH_COMMANDS,
+  ...PLANNED_SLASH_COMMANDS,
 ]
 
 export interface FileChange {
@@ -133,8 +191,16 @@ export interface AliciaState {
   reasoningEffort: ReasoningEffort
   approvalPreset: ApprovalPreset
   sandboxMode: SandboxMode
+  runtimeCapabilities: RuntimeMethodCapabilities
   mcpServers: McpServer[]
+  apps: ConnectedApp[]
+  account: AccountState
+  rateLimits: AccountRateLimitSnapshot | null
+  rateLimitsByLimitId: Record<string, AccountRateLimitSnapshot>
   sessions: Session[]
   fileChanges: FileChange[]
-  activePanel: "model" | "permissions" | "mcp" | "sessions" | null
+  activePanel: "model" | "permissions" | "mcp" | "sessions" | "apps" | null
 }
+
+
+

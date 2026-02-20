@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tauri::{AppHandle, State};
 
 mod app_server_runtime;
+mod account_runtime;
 mod command_runtime;
 mod bridge_runtime;
 mod config_runtime;
@@ -21,9 +22,17 @@ mod session_lifecycle_runtime;
 mod session_runtime;
 mod session_turn_runtime;
 mod terminal_runtime;
+use crate::account_runtime::{
+    AccountLoginStartRequest, AccountLoginStartResponse, AccountLogoutResponse,
+    AccountRateLimitsReadResponse, AccountReadRequest, AccountReadResponse,
+    AppListRequest, AppListResponse,
+};
 use crate::config_runtime::{load_runtime_config_from_codex, normalize_runtime_config};
 use crate::bridge_runtime::BridgeProcess;
-use crate::mcp_runtime::{McpServerListResponse, McpStartupWarmupResponse};
+use crate::mcp_runtime::{
+    McpLoginRequest, McpLoginResponse, McpReloadResponse, McpServerListResponse,
+    McpStartupWarmupResponse,
+};
 
 pub(crate) use crate::launch_runtime::{default_codex_binary, resolve_binary_path, resolve_codex_launch};
 pub(crate) use crate::events_runtime::{emit_codex_event, emit_lifecycle, emit_stderr, emit_stdout, emit_terminal_data, emit_terminal_exit};
@@ -170,6 +179,12 @@ struct RuntimeStatusResponse {
     pid: Option<u32>,
     workspace: String,
     runtime_config: RuntimeCodexConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCapabilitiesResponse {
+    methods: HashMap<String, bool>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -389,6 +404,23 @@ struct CodexTurnInterruptResponse {
     turn_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexReviewStartRequest {
+    thread_id: Option<String>,
+    target: Option<Value>,
+    delivery: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexReviewStartResponse {
+    accepted: bool,
+    session_id: u64,
+    thread_id: Option<String>,
+    review_thread_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexApprovalRespondRequest {
@@ -544,6 +576,12 @@ fn codex_runtime_status(state: State<'_, AppState>) -> Result<RuntimeStatusRespo
 }
 
 #[tauri::command]
+async fn codex_runtime_capabilities(
+    state: State<'_, AppState>,
+) -> Result<RuntimeCapabilitiesResponse, String> {
+    crate::command_runtime::codex_runtime_capabilities_impl(state).await
+}
+#[tauri::command]
 async fn load_codex_default_config(state: State<'_, AppState>) -> Result<RuntimeCodexConfig, String> {
     let loaded = load_runtime_config_from_codex().await?;
     let mut runtime = lock_runtime_config(state.inner())?;
@@ -666,6 +704,15 @@ async fn codex_turn_interrupt(
 }
 
 #[tauri::command]
+async fn codex_review_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CodexReviewStartRequest,
+) -> Result<CodexReviewStartResponse, String> {
+    crate::session_runtime::codex_review_start_impl(app, state, request).await
+}
+
+#[tauri::command]
 async fn codex_approval_respond(
     state: State<'_, AppState>,
     request: CodexApprovalRespondRequest,
@@ -762,9 +809,66 @@ async fn codex_wait_for_mcp_startup(
     crate::command_runtime::codex_wait_for_mcp_startup_impl(state).await
 }
 #[tauri::command]
+async fn codex_app_list(
+    state: State<'_, AppState>,
+    request: Option<AppListRequest>,
+) -> Result<AppListResponse, String> {
+    crate::command_runtime::codex_app_list_impl(state, request.unwrap_or(AppListRequest {
+        cursor: None,
+        limit: None,
+        thread_id: None,
+        force_refetch: false,
+    }))
+    .await
+}
+
+#[tauri::command]
+async fn codex_account_read(
+    state: State<'_, AppState>,
+    request: Option<AccountReadRequest>,
+) -> Result<AccountReadResponse, String> {
+    crate::command_runtime::codex_account_read_impl(state, request.unwrap_or_default()).await
+}
+
+#[tauri::command]
+async fn codex_account_login_start(
+    state: State<'_, AppState>,
+    request: AccountLoginStartRequest,
+) -> Result<AccountLoginStartResponse, String> {
+    crate::command_runtime::codex_account_login_start_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_account_logout(
+    state: State<'_, AppState>,
+) -> Result<AccountLogoutResponse, String> {
+    crate::command_runtime::codex_account_logout_impl(state).await
+}
+
+#[tauri::command]
+async fn codex_account_rate_limits_read(
+    state: State<'_, AppState>,
+) -> Result<AccountRateLimitsReadResponse, String> {
+    crate::command_runtime::codex_account_rate_limits_read_impl(state).await
+}
+#[tauri::command]
 async fn codex_mcp_list(state: State<'_, AppState>) -> Result<McpServerListResponse, String> {
     crate::command_runtime::codex_mcp_list_impl(state).await
 }
+
+#[tauri::command]
+async fn codex_mcp_login(
+    state: State<'_, AppState>,
+    request: McpLoginRequest,
+) -> Result<McpLoginResponse, String> {
+    crate::command_runtime::codex_mcp_login_impl(state, request).await
+}
+
+#[tauri::command]
+async fn codex_mcp_reload(state: State<'_, AppState>) -> Result<McpReloadResponse, String> {
+    crate::command_runtime::codex_mcp_reload_impl(state).await
+}
+
 #[tauri::command]
 fn pick_image_file() -> Option<String> {
     rfd::FileDialog::new()
@@ -808,6 +912,7 @@ fn main() {
             codex_thread_compact_start,
             codex_thread_rollback,
             codex_thread_fork,
+            codex_review_start,
             codex_turn_steer,
             codex_turn_interrupt,
             codex_approval_respond,
@@ -815,6 +920,7 @@ fn main() {
             codex_config_get,
             codex_config_set,
             codex_runtime_status,
+            codex_runtime_capabilities,
             load_codex_default_config,
             send_codex_input,
             stop_codex_session,
@@ -825,7 +931,14 @@ fn main() {
             terminal_kill,
             run_codex_command,
             codex_models_list,
+            codex_app_list,
+            codex_account_read,
+            codex_account_login_start,
+            codex_account_logout,
+            codex_account_rate_limits_read,
             codex_mcp_list,
+            codex_mcp_login,
+            codex_mcp_reload,
             codex_wait_for_mcp_startup,
             pick_image_file,
             pick_mention_file,
@@ -834,15 +947,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-
-
-
-
-
-
-
-
 
 
 

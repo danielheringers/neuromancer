@@ -22,6 +22,7 @@ import {
   ShieldOff,
   Power,
   ChevronsUpDown,
+  AppWindow,
 } from "lucide-react"
 import { useMemo, useState } from "react"
 import {
@@ -80,6 +81,14 @@ const statusLabel = {
   modified: "M",
   added: "A",
   deleted: "D",
+}
+
+function authModeSummary(mode: AliciaState["account"]["authMode"]): string {
+  if (mode === "chatgpt") return "chatgpt"
+  if (mode === "api_key") return "api-key"
+  if (mode === "chatgpt_auth_tokens") return "tokens"
+  if (mode === "none") return "logged-out"
+  return "unknown"
 }
 
 function resolveSessionEpochSeconds(session: Session): number | null {
@@ -365,6 +374,21 @@ export function Sidebar({
           <span className="text-[10px] text-muted-foreground/40">({totalTools} tools)</span>
           <ChevronRight className="w-3 h-3 text-muted-foreground/30 group-hover:text-muted-foreground transition-colors" />
         </button>
+
+        <button
+          onClick={() => onOpenPanel("apps")}
+          className="flex items-center gap-2 px-2 py-1.5 rounded text-left w-full transition-colors hover:bg-[#b9bcc01c] group"
+        >
+          <AppWindow className="w-3.5 h-3.5 text-terminal-cyan" />
+          <div className="flex-1 min-w-0">
+            <span className="text-xs text-muted-foreground">Apps/Auth</span>
+          </div>
+          <span className="text-[10px] text-terminal-fg/70 tabular-nums">{state.apps.length}</span>
+          <span className="text-[10px] text-muted-foreground/40 truncate max-w-[80px]">
+            {authModeSummary(state.account.authMode)}
+          </span>
+          <ChevronRight className="w-3 h-3 text-muted-foreground/30 group-hover:text-muted-foreground transition-colors" />
+        </button>
       </div>
 
       <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
@@ -565,6 +589,7 @@ export function Sidebar({
     </div>
   )
 }
+
 
 
 

@@ -2,6 +2,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
 import type {
   CodexRuntimeEvent,
+  CodexRuntimeTimelineEvent,
   CodexStructuredEventPayload,
   LifecycleEventPayload,
   StreamEventPayload,
@@ -43,13 +44,37 @@ function normalizeLifecyclePayload(payload: unknown): LifecycleEventPayload {
   }
 }
 
+function normalizeTimelineEventEnvelope(payload: unknown): CodexRuntimeTimelineEvent {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      type: '__invalid__',
+      reason: 'invalid-envelope',
+      raw: payload,
+    }
+  }
+
+  const source = payload as Record<string, unknown>
+  const rawType = source.type
+  if (typeof rawType !== 'string' || rawType.trim().length === 0) {
+    return {
+      type: '__invalid__',
+      reason: 'missing-type',
+      raw: payload,
+    }
+  }
+
+  return {
+    ...source,
+    type: rawType.trim(),
+  } as CodexRuntimeTimelineEvent
+}
+
 function normalizeStructuredEventPayload(payload: unknown): CodexStructuredEventPayload {
   const source = (payload ?? {}) as Record<string, unknown>
-  const event = (source.event ?? {}) as Record<string, unknown>
   return {
     sessionId: asNumber(source.sessionId ?? source.session_id) ?? 0,
     seq: asNumber(source.seq) ?? 0,
-    event,
+    event: normalizeTimelineEventEnvelope(source.event),
   }
 }
 

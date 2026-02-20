@@ -21,15 +21,29 @@ import type {
   CodexThreadUnarchiveResponse,
   CodexTurnInterruptRequest,
   CodexTurnInterruptResponse,
+  CodexReviewStartRequest,
+  CodexReviewStartResponse,
   CodexTurnRunRequest,
   CodexTurnRunResponse,
   CodexTurnSteerRequest,
   CodexTurnSteerResponse,
+  McpLoginRequest,
+  McpLoginResponse,
+  McpReloadResponse,
   McpServerListResponse,
   McpStartupWarmupResponse,
+  AppListRequest,
+  AppListResponse,
+  AccountReadRequest,
+  AccountReadResponse,
+  AccountLoginStartRequest,
+  AccountLoginStartResponse,
+  AccountLogoutResponse,
+  AccountRateLimitsReadResponse,
   RunCodexCommandResponse,
   RuntimeCodexConfig,
   RuntimeStatusResponse,
+  RuntimeCapabilitiesResponse,
   StartCodexSessionConfig,
   StartCodexSessionResponse,
   TerminalCreateRequest,
@@ -38,6 +52,10 @@ import type {
 
 export async function codexRuntimeStatus(): Promise<RuntimeStatusResponse> {
   return invoke<RuntimeStatusResponse>('codex_runtime_status')
+}
+
+export async function codexRuntimeCapabilities(): Promise<RuntimeCapabilitiesResponse> {
+  return invoke<RuntimeCapabilitiesResponse>('codex_runtime_capabilities')
 }
 
 export async function loadCodexDefaultConfig(): Promise<RuntimeCodexConfig> {
@@ -80,6 +98,11 @@ export async function codexTurnInterrupt(
   request: CodexTurnInterruptRequest,
 ): Promise<CodexTurnInterruptResponse> {
   return invoke<CodexTurnInterruptResponse>('codex_turn_interrupt', { request })
+}
+export async function codexReviewStart(
+  request: CodexReviewStartRequest,
+): Promise<CodexReviewStartResponse> {
+  return invoke<CodexReviewStartResponse>('codex_review_start', { request })
 }
 
 export async function codexThreadOpen(
@@ -179,6 +202,41 @@ export async function codexMcpList(): Promise<McpServerListResponse> {
   return invoke<McpServerListResponse>('codex_mcp_list')
 }
 
+export async function codexAppList(
+  request?: AppListRequest,
+): Promise<AppListResponse> {
+  return invoke<AppListResponse>('codex_app_list', { request })
+}
+
+export async function codexAccountRead(
+  request?: AccountReadRequest,
+): Promise<AccountReadResponse> {
+  return invoke<AccountReadResponse>('codex_account_read', { request })
+}
+
+export async function codexAccountLoginStart(
+  request: AccountLoginStartRequest,
+): Promise<AccountLoginStartResponse> {
+  return invoke<AccountLoginStartResponse>('codex_account_login_start', { request })
+}
+
+export async function codexAccountLogout(): Promise<AccountLogoutResponse> {
+  return invoke<AccountLogoutResponse>('codex_account_logout')
+}
+
+export async function codexAccountRateLimitsRead(): Promise<AccountRateLimitsReadResponse> {
+  return invoke<AccountRateLimitsReadResponse>('codex_account_rate_limits_read')
+}
+export async function codexMcpLogin(
+  request: McpLoginRequest,
+): Promise<McpLoginResponse> {
+  return invoke<McpLoginResponse>('codex_mcp_login', { request })
+}
+
+export async function codexMcpReload(): Promise<McpReloadResponse> {
+  return invoke<McpReloadResponse>('codex_mcp_reload')
+}
+
 export async function terminalCreate(
   request?: TerminalCreateRequest,
 ): Promise<TerminalCreateResponse> {
@@ -225,3 +283,8 @@ export async function codexHelpSnapshot(): Promise<CodexHelpSnapshot> {
 export async function resizeCodexPty(rows: number, cols: number): Promise<void> {
   await invoke('resize_codex_pty', { rows, cols })
 }
+
+
+
+
+

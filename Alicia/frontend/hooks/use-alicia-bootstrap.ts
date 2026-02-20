@@ -9,12 +9,14 @@ import { type AliciaState } from "@/lib/alicia-types"
 import {
   markAutoTerminalBootDone,
   normalizeConfig,
+  normalizeRuntimeMethodCapabilities,
   wasAutoTerminalBootDone,
   type Message,
   type RuntimeState,
 } from "@/lib/alicia-runtime-helpers"
 import {
   codexHelpSnapshot,
+  codexRuntimeCapabilities,
   codexRuntimeStatus,
   codexWaitForMcpStartup,
   isTauriRuntime,
@@ -52,7 +54,12 @@ interface UseAliciaBootstrapParams {
     activeThreadId?: string | null
     notifyOnError?: boolean
   }) => Promise<CodexThreadRecord[]>
-  refreshMcpServers: () => Promise<void>
+  refreshMcpServers: (options?: { throwOnError?: boolean }) => Promise<unknown>
+  refreshAppsAndAuth: (options?: {
+    throwOnError?: boolean
+    forceRefetch?: boolean
+    refreshToken?: boolean
+  }) => Promise<unknown>
   createTerminalTab: (cwd?: string) => Promise<boolean>
   onBootLog?: (message: string) => void
 }
@@ -75,6 +82,7 @@ export function useAliciaBootstrap({
   refreshModelsCatalog,
   refreshThreadList,
   refreshMcpServers,
+  refreshAppsAndAuth,
   createTerminalTab,
   onBootLog,
 }: UseAliciaBootstrapParams) {
@@ -138,6 +146,23 @@ export function useAliciaBootstrap({
         }))
         reportBoot(`Runtime connected (session: ${status.sessionId ?? "none"})`)
 
+        setBootStatus("Checking runtime capabilities...")
+        try {
+          const capabilities = await codexRuntimeCapabilities()
+          const normalizedCapabilities = normalizeRuntimeMethodCapabilities(
+            capabilities.methods,
+          )
+          if (mounted) {
+            setAliciaState((prev) => ({
+              ...prev,
+              runtimeCapabilities: normalizedCapabilities,
+            }))
+          }
+          reportBoot("Runtime capabilities synchronized")
+        } catch (error) {
+          reportBoot(`Runtime capabilities unavailable: ${String(error)}`)
+        }
+
         let hasActiveSession = status.sessionId != null
         if (status.sessionId != null) {
           setActiveSessionEntry(
@@ -179,6 +204,7 @@ export function useAliciaBootstrap({
         void codexHelpSnapshot()
         await refreshModelsCatalog(false)
         await refreshMcpServers()
+        await refreshAppsAndAuth()
         reportBoot("Runtime metadata synchronized")
 
         // Startup terminal must be idempotent: exactly one automatic tab.
@@ -211,3 +237,9 @@ export function useAliciaBootstrap({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 }
+
+
+
+
+
+

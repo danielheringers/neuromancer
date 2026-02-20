@@ -6,10 +6,12 @@ import {
   type SetStateAction,
 } from "react"
 
-import { type AliciaState } from "@/lib/alicia-types"
+import { type AliciaState, type McpServer } from "@/lib/alicia-types"
 import {
   isRuntimeCommandUnavailable,
+  isRuntimeMethodSupported,
   mapThreadRecordsToSessions,
+  markRuntimeMethodUnsupported,
   parseMcpListOutput,
   relativeNowLabel,
   writeModelsCache,
@@ -18,6 +20,9 @@ import {
   type TerminalTab,
 } from "@/lib/alicia-runtime-helpers"
 import {
+  codexAppList,
+  codexAccountRateLimitsRead,
+  codexAccountRead,
   codexBridgeStart,
   codexBridgeStop,
   codexModelsList,
@@ -29,6 +34,7 @@ import {
   terminalResize,
   type CodexModel,
   type CodexThreadRecord,
+  type RuntimeMethod,
 } from "@/lib/tauri-bridge"
 
 interface UseAliciaRuntimeCoreParams {
@@ -56,6 +62,29 @@ interface UseAliciaRuntimeCoreParams {
 interface RefreshThreadListOptions {
   activeThreadId?: string | null
   notifyOnError?: boolean
+}
+
+interface RefreshMcpServersOptions {
+  throwOnError?: boolean
+}
+
+interface RefreshAppsAndAuthOptions {
+  throwOnError?: boolean
+  forceRefetch?: boolean
+  refreshToken?: boolean
+}
+
+function normalizeAccountMode(value: unknown): AliciaState["account"]["authMode"] {
+  if (
+    value === "none" ||
+    value === "api_key" ||
+    value === "chatgpt" ||
+    value === "chatgpt_auth_tokens" ||
+    value === "unknown"
+  ) {
+    return value
+  }
+  return "unknown"
 }
 
 export function useAliciaRuntimeCore({
@@ -114,11 +143,40 @@ export function useAliciaRuntimeCore({
     [setAliciaState],
   )
 
+  const supportsRuntimeMethod = useCallback(
+    (method: RuntimeMethod): boolean =>
+      isRuntimeMethodSupported(aliciaState.runtimeCapabilities, method),
+    [aliciaState.runtimeCapabilities],
+  )
+
+  const markUnsupportedRuntimeMethod = useCallback(
+    (method: RuntimeMethod) => {
+      setAliciaState((previous) => {
+        const nextCapabilities = markRuntimeMethodUnsupported(
+          previous.runtimeCapabilities,
+          method,
+        )
+        if (nextCapabilities === previous.runtimeCapabilities) {
+          return previous
+        }
+        return {
+          ...previous,
+          runtimeCapabilities: nextCapabilities,
+        }
+      })
+    },
+    [setAliciaState],
+  )
+
   const refreshThreadList = useCallback(
     async (
       options: RefreshThreadListOptions = {},
     ): Promise<CodexThreadRecord[]> => {
       if (!runtime.connected) {
+        return []
+      }
+
+      if (!supportsRuntimeMethod("thread.list")) {
         return []
       }
 
@@ -149,7 +207,9 @@ export function useAliciaRuntimeCore({
 
         return records
       } catch (error) {
-        if (options.notifyOnError && !isRuntimeCommandUnavailable(error)) {
+        if (isRuntimeCommandUnavailable(error)) {
+          markUnsupportedRuntimeMethod("thread.list")
+        } else if (options.notifyOnError) {
           addMessage("system", `[threads] refresh failed: ${String(error)}`)
         }
         return []
@@ -158,29 +218,189 @@ export function useAliciaRuntimeCore({
     [
       addMessage,
       aliciaState.model,
+      markUnsupportedRuntimeMethod,
       runtime.connected,
       setAliciaState,
+      supportsRuntimeMethod,
       threadIdRef,
     ],
   )
 
-  const refreshMcpServers = useCallback(async () => {
-    try {
-      const result = await codexMcpList()
-      setAliciaState((previous) => ({ ...previous, mcpServers: result.data }))
-      return
-    } catch {
-      // fall back to CLI output parsing when bridge listing is unavailable
-    }
+  const refreshMcpServers = useCallback(
+    async (
+      options: RefreshMcpServersOptions = {},
+    ): Promise<McpServer[]> => {
+      let lastError: unknown = null
+      let shouldUseCliFallback = !supportsRuntimeMethod("mcp.list")
 
-    try {
-      const result = await runCodexCommand(["mcp", "list"])
-      const parsed = parseMcpListOutput(result.stdout)
-      setAliciaState((previous) => ({ ...previous, mcpServers: parsed }))
-    } catch {
-      // best effort
-    }
-  }, [setAliciaState])
+      if (!shouldUseCliFallback) {
+        try {
+          const result = await codexMcpList()
+          const parsed = Array.isArray(result.data) ? result.data : []
+          setAliciaState((previous) => ({ ...previous, mcpServers: parsed }))
+          return parsed
+        } catch (error) {
+          if (isRuntimeCommandUnavailable(error)) {
+            markUnsupportedRuntimeMethod("mcp.list")
+            shouldUseCliFallback = true
+          } else {
+            lastError = error
+          }
+        }
+      }
+
+      if (shouldUseCliFallback) {
+        try {
+          const result = await runCodexCommand(["mcp", "list", "--json"])
+          const parsed = parseMcpListOutput(result.stdout)
+          setAliciaState((previous) => ({ ...previous, mcpServers: parsed }))
+          return parsed
+        } catch (error) {
+          lastError = error
+        }
+      }
+
+      if (options.throwOnError) {
+        throw lastError ?? new Error("failed to refresh MCP server list")
+      }
+
+      return []
+    },
+    [markUnsupportedRuntimeMethod, setAliciaState, supportsRuntimeMethod],
+  )
+
+  const refreshAppsAndAuth = useCallback(
+    async (options: RefreshAppsAndAuthOptions = {}) => {
+      if (!runtime.connected) {
+        if (options.throwOnError) {
+          throw new Error("runtime disconnected; cannot refresh apps/auth")
+        }
+        return null
+      }
+
+      let lastError: unknown = null
+      let apps = aliciaState.apps
+      let account = aliciaState.account
+      let rateLimits = aliciaState.rateLimits
+      let rateLimitsByLimitId = aliciaState.rateLimitsByLimitId
+
+      if (supportsRuntimeMethod("app.list")) {
+        try {
+          const appsResponse = await codexAppList({
+            cursor: null,
+            limit: 100,
+            threadId: threadIdRef.current,
+            forceRefetch: Boolean(options.forceRefetch),
+          })
+          apps = Array.isArray(appsResponse.data) ? appsResponse.data : []
+        } catch (error) {
+          if (isRuntimeCommandUnavailable(error)) {
+            markUnsupportedRuntimeMethod("app.list")
+            apps = []
+          } else {
+            lastError = error
+          }
+        }
+      } else {
+        apps = []
+      }
+
+      if (supportsRuntimeMethod("account.read")) {
+        try {
+          const accountResponse = await codexAccountRead({
+            refreshToken: Boolean(options.refreshToken),
+          })
+          const authMode = normalizeAccountMode(accountResponse.authMode)
+
+          const profile = accountResponse.account
+            ? {
+              type: normalizeAccountMode(accountResponse.account.accountType),
+              email: accountResponse.account.email ?? null,
+              planType: accountResponse.account.planType ?? null,
+            }
+            : null
+
+          account = {
+            authMode,
+            requiresOpenaiAuth: Boolean(accountResponse.requiresOpenaiAuth),
+            account:
+              profile && profile.type !== "none"
+                ? {
+                  type:
+                    profile.type === "api_key" ||
+                      profile.type === "chatgpt" ||
+                      profile.type === "chatgpt_auth_tokens" ||
+                      profile.type === "unknown"
+                      ? profile.type
+                      : "unknown",
+                  email: profile.email,
+                  planType: profile.planType,
+                }
+                : null,
+          }
+        } catch (error) {
+          if (isRuntimeCommandUnavailable(error)) {
+            markUnsupportedRuntimeMethod("account.read")
+          } else {
+            lastError = lastError ?? error
+          }
+        }
+      }
+
+      if (supportsRuntimeMethod("account.rate_limits.read")) {
+        try {
+          const rateLimitsResponse = await codexAccountRateLimitsRead()
+          rateLimits = rateLimitsResponse.rateLimits ?? null
+          rateLimitsByLimitId = rateLimitsResponse.rateLimitsByLimitId ?? {}
+        } catch (error) {
+          if (isRuntimeCommandUnavailable(error)) {
+            markUnsupportedRuntimeMethod("account.rate_limits.read")
+            rateLimits = null
+            rateLimitsByLimitId = {}
+          } else {
+            lastError = lastError ?? error
+          }
+        }
+      } else {
+        rateLimits = null
+        rateLimitsByLimitId = {}
+      }
+
+      setAliciaState((previous) => ({
+        ...previous,
+        apps,
+        account,
+        rateLimits,
+        rateLimitsByLimitId,
+      }))
+
+      if (lastError && options.throwOnError) {
+        throw lastError
+      }
+
+      if (lastError) {
+        return null
+      }
+
+      return {
+        apps,
+        account,
+        rateLimits,
+        rateLimitsByLimitId,
+      }
+    },
+    [
+      aliciaState.account,
+      aliciaState.apps,
+      aliciaState.rateLimits,
+      aliciaState.rateLimitsByLimitId,
+      markUnsupportedRuntimeMethod,
+      runtime.connected,
+      setAliciaState,
+      supportsRuntimeMethod,
+      threadIdRef,
+    ],
+  )
 
   const refreshModelsCatalog = useCallback(
     async (notifyOnError = false): Promise<CodexModel[]> => {
@@ -384,6 +604,7 @@ export function useAliciaRuntimeCore({
     setActiveSessionEntry,
     refreshThreadList,
     refreshMcpServers,
+    refreshAppsAndAuth,
     refreshModelsCatalog,
     openModelPanel,
     ensureBridgeSession,
@@ -392,3 +613,12 @@ export function useAliciaRuntimeCore({
     currentModelLabel,
   }
 }
+
+
+
+
+
+
+
+
+

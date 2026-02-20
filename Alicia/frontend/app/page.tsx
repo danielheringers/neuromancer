@@ -9,6 +9,7 @@ import { StatusBar } from "@/components/alicia/status-bar"
 import { ModelPicker } from "@/components/alicia/model-picker"
 import { PermissionsPanel } from "@/components/alicia/permissions-panel"
 import { McpPanel } from "@/components/alicia/mcp-panel"
+import { AppsPanel } from "@/components/alicia/apps-panel"
 import { SessionPicker } from "@/components/alicia/session-picker"
 import { TerminalPane } from "@/components/alicia/terminal-pane"
 import { type AliciaState } from "@/lib/alicia-types"
@@ -288,6 +289,7 @@ export default function AliciaTerminal() {
     setActiveSessionEntry,
     refreshThreadList,
     refreshMcpServers,
+    refreshAppsAndAuth,
     refreshModelsCatalog,
     openModelPanel,
     ensureBridgeSession,
@@ -376,6 +378,7 @@ export default function AliciaTerminal() {
     refreshModelsCatalog,
     refreshThreadList,
     refreshMcpServers,
+    refreshAppsAndAuth,
     createTerminalTab,
     onBootLog: appendBootLog,
   })
@@ -389,6 +392,7 @@ export default function AliciaTerminal() {
     sessionActionPending,
   } = useAliciaActions({
     addMessage,
+    aliciaState,
     ensureBridgeSession,
     pendingImages,
     pendingMentions,
@@ -403,6 +407,7 @@ export default function AliciaTerminal() {
     openModelPanel,
     openSessionPanel,
     refreshMcpServers,
+    refreshAppsAndAuth,
     refreshThreadList,
     setAliciaState,
     setRuntime,
@@ -498,6 +503,11 @@ export default function AliciaTerminal() {
               }
               if (panel === "sessions") {
                 void openSessionPanel("list")
+                return
+              }
+              if (panel === "apps") {
+                setAliciaState((prev) => ({ ...prev, activePanel: "apps" }))
+                void refreshAppsAndAuth({ throwOnError: false })
                 return
               }
               setAliciaState((prev) => ({ ...prev, activePanel: panel }))
@@ -605,6 +615,11 @@ export default function AliciaTerminal() {
             void openSessionPanel("list")
             return
           }
+          if (panel === "apps") {
+            setAliciaState((prev) => ({ ...prev, activePanel: "apps" }))
+            void refreshAppsAndAuth({ throwOnError: false })
+            return
+          }
           setAliciaState((prev) => ({ ...prev, activePanel: panel }))
         }}
       />
@@ -635,6 +650,17 @@ export default function AliciaTerminal() {
       {aliciaState.activePanel === "mcp" && (
         <McpPanel
           servers={aliciaState.mcpServers}
+          onRefresh={refreshMcpServers}
+          onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
+        />
+      )}
+      {aliciaState.activePanel === "apps" && (
+        <AppsPanel
+          apps={aliciaState.apps}
+          account={aliciaState.account}
+          rateLimits={aliciaState.rateLimits}
+          rateLimitsByLimitId={aliciaState.rateLimitsByLimitId}
+          onRefresh={refreshAppsAndAuth}
           onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
         />
       )}
@@ -658,5 +684,4 @@ export default function AliciaTerminal() {
     </div>
   )
 }
-
 

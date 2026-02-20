@@ -12,9 +12,10 @@ use crate::{
     CodexThreadForkRequest, CodexThreadForkResponse, CodexThreadListRequest,
     CodexThreadListResponse, CodexThreadOpenResponse, CodexThreadReadRequest,
     CodexThreadReadResponse, CodexThreadRollbackRequest, CodexThreadRollbackResponse,
-    CodexThreadUnarchiveRequest, CodexThreadUnarchiveResponse, CodexTurnInterruptRequest,
-    CodexTurnInterruptResponse, CodexTurnRunRequest, CodexTurnRunResponse,
-    CodexTurnSteerRequest, CodexTurnSteerResponse, RuntimeCodexConfig,
+    CodexReviewStartRequest, CodexReviewStartResponse, CodexThreadUnarchiveRequest,
+    CodexThreadUnarchiveResponse, CodexTurnInterruptRequest, CodexTurnInterruptResponse,
+    CodexTurnRunRequest, CodexTurnRunResponse, CodexTurnSteerRequest,
+    CodexTurnSteerResponse, RuntimeCodexConfig,
 };
 
 fn runtime_config_to_json(config: &RuntimeCodexConfig, binary: &str) -> Value {
@@ -221,6 +222,155 @@ pub(crate) async fn codex_turn_run_impl(
         return Err("output_schema must be a plain JSON object".to_string());
     }
     schedule_turn_run(app, state, request).await
+}
+
+async fn schedule_review_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CodexReviewStartRequest,
+) -> Result<CodexReviewStartResponse, String> {
+    let runtime_config = lock_runtime_config(state.inner())?.clone();
+    let CodexReviewStartRequest {
+        thread_id: requested_thread_id,
+        target,
+        delivery,
+    } = request;
+
+    let (session_id, pid, binary, cwd, initial_thread_id, stdin, pending, next_request_id) = {
+        let mut guard = lock_active_session(state.inner())?;
+        let active = guard
+            .as_mut()
+            .ok_or_else(|| "no active codex session".to_string())?;
+
+        if active.busy {
+            return Err("codex session is still processing the previous turn".to_string());
+        }
+
+        active.busy = true;
+
+        (
+            active.session_id,
+            active.pid,
+            active.binary.clone(),
+            active.cwd.clone(),
+            active.thread_id.clone(),
+            Arc::clone(&active.bridge.stdin),
+            Arc::clone(&active.bridge.pending),
+            Arc::clone(&active.bridge.next_request_id),
+        )
+    };
+
+    let response = CodexReviewStartResponse {
+        accepted: true,
+        session_id,
+        thread_id: initial_thread_id.clone(),
+        review_thread_id: initial_thread_id.clone(),
+    };
+
+    let app_for_task = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result: Result<String, String> = async {
+            let mut thread_id = requested_thread_id.or(initial_thread_id);
+            if thread_id
+                .as_ref()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+            {
+                let open_result = bridge_request(
+                    Arc::clone(&stdin),
+                    Arc::clone(&pending),
+                    Arc::clone(&next_request_id),
+                    "thread.open",
+                    json!({
+                        "workspace": cwd.to_string_lossy().to_string(),
+                        "runtimeConfig": runtime_config_to_json(&runtime_config, &binary),
+                    }),
+                )
+                .await?;
+                thread_id = open_result
+                    .get("threadId")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string());
+            }
+
+            let thread_id = thread_id.ok_or_else(|| "failed to establish thread id".to_string())?;
+            let mut review_params = serde_json::Map::new();
+            review_params.insert("threadId".to_string(), Value::String(thread_id.clone()));
+
+            if let Some(target) = target {
+                review_params.insert("target".to_string(), target);
+            } else {
+                review_params.insert("target".to_string(), json!({ "type": "uncommittedChanges" }));
+            }
+
+            if let Some(delivery) = delivery
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                review_params.insert("delivery".to_string(), Value::String(delivery));
+            }
+
+            let review_result = bridge_request(
+                Arc::clone(&stdin),
+                Arc::clone(&pending),
+                Arc::clone(&next_request_id),
+                "review.start",
+                Value::Object(review_params),
+            )
+            .await?;
+
+            let returned_thread_id = review_result
+                .get("reviewThreadId")
+                .or_else(|| review_result.get("threadId"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(&thread_id)
+                .to_string();
+            Ok(returned_thread_id)
+        }
+        .await;
+
+        match result {
+            Ok(returned_thread_id) => {
+                finish_session_turn(&app_for_task, session_id, Some(returned_thread_id));
+            }
+            Err(error) => {
+                emit_lifecycle(
+                    &app_for_task,
+                    "error",
+                    Some(session_id),
+                    pid,
+                    None,
+                    Some(error),
+                );
+                finish_session_turn(&app_for_task, session_id, None);
+            }
+        }
+    });
+
+    Ok(response)
+}
+
+pub(crate) async fn codex_review_start_impl(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CodexReviewStartRequest,
+) -> Result<CodexReviewStartResponse, String> {
+    if request
+        .target
+        .as_ref()
+        .is_some_and(|target| !target.is_object())
+    {
+        return Err("target must be a plain JSON object".to_string());
+    }
+
+    if let Some(delivery) = request.delivery.as_ref() {
+        let normalized = delivery.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && normalized != "inline" && normalized != "detached" {
+            return Err("delivery must be `inline` or `detached`".to_string());
+        }
+    }
+
+    schedule_review_start(app, state, request).await
 }
 
 pub(crate) async fn codex_thread_open_impl(

@@ -13,7 +13,9 @@ import {
 } from "@/lib/alicia-types"
 import {
   isRuntimeCommandUnavailable,
+  isRuntimeMethodSupported,
   mapThreadTurnsToMessages,
+  markRuntimeMethodUnsupported,
   type ApprovalRequestState,
   type Message,
   type RuntimeState,
@@ -21,22 +23,33 @@ import {
   type TurnPlanState,
 } from "@/lib/alicia-runtime-helpers"
 import {
+  codexAccountLogout,
   codexBridgeStop,
+  codexConfigGet,
   codexConfigSet,
+  codexReviewStart,
+  codexThreadArchive,
+  codexThreadCompactStart,
   codexThreadFork,
   codexThreadOpen,
   codexThreadRead,
+  codexThreadRollback,
+  codexThreadUnarchive,
   codexTurnRun,
   runCodexCommand,
   sendCodexInput,
   type CodexInputItem,
   type CodexModel,
   type CodexThreadRecord,
+  type ReviewDelivery,
+  type ReviewTarget,
   type RuntimeCodexConfig,
+  type RuntimeMethod,
 } from "@/lib/tauri-bridge"
 
 interface UseAliciaActionsParams {
   addMessage: (type: Message["type"], content: string) => void
+  aliciaState: AliciaState
   ensureBridgeSession: (forceNew?: boolean) => Promise<boolean>
   pendingImages: string[]
   pendingMentions: string[]
@@ -50,7 +63,12 @@ interface UseAliciaActionsParams {
   threadIdRef: MutableRefObject<string | null>
   openModelPanel: (notifyOnError?: boolean) => Promise<void>
   openSessionPanel: (mode: "resume" | "fork" | "list") => void
-  refreshMcpServers: () => Promise<void>
+  refreshMcpServers: (options?: { throwOnError?: boolean }) => Promise<unknown>
+  refreshAppsAndAuth: (options?: {
+    throwOnError?: boolean
+    forceRefetch?: boolean
+    refreshToken?: boolean
+  }) => Promise<unknown>
   refreshThreadList: (options?: {
     activeThreadId?: string | null
     notifyOnError?: boolean
@@ -61,8 +79,112 @@ interface UseAliciaActionsParams {
   availableModels: CodexModel[]
 }
 
+interface ParsedSlashCommand {
+  name: string
+  args: string
+}
+
+function parseSlashCommandInput(input: string): ParsedSlashCommand {
+  const trimmed = input.trim()
+  const [name = "", ...rest] = trimmed.split(/\s+/)
+  return {
+    name: name.toLowerCase(),
+    args: rest.join(" ").trim(),
+  }
+}
+
+interface ParsedReviewSlash {
+  target: ReviewTarget
+  delivery?: ReviewDelivery | null
+}
+
+function parseReviewSlashArgs(argsRaw: string): ParsedReviewSlash {
+  const tokens = argsRaw
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0)
+
+  let delivery: ReviewDelivery | null | undefined
+  const normalizedTokens: string[] = []
+
+  for (const token of tokens) {
+    const lowered = token.toLowerCase()
+    if (lowered === "--detached") {
+      delivery = "detached"
+      continue
+    }
+    if (lowered === "--inline") {
+      delivery = "inline"
+      continue
+    }
+    normalizedTokens.push(token)
+  }
+
+  const args = normalizedTokens.join(" ").trim()
+  if (!args) {
+    return {
+      target: { type: "uncommittedChanges" },
+      delivery,
+    }
+  }
+
+  const mode = normalizedTokens[0]?.toLowerCase() ?? ""
+  const rest = normalizedTokens.slice(1)
+
+  if (mode === "uncommitted" || mode === "changes" || mode === "diff") {
+    return {
+      target: { type: "uncommittedChanges" },
+      delivery,
+    }
+  }
+
+  if (mode === "base" || mode === "branch") {
+    const branch = rest[0]?.trim() ?? ""
+    if (!branch) {
+      throw new Error("usage: /review base <branch>")
+    }
+    return {
+      target: { type: "baseBranch", branch },
+      delivery,
+    }
+  }
+
+  if (mode === "commit") {
+    const sha = rest[0]?.trim() ?? ""
+    if (!sha) {
+      throw new Error("usage: /review commit <sha> [title]")
+    }
+    const title = rest.slice(1).join(" ").trim()
+    return {
+      target: {
+        type: "commit",
+        sha,
+        title: title.length > 0 ? title : null,
+      },
+      delivery,
+    }
+  }
+
+  if (mode === "custom") {
+    const instructions = rest.join(" ").trim()
+    if (!instructions) {
+      throw new Error("usage: /review custom <instructions>")
+    }
+    return {
+      target: { type: "custom", instructions },
+      delivery,
+    }
+  }
+
+  return {
+    target: { type: "custom", instructions: args },
+    delivery,
+  }
+}
+
 export function useAliciaActions({
   addMessage,
+  aliciaState,
   ensureBridgeSession,
   pendingImages,
   pendingMentions,
@@ -77,6 +199,7 @@ export function useAliciaActions({
   openModelPanel,
   openSessionPanel,
   refreshMcpServers,
+  refreshAppsAndAuth,
   refreshThreadList,
   setAliciaState,
   setRuntime,
@@ -87,6 +210,25 @@ export function useAliciaActions({
     sessionId: string
     action: "resume" | "fork" | "switch"
   } | null>(null)
+
+  const supportsRuntimeMethod = useCallback(
+    (method: RuntimeMethod): boolean =>
+      isRuntimeMethodSupported(aliciaState.runtimeCapabilities, method),
+    [aliciaState.runtimeCapabilities],
+  )
+
+  const markUnsupportedRuntimeMethod = useCallback(
+    (method: RuntimeMethod) => {
+      setAliciaState((prev) => ({
+        ...prev,
+        runtimeCapabilities: markRuntimeMethodUnsupported(
+          prev.runtimeCapabilities,
+          method,
+        ),
+      }))
+    },
+    [setAliciaState],
+  )
   const handleSubmit = useCallback(
     async (value: string) => {
       const text = value.trim()
@@ -128,6 +270,7 @@ export function useAliciaActions({
     [
       addMessage,
       ensureBridgeSession,
+      markUnsupportedRuntimeMethod,
       pendingImages,
       pendingMentions,
       setPendingImages,
@@ -139,33 +282,46 @@ export function useAliciaActions({
 
   const handleSlashCommand = useCallback(
     async (command: string) => {
-      if (command === "/model" || command === "/models") {
+      const { name, args } = parseSlashCommandInput(command)
+
+      if (name === "/model" || name === "/models") {
         await openModelPanel(true)
         return
       }
-      if (command === "/permissions" || command === "/approvals") {
+      if (name === "/permissions" || name === "/approvals") {
+        try {
+          const config = await codexConfigGet()
+          runtimeConfigRef.current = config
+        } catch {
+          // best effort: panel can still open using local config snapshot
+        }
         setAliciaState((prev) => ({ ...prev, activePanel: "permissions" }))
         return
       }
-      if (command === "/mcp") {
+      if (name === "/mcp") {
         setAliciaState((prev) => ({ ...prev, activePanel: "mcp" }))
         await refreshMcpServers()
         return
       }
-      if (command === "/resume") {
+      if (name === "/apps") {
+        setAliciaState((prev) => ({ ...prev, activePanel: "apps" }))
+        await refreshAppsAndAuth({ throwOnError: false })
+        return
+      }
+      if (name === "/resume") {
         openSessionPanel("resume")
         return
       }
-      if (command === "/fork") {
+      if (name === "/fork") {
         openSessionPanel("fork")
         return
       }
-      if (command === "/new") {
+      if (name === "/new") {
         threadIdRef.current = null
         await ensureBridgeSession(true)
         return
       }
-      if (command === "/status") {
+      if (name === "/status") {
         if (!(await ensureBridgeSession(false))) {
           return
         }
@@ -176,7 +332,301 @@ export function useAliciaActions({
         }
         return
       }
-      if (command === "/quit" || command === "/exit") {
+      if (name === "/review") {
+        if (!(await ensureBridgeSession(false))) {
+          return
+        }
+
+        let parsedReview: ParsedReviewSlash
+        try {
+          parsedReview = parseReviewSlashArgs(args)
+        } catch (error) {
+          addMessage("system", `[review] ${String(error)}`)
+          return
+        }
+
+        if (!supportsRuntimeMethod("review.start")) {
+          await handleSubmit(command)
+          return
+        }
+
+        setIsThinking(true)
+        try {
+          const started = await codexReviewStart({
+            threadId: threadIdRef.current ?? undefined,
+            target: parsedReview.target,
+            delivery: parsedReview.delivery ?? undefined,
+          })
+
+          const nextThreadId =
+            (typeof started.reviewThreadId === "string" &&
+              started.reviewThreadId.trim()) ||
+            (typeof started.threadId === "string" && started.threadId.trim()) ||
+            threadIdRef.current
+
+          if (nextThreadId) {
+            threadIdRef.current = nextThreadId
+          }
+
+          void refreshThreadList({
+            activeThreadId: threadIdRef.current,
+            notifyOnError: false,
+          })
+        } catch (error) {
+          setIsThinking(false)
+          if (isRuntimeCommandUnavailable(error)) {
+            markUnsupportedRuntimeMethod("review.start")
+            await handleSubmit(command)
+            return
+          }
+          addMessage("system", `[review] failed: ${String(error)}`)
+        }
+        return
+      }
+      if (name === "/agent") {
+        if (!(await ensureBridgeSession(false))) {
+          return
+        }
+
+        const normalizedArgs = args.trim()
+        const argTokens = normalizedArgs
+          .split(/\s+/)
+          .map((token) => token.trim())
+          .filter((token) => token.length > 0)
+        const subcommand = argTokens[0]?.toLowerCase() ?? ""
+
+        const resolveTargetThreadId = (candidate?: string): string => {
+          const explicit = (candidate ?? "").trim()
+          if (explicit.length > 0) {
+            return explicit
+          }
+          return threadIdRef.current?.trim() ?? ""
+        }
+
+        if (subcommand === "resume") {
+          openSessionPanel("resume")
+          return
+        }
+        if (subcommand === "fork") {
+          openSessionPanel("fork")
+          return
+        }
+        if (subcommand === "list") {
+          openSessionPanel("list")
+          return
+        }
+
+        if (subcommand === "archive") {
+          const targetThreadId = resolveTargetThreadId(argTokens[1])
+          if (!targetThreadId) {
+            addMessage("system", "[agent] usage: /agent archive <thread-id>")
+            return
+          }
+
+          if (!supportsRuntimeMethod("thread.archive")) {
+            addMessage("system", "[agent] thread.archive not supported by runtime")
+            return
+          }
+
+          try {
+            await codexThreadArchive({ threadId: targetThreadId })
+            if ((threadIdRef.current?.trim() ?? "") === targetThreadId) {
+              threadIdRef.current = null
+            }
+            await refreshThreadList({
+              activeThreadId: threadIdRef.current,
+              notifyOnError: false,
+            })
+            addMessage("system", `[agent] archived thread ${targetThreadId}`)
+          } catch (error) {
+            if (isRuntimeCommandUnavailable(error)) {
+              markUnsupportedRuntimeMethod("thread.archive")
+              addMessage("system", "[agent] thread.archive not supported by runtime")
+            } else {
+              addMessage("system", `[agent] archive failed: ${String(error)}`)
+            }
+          }
+          return
+        }
+
+        if (subcommand === "unarchive") {
+          const targetThreadId = resolveTargetThreadId(argTokens[1])
+          if (!targetThreadId) {
+            addMessage("system", "[agent] usage: /agent unarchive <thread-id>")
+            return
+          }
+
+          if (!supportsRuntimeMethod("thread.unarchive")) {
+            addMessage("system", "[agent] thread.unarchive not supported by runtime")
+            return
+          }
+
+          try {
+            const unarchived = await codexThreadUnarchive({ threadId: targetThreadId })
+            const nextThreadId =
+              (typeof unarchived.thread?.codexThreadId === "string" &&
+                unarchived.thread.codexThreadId.trim()) ||
+              (typeof unarchived.thread?.id === "string" && unarchived.thread.id.trim()) ||
+              targetThreadId
+            threadIdRef.current = nextThreadId
+            await refreshThreadList({
+              activeThreadId: threadIdRef.current,
+              notifyOnError: false,
+            })
+            addMessage("system", `[agent] unarchived thread ${nextThreadId}`)
+          } catch (error) {
+            if (isRuntimeCommandUnavailable(error)) {
+              markUnsupportedRuntimeMethod("thread.unarchive")
+              addMessage("system", "[agent] thread.unarchive not supported by runtime")
+            } else {
+              addMessage("system", `[agent] unarchive failed: ${String(error)}`)
+            }
+          }
+          return
+        }
+
+        if (subcommand === "compact") {
+          const targetThreadId = resolveTargetThreadId(argTokens[1])
+          if (!targetThreadId) {
+            addMessage("system", "[agent] usage: /agent compact <thread-id>")
+            return
+          }
+
+          if (!supportsRuntimeMethod("thread.compact.start")) {
+            addMessage("system", "[agent] thread.compact.start not supported by runtime")
+            return
+          }
+
+          try {
+            await codexThreadCompactStart({ threadId: targetThreadId })
+            addMessage("system", `[agent] compact started for thread ${targetThreadId}`)
+          } catch (error) {
+            if (isRuntimeCommandUnavailable(error)) {
+              markUnsupportedRuntimeMethod("thread.compact.start")
+              addMessage("system", "[agent] thread.compact.start not supported by runtime")
+            } else {
+              addMessage("system", `[agent] compact failed: ${String(error)}`)
+            }
+          }
+          return
+        }
+
+        if (subcommand === "rollback") {
+          const rawTurns = argTokens[1] ?? ""
+          const parsedTurns = Number(rawTurns)
+          if (!Number.isInteger(parsedTurns) || parsedTurns <= 0) {
+            addMessage("system", "[agent] usage: /agent rollback <num-turns> [thread-id]")
+            return
+          }
+
+          const targetThreadId = resolveTargetThreadId(argTokens[2])
+          if (!targetThreadId) {
+            addMessage("system", "[agent] usage: /agent rollback <num-turns> <thread-id>")
+            return
+          }
+
+          if (!supportsRuntimeMethod("thread.rollback")) {
+            addMessage("system", "[agent] thread.rollback not supported by runtime")
+            return
+          }
+
+          try {
+            const rolledBack = await codexThreadRollback({
+              threadId: targetThreadId,
+              numTurns: parsedTurns,
+            })
+            const nextThreadId =
+              (typeof rolledBack.thread?.codexThreadId === "string" &&
+                rolledBack.thread.codexThreadId.trim()) ||
+              (typeof rolledBack.thread?.id === "string" && rolledBack.thread.id.trim()) ||
+              targetThreadId
+            threadIdRef.current = nextThreadId
+            await refreshThreadList({
+              activeThreadId: threadIdRef.current,
+              notifyOnError: false,
+            })
+            addMessage(
+              "system",
+              `[agent] rolled back ${parsedTurns} turn(s) on thread ${nextThreadId}`,
+            )
+          } catch (error) {
+            if (isRuntimeCommandUnavailable(error)) {
+              markUnsupportedRuntimeMethod("thread.rollback")
+              addMessage("system", "[agent] thread.rollback not supported by runtime")
+            } else {
+              addMessage("system", `[agent] rollback failed: ${String(error)}`)
+            }
+          }
+          return
+        }
+
+        const records = await refreshThreadList({
+          activeThreadId: threadIdRef.current,
+          notifyOnError: false,
+        })
+
+        const activeThreadId = threadIdRef.current?.trim() ?? ""
+        const activeRecord = records.find((record) => {
+          const recordId = typeof record.id === "string" ? record.id.trim() : ""
+          const codexThreadId =
+            typeof record.codexThreadId === "string"
+              ? record.codexThreadId.trim()
+              : ""
+          return (
+            activeThreadId.length > 0 &&
+            (recordId === activeThreadId || codexThreadId === activeThreadId)
+          )
+        })
+
+        const activeLabel =
+          activeRecord &&
+            typeof activeRecord.preview === "string" &&
+            activeRecord.preview.trim().length > 0
+            ? `${activeThreadId || activeRecord.id} - ${activeRecord.preview.trim()}`
+            : activeThreadId || activeRecord?.id || "none"
+
+        addMessage("system", `[agent] active=${activeLabel} total=${records.length}`)
+        return
+      }
+      if (name === "/logout") {
+        if (!(await ensureBridgeSession(false))) {
+          return
+        }
+
+        const logoutViaCli = async () => {
+          try {
+            const result = await runCodexCommand(["logout"])
+            if (!result.success) {
+              const failure = result.stderr.trim() || result.stdout.trim() || "logout failed"
+              throw new Error(failure)
+            }
+            addMessage("system", "[account] logged out via CLI")
+          } catch (fallbackError) {
+            addMessage("system", `[account] logout failed: ${String(fallbackError)}`)
+          }
+        }
+
+        if (!supportsRuntimeMethod("account.logout")) {
+          await logoutViaCli()
+          return
+        }
+
+        try {
+          await codexAccountLogout()
+          await refreshAppsAndAuth({ throwOnError: false, refreshToken: false })
+          addMessage("system", "[account] logged out")
+        } catch (error) {
+          if (!isRuntimeCommandUnavailable(error)) {
+            addMessage("system", `[account] logout failed: ${String(error)}`)
+            return
+          }
+
+          markUnsupportedRuntimeMethod("account.logout")
+          await logoutViaCli()
+        }
+        return
+      }
+      if (name === "/quit" || name === "/exit") {
         await codexBridgeStop()
         setRuntime((prev) => ({
           ...prev,
@@ -192,11 +642,16 @@ export function useAliciaActions({
       addMessage,
       ensureBridgeSession,
       handleSubmit,
+      markUnsupportedRuntimeMethod,
       openModelPanel,
       openSessionPanel,
       refreshMcpServers,
+      refreshAppsAndAuth,
+      refreshThreadList,
       setAliciaState,
+      setIsThinking,
       setRuntime,
+      supportsRuntimeMethod,
       threadIdRef,
     ],
   )
@@ -295,20 +750,27 @@ export function useAliciaActions({
         if (action === "fork") {
           let nextThreadId: string | null = null
 
-          try {
-            const forked = await codexThreadFork({
-              threadId: selectedThreadId,
-              persistExtendedHistory: false,
-            })
-            nextThreadId =
-              (typeof forked.thread?.id === "string" && forked.thread.id.trim()) ||
-              (typeof forked.threadId === "string" && forked.threadId.trim()) ||
-              null
-          } catch (error) {
-            if (!isRuntimeCommandUnavailable(error)) {
-              throw error
-            }
+          if (supportsRuntimeMethod("thread.fork")) {
+            try {
+              const forked = await codexThreadFork({
+                threadId: selectedThreadId,
+                persistExtendedHistory: false,
+              })
+              nextThreadId =
+                (typeof forked.thread?.id === "string" && forked.thread.id.trim()) ||
+                (typeof forked.threadId === "string" && forked.threadId.trim()) ||
+                null
+            } catch (error) {
+              if (!isRuntimeCommandUnavailable(error)) {
+                throw error
+              }
 
+              markUnsupportedRuntimeMethod("thread.fork")
+              await runCodexCommand(["fork", selectedThreadId])
+              const refreshed = await refreshThreadList({ notifyOnError: false })
+              nextThreadId = refreshed[0]?.id ?? null
+            }
+          } else {
             await runCodexCommand(["fork", selectedThreadId])
             const refreshed = await refreshThreadList({ notifyOnError: false })
             nextThreadId = refreshed[0]?.id ?? null
@@ -341,10 +803,11 @@ export function useAliciaActions({
             const includeTurnsUnavailable = message.includes(
               "includeTurns is unavailable before first user message",
             )
-            if (
-              !includeTurnsUnavailable &&
-              !isRuntimeCommandUnavailable(error)
-            ) {
+            if (includeTurnsUnavailable) {
+              // ignore empty history before first user turn
+            } else if (isRuntimeCommandUnavailable(error)) {
+              markUnsupportedRuntimeMethod("thread.read")
+            } else {
               historyError = `[session] history sync failed: ${message}`
             }
           }
@@ -373,6 +836,7 @@ export function useAliciaActions({
     [
       addMessage,
       ensureBridgeSession,
+      markUnsupportedRuntimeMethod,
       refreshThreadList,
       sessionActionPending,
       setAliciaState,
@@ -381,6 +845,7 @@ export function useAliciaActions({
       setPendingApprovals,
       setTurnDiff,
       setTurnPlan,
+      supportsRuntimeMethod,
       threadIdRef,
     ],
   )

@@ -46,6 +46,16 @@ export function createCodexEventHandler({
   streamedAgentTextRef,
   threadIdRef,
 }: CodexEventHandlerDeps) {
+  const reportedContractViolations = new Set<string>()
+
+  const reportContractViolation = (key: string, message: string) => {
+    if (reportedContractViolations.has(key)) {
+      return
+    }
+    reportedContractViolations.add(key)
+    addMessage("system", `[contract] ${message}`)
+  }
+
   return (event: CodexRuntimeEvent) => {
     if (event.type === "lifecycle") {
       if (event.payload.status === "error") {
@@ -81,7 +91,6 @@ export function createCodexEventHandler({
       return
     }
 
-    const payload = event.payload.event
     const seq = event.payload.seq
     if (seq > 0) {
       const seen = seenEventSeqRef.current
@@ -97,7 +106,37 @@ export function createCodexEventHandler({
       }
     }
 
-    const eventType = String(payload.type ?? "")
+    const rawPayload = event.payload.event
+    if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
+      reportContractViolation(
+        "structured-event-envelope",
+        "received runtime event without a valid object envelope",
+      )
+      return
+    }
+
+    const payload = rawPayload as Record<string, unknown>
+    const rawEventType = payload.type
+    if (typeof rawEventType !== "string" || rawEventType.trim().length === 0) {
+      reportContractViolation(
+        "structured-event-type",
+        "received runtime event without a valid type",
+      )
+      return
+    }
+
+    const eventType = rawEventType.trim()
+    if (eventType === "__invalid__") {
+      const reason =
+        typeof payload.reason === "string" && payload.reason.trim().length > 0
+          ? payload.reason.trim()
+          : "invalid-envelope"
+      reportContractViolation(
+        `structured-event-${reason}`,
+        `received runtime event with invalid envelope (${reason})`,
+      )
+      return
+    }
     if (eventType === "thread.started") {
       const codexThreadId = String(payload.thread_id ?? "")
       if (codexThreadId.trim().length > 0) {
@@ -124,6 +163,30 @@ export function createCodexEventHandler({
       streamedAgentTextRef.current.clear()
       const error = payload.error as Record<string, unknown> | undefined
       addMessage("system", `[turn failed] ${String(error?.message ?? "unknown")}`)
+      return
+    }
+
+    if (eventType === "mcp.oauth_login.completed") {
+      const name = String(payload.name ?? "").trim()
+      const success = Boolean(payload.success)
+      const error =
+        typeof payload.error === "string" && payload.error.trim().length > 0
+          ? payload.error.trim()
+          : null
+
+      if (success) {
+        addMessage(
+          "system",
+          name ? `[mcp] oauth login completed for ${name}` : "[mcp] oauth login completed",
+        )
+      } else {
+        addMessage(
+          "system",
+          name
+            ? `[mcp] oauth login failed for ${name}: ${error ?? "unknown error"}`
+            : `[mcp] oauth login failed: ${error ?? "unknown error"}`,
+        )
+      }
       return
     }
 
@@ -268,7 +331,11 @@ export function createCodexEventHandler({
         return
       }
 
-      if (eventType !== "item.completed") {
+      const shouldRenderOnStart =
+        eventType === "item.started" &&
+        (itemType === "entered_review_mode" || itemType === "enteredReviewMode")
+
+      if (eventType !== "item.completed" && !shouldRenderOnStart) {
         return
       }
 
@@ -315,3 +382,5 @@ export function createTerminalEventHandler<TWriter extends TerminalOutputWriter>
     )
   }
 }
+
+

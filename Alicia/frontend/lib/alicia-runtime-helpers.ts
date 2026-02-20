@@ -5,10 +5,13 @@ import {
   type Session,
 } from "@/lib/alicia-types"
 import {
+  RUNTIME_METHODS,
   type CodexModel,
   type CodexThreadRecord,
   type CodexThreadTurn,
   type RuntimeCodexConfig,
+  type RuntimeMethod,
+  type RuntimeMethodCapabilities,
 } from "@/lib/tauri-bridge"
 import {
   createAgentSpawnerPayloadFromCollabItem,
@@ -80,13 +83,91 @@ export interface TerminalTab {
   title: string
   alive: boolean
 }
+function syncAccountRateMethodCapabilities(
+  capabilities: RuntimeMethodCapabilities,
+): RuntimeMethodCapabilities {
+  const accountRateSupported =
+    capabilities["account.rate_limits.read"] !== false &&
+    capabilities["account.rateLimits.read"] !== false
+
+  if (
+    capabilities["account.rate_limits.read"] === accountRateSupported &&
+    capabilities["account.rateLimits.read"] === accountRateSupported
+  ) {
+    return capabilities
+  }
+
+  return {
+    ...capabilities,
+    "account.rate_limits.read": accountRateSupported,
+    "account.rateLimits.read": accountRateSupported,
+  }
+}
+
+export function createDefaultRuntimeMethodCapabilities(): RuntimeMethodCapabilities {
+  return Object.fromEntries(
+    RUNTIME_METHODS.map((method) => [method, true]),
+  ) as RuntimeMethodCapabilities
+}
+
+export function normalizeRuntimeMethodCapabilities(
+  value: unknown,
+  fallback: RuntimeMethodCapabilities = createDefaultRuntimeMethodCapabilities(),
+): RuntimeMethodCapabilities {
+  const base: RuntimeMethodCapabilities = { ...fallback }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return syncAccountRateMethodCapabilities(base)
+  }
+
+  const record = value as Record<string, unknown>
+  for (const method of RUNTIME_METHODS) {
+    if (typeof record[method] === "boolean") {
+      base[method] = record[method] as boolean
+    }
+  }
+
+  return syncAccountRateMethodCapabilities(base)
+}
+
+export function isRuntimeMethodSupported(
+  capabilities: RuntimeMethodCapabilities,
+  method: RuntimeMethod,
+): boolean {
+  return capabilities[method] !== false
+}
+
+export function markRuntimeMethodUnsupported(
+  capabilities: RuntimeMethodCapabilities,
+  method: RuntimeMethod,
+): RuntimeMethodCapabilities {
+  if (capabilities[method] === false) {
+    return capabilities
+  }
+
+  return normalizeRuntimeMethodCapabilities(
+    {
+      ...capabilities,
+      [method]: false,
+    },
+    capabilities,
+  )
+}
 
 export const INITIAL_ALICIA_STATE: AliciaState = {
   model: "default",
   reasoningEffort: "medium",
   approvalPreset: "auto",
   sandboxMode: "read-only",
+  runtimeCapabilities: createDefaultRuntimeMethodCapabilities(),
   mcpServers: [],
+  apps: [],
+  account: {
+    authMode: "unknown",
+    requiresOpenaiAuth: false,
+    account: null,
+  },
+  rateLimits: null,
+  rateLimitsByLimitId: {},
   sessions: [],
   fileChanges: [],
   activePanel: null,
@@ -403,6 +484,100 @@ export function parseMcpListOutput(output: string): McpServer[] {
     return count === 0 ? baseId : `${baseId}-${count + 1}`
   }
 
+  const normalizeAuthStatus = (
+    raw: unknown,
+  ): McpServer["authStatus"] => {
+    const value = String(raw ?? "").trim()
+    if (value === "notLoggedIn" || value === "not_logged_in") {
+      return "not_logged_in"
+    }
+    if (value === "bearerToken" || value === "bearer_token") {
+      return "bearer_token"
+    }
+    if (value === "oAuth" || value === "oauth" || value === "o_auth") {
+      return "oauth"
+    }
+    return "unsupported"
+  }
+
+  const statusFromAuth = (
+    authStatus: McpServer["authStatus"],
+  ): McpServer["status"] => (authStatus === "not_logged_in" ? "disconnected" : "connected")
+
+  const reasonFromAuth = (
+    authStatus: McpServer["authStatus"],
+  ): string | null => {
+    if (authStatus === "not_logged_in") {
+      return "OAuth required"
+    }
+    if (authStatus === "bearer_token") {
+      return "Using bearer token auth"
+    }
+    if (authStatus === "oauth") {
+      return "OAuth connected"
+    }
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(output) as unknown
+    if (Array.isArray(parsed)) {
+      const mapped = parsed
+        .map((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null
+          }
+
+          const record = entry as Record<string, unknown>
+          const name =
+            typeof record.name === "string" ? record.name.trim() : ""
+          if (!name) {
+            return null
+          }
+
+          const transportConfig =
+            record.transport &&
+            typeof record.transport === "object" &&
+            !Array.isArray(record.transport)
+              ? (record.transport as Record<string, unknown>)
+              : null
+
+          const transportType = String(transportConfig?.type ?? "stdio").trim().toLowerCase()
+          const transport: McpServer["transport"] =
+            transportType === "sse"
+              ? "sse"
+              : transportType === "streamable_http" || transportType === "streamable-http"
+                ? "streamable-http"
+                : "stdio"
+
+          const authStatus = normalizeAuthStatus(record.auth_status ?? record.authStatus)
+
+          const statusReason = reasonFromAuth(authStatus)
+          const url =
+            typeof transportConfig?.url === "string" && transportConfig.url.trim().length > 0
+              ? transportConfig.url.trim()
+              : undefined
+
+          return {
+            id: makeUniqueId(name),
+            name,
+            transport,
+            status: statusFromAuth(authStatus),
+            statusReason,
+            authStatus,
+            tools: [],
+            url,
+          } as McpServer
+        })
+        .filter((entry): entry is McpServer => entry !== null)
+
+      mapped.sort((a, b) => a.name.localeCompare(b.name))
+      return mapped
+    }
+  } catch {
+    // fall through to plain-text parsing
+  }
+
   return output
     .split(/\r?\n/)
     .map((line) => stripAnsi(line).trim())
@@ -427,10 +602,11 @@ export function parseMcpListOutput(output: string): McpServer[] {
         status,
         transport: /sse/i.test(line) ? "sse" : "stdio",
         tools: [],
+        authStatus: "unsupported",
+        statusReason: null,
       }
     })
 }
-
 export function normalizeConfig(config: RuntimeCodexConfig) {
   return {
     model: config.model.trim() || "default",
@@ -499,6 +675,17 @@ export function formatStructuredItem(
   if (itemType === "reasoning") {
     return `[reasoning]\n${String(item.text ?? "")}`
   }
+
+  if (itemType === "entered_review_mode" || itemType === "enteredReviewMode") {
+    const review = String(item.review ?? "").trim()
+    return review ? `[review] started: ${review}` : "[review] started"
+  }
+
+  if (itemType === "exited_review_mode" || itemType === "exitedReviewMode") {
+    const review = String(item.review ?? "").trim()
+    return review ? `[review] completed\n${review}` : "[review] completed"
+  }
+
   if (itemType === "error") {
     return `[error] ${String(item.message ?? "unknown")}`
   }
@@ -638,6 +825,7 @@ export function mergeTerminalBuffer(previous: string, chunk: string): string {
   const max = 400_000
   return next.length <= max ? next : next.slice(next.length - max)
 }
+
 
 
 
