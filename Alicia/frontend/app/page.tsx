@@ -16,6 +16,7 @@ import { type AliciaState } from "@/lib/alicia-types"
 import {
   codexApprovalRespond,
   codexBridgeStop,
+  codexUserInputRespond,
   isTauriRuntime,
   pickImageFile,
   pickMentionFile,
@@ -27,6 +28,7 @@ import {
 } from "@/lib/tauri-bridge"
 import {
   INITIAL_ALICIA_STATE,
+  mapDiffFilesToFileChanges,
   parseUnifiedDiffFiles,
   type ApprovalRequestState,
   type Message,
@@ -36,6 +38,7 @@ import {
   timestampNow,
   type TurnDiffState,
   type TurnPlanState,
+  type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
 import {
   ResizableHandle,
@@ -70,6 +73,7 @@ export default function AliciaTerminal() {
   const [messages, setMessages] = useState<Message[]>([])
   const [isThinking, setIsThinking] = useState(false)
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequestState[]>([])
+  const [pendingUserInput, setPendingUserInput] = useState<UserInputRequestState | null>(null)
   const [turnDiff, setTurnDiff] = useState<TurnDiffState | null>(null)
   const [turnPlan, setTurnPlan] = useState<TurnPlanState | null>(null)
   const [pendingImages, setPendingImages] = useState<string[]>([])
@@ -196,6 +200,13 @@ export default function AliciaTerminal() {
     () => parseUnifiedDiffFiles(turnDiff?.diff ?? ""),
     [turnDiff],
   )
+
+  useEffect(() => {
+    setAliciaState((previous) => ({
+      ...previous,
+      fileChanges: mapDiffFilesToFileChanges(turnDiffFiles),
+    }))
+  }, [turnDiffFiles])
 
   const statusSignals = useMemo(() => {
     let usage: UsageStats | null = null
@@ -340,6 +351,7 @@ export default function AliciaTerminal() {
         setRuntime,
         setIsThinking,
         setPendingApprovals,
+        setPendingUserInput,
         setTurnDiff,
         setTurnPlan,
         seenEventSeqRef,
@@ -400,6 +412,7 @@ export default function AliciaTerminal() {
     setPendingMentions,
     setMessages,
     setPendingApprovals,
+    setPendingUserInput,
     setTurnDiff,
     setTurnPlan,
     setIsThinking,
@@ -460,6 +473,31 @@ export default function AliciaTerminal() {
     [addMessage],
   )
 
+  const handleUserInputDecision = useCallback(
+    async (response: {
+      actionId: string
+      decision: "submit" | "cancel"
+      answers?: Record<string, { answers: string[] }>
+    }) => {
+      try {
+        await codexUserInputRespond({
+          actionId: response.actionId,
+          decision: response.decision,
+          answers: response.answers,
+        })
+        setPendingUserInput((previous) => {
+          if (!previous || previous.actionId === response.actionId) {
+            return null
+          }
+          return previous
+        })
+      } catch (error) {
+        addMessage("system", `[user input] failed: ${String(error)}`)
+      }
+    },
+    [addMessage],
+  )
+
   if (initializing) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-background p-4">
@@ -515,6 +553,7 @@ export default function AliciaTerminal() {
             onStartSession={() => {
               threadIdRef.current = null
               setPendingApprovals([])
+              setPendingUserInput(null)
               setTurnDiff(null)
               setTurnPlan(null)
               void ensureBridgeSession(true)
@@ -522,6 +561,7 @@ export default function AliciaTerminal() {
             onStopSession={() => {
               void codexBridgeStop()
               setPendingApprovals([])
+              setPendingUserInput(null)
               setTurnDiff(null)
               setTurnPlan(null)
               setRuntime((prev) => ({
@@ -553,7 +593,9 @@ export default function AliciaTerminal() {
                 isThinking={isThinking}
                 pendingImages={pendingImages}
                 pendingMentions={pendingMentions}
+                runtimeCapabilities={aliciaState.runtimeCapabilities}
                 pendingApprovals={pendingApprovals}
+                pendingUserInput={pendingUserInput}
                 turnDiffFiles={turnDiffFiles}
                 turnPlan={turnPlan}
                 runtimeState={runtime.state}
@@ -575,6 +617,7 @@ export default function AliciaTerminal() {
                   setPendingMentions((prev) => prev.filter((_, i) => i !== index))
                 }}
                 onApprovalDecision={handleApprovalDecision}
+                onUserInputDecision={handleUserInputDecision}
               />
             </ResizablePanel>
             <ResizableHandle withHandle />
@@ -674,6 +717,7 @@ export default function AliciaTerminal() {
           onNewSession={() => {
             threadIdRef.current = null
             setPendingApprovals([])
+            setPendingUserInput(null)
             setTurnDiff(null)
             setTurnPlan(null)
             void ensureBridgeSession(true)
@@ -684,4 +728,10 @@ export default function AliciaTerminal() {
     </div>
   )
 }
+
+
+
+
+
+
 

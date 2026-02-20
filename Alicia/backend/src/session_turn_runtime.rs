@@ -15,7 +15,8 @@ use crate::{
     CodexReviewStartRequest, CodexReviewStartResponse, CodexThreadUnarchiveRequest,
     CodexThreadUnarchiveResponse, CodexTurnInterruptRequest, CodexTurnInterruptResponse,
     CodexTurnRunRequest, CodexTurnRunResponse, CodexTurnSteerRequest,
-    CodexTurnSteerResponse, RuntimeCodexConfig,
+    CodexTurnSteerResponse, CodexUserInputRespondRequest, CodexUserInputRespondResponse,
+    RuntimeCodexConfig,
 };
 
 fn runtime_config_to_json(config: &RuntimeCodexConfig, binary: &str) -> Value {
@@ -54,6 +55,51 @@ fn parse_bridge_response<T: DeserializeOwned>(result: Value, method: &str) -> Re
 }
 
 
+fn is_unsupported_method_message(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("unsupported method") || normalized.contains("method not found")
+}
+
+fn is_unsupported_method_error_for(error: &str, methods: &[&str]) -> bool {
+    if !is_unsupported_method_message(error) {
+        return false;
+    }
+
+    let normalized = error.to_ascii_lowercase();
+    methods.iter().any(|method| {
+        let dotted = method.to_ascii_lowercase();
+        let slashed = dotted.replace('.', "/");
+        normalized.contains(&dotted) || normalized.contains(&slashed)
+    })
+}
+
+fn is_user_input_action_not_found_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("not found")
+        && (normalized.contains("action")
+            || normalized.contains("user_input")
+            || normalized.contains("user input"))
+}
+
+fn map_user_input_respond_error(action_id: &str, error: String) -> String {
+    if is_unsupported_method_error_for(&error, &["user_input.respond", "user_input/respond"]) {
+        return "user_input.respond is unsupported by the active bridge/runtime".to_string();
+    }
+
+    if is_user_input_action_not_found_error(&error) {
+        return format!("user input action not found: {action_id}");
+    }
+
+    error
+}
+
+fn unsupported_slash_command_message(command: &str) -> String {
+    let normalized = command.trim();
+    let display_command = if normalized.is_empty() { "/" } else { normalized };
+    format!(
+        "slash command `{display_command}` is not available in SDK bridge mode. Supported compatibility command: /status"
+    )
+}
 fn finish_session_turn(app: &AppHandle, session_id: u64, discovered_thread_id: Option<String>) {
     let state = app.state::<AppState>();
     let mut guard = match lock_active_session(state.inner()) {
@@ -801,6 +847,48 @@ pub(crate) async fn codex_approval_respond_impl(
     Ok(())
 }
 
+pub(crate) async fn codex_user_input_respond_impl(
+    state: State<'_, AppState>,
+    request: CodexUserInputRespondRequest,
+) -> Result<CodexUserInputRespondResponse, String> {
+    let action_id = request.action_id.trim();
+    if action_id.is_empty() {
+        return Err("action_id is required".to_string());
+    }
+
+    let decision = request.decision.trim().to_ascii_lowercase();
+    if decision.is_empty() {
+        return Err("decision is required".to_string());
+    }
+    if decision != "submit" && decision != "cancel" {
+        return Err("decision must be one of: submit, cancel".to_string());
+    }
+
+    let answers = request
+        .answers
+        .into_iter()
+        .collect::<serde_json::Map<String, Value>>();
+
+    let (stdin, pending, next_request_id) = active_bridge_handles(&state)?;
+
+    let result = bridge_request(
+        stdin,
+        pending,
+        next_request_id,
+        "user_input.respond",
+        Value::Object({
+            let mut payload = serde_json::Map::new();
+            payload.insert("actionId".to_string(), Value::String(action_id.to_string()));
+            payload.insert("decision".to_string(), Value::String(decision));
+            payload.insert("answers".to_string(), Value::Object(answers));
+            payload
+        }),
+    )
+    .await
+    .map_err(|error| map_user_input_respond_error(action_id, error))?;
+
+    parse_bridge_response(result, "user_input.respond")
+}
 pub(crate) async fn send_codex_input_impl(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -838,9 +926,7 @@ pub(crate) async fn send_codex_input_impl(
                 emit_stderr(
                     &app,
                     active.session_id,
-                    format!(
-                        "slash command `{command}` is not available in SDK bridge mode. Supported compatibility command: /status"
-                    ),
+                    unsupported_slash_command_message(command),
                 );
                 return Ok(());
             }
@@ -886,3 +972,4 @@ pub(crate) async fn send_codex_input_impl(
     let _ = schedule_turn_run(app, state, request).await?;
     Ok(())
 }
+

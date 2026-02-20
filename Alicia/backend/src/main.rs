@@ -432,6 +432,24 @@ struct CodexApprovalRespondRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CodexUserInputRespondRequest {
+    #[serde(alias = "action_id")]
+    action_id: String,
+    decision: String,
+    #[serde(default)]
+    answers: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexUserInputRespondResponse {
+    ok: bool,
+    action_id: String,
+    decision: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TerminalCreateRequest {
     cwd: Option<String>,
     shell: Option<String>,
@@ -721,6 +739,14 @@ async fn codex_approval_respond(
 }
 
 #[tauri::command]
+async fn codex_user_input_respond(
+    state: State<'_, AppState>,
+    request: CodexUserInputRespondRequest,
+) -> Result<CodexUserInputRespondResponse, String> {
+    crate::session_runtime::codex_user_input_respond_impl(state, request).await
+}
+
+#[tauri::command]
 async fn send_codex_input(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -916,6 +942,7 @@ fn main() {
             codex_turn_steer,
             codex_turn_interrupt,
             codex_approval_respond,
+            codex_user_input_respond,
             update_codex_config,
             codex_config_get,
             codex_config_set,
@@ -947,14 +974,4 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-
-
-
-
-
-
-
-
-
 

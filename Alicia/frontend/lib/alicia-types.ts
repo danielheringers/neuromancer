@@ -1,4 +1,7 @@
-import type { RuntimeMethodCapabilities } from "@/lib/tauri-bridge/types"
+import type {
+  RuntimeMethod,
+  RuntimeMethodCapabilities,
+} from "@/lib/tauri-bridge/types"
 
 // ========================
 // Alicia shared types
@@ -181,6 +184,42 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   ...PLANNED_SLASH_COMMANDS,
 ]
 
+export type SlashCommandSupportState = SlashCommand["support"] | "unsupported"
+
+const SLASH_COMMAND_METHOD_REQUIREMENTS: Partial<Record<string, RuntimeMethod[]>> = {
+  "/review": ["review.start"],
+}
+
+export function getSlashCommandDefinition(command: string): SlashCommand | null {
+  const normalized = command.trim().toLowerCase()
+  if (!normalized.startsWith("/")) {
+    return null
+  }
+  return (
+    SLASH_COMMANDS.find((entry) => entry.command.toLowerCase() === normalized) ??
+    null
+  )
+}
+
+export function resolveSlashCommandSupport(
+  command: SlashCommand,
+  capabilities: RuntimeMethodCapabilities,
+): SlashCommandSupportState {
+  if (command.support === "planned") {
+    return "planned"
+  }
+
+  const requiredMethods =
+    SLASH_COMMAND_METHOD_REQUIREMENTS[command.command.toLowerCase()]
+  if (!requiredMethods || requiredMethods.length === 0) {
+    return "supported"
+  }
+
+  return requiredMethods.every((method) => capabilities[method] !== false)
+    ? "supported"
+    : "unsupported"
+}
+
 export interface FileChange {
   name: string
   status: "modified" | "added" | "deleted"
@@ -201,6 +240,7 @@ export interface AliciaState {
   fileChanges: FileChange[]
   activePanel: "model" | "permissions" | "mcp" | "sessions" | "apps" | null
 }
+
 
 
 

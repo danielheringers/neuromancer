@@ -55,6 +55,8 @@ const RUNTIME_METHOD_KEYS: &[&str] = &[
     "turn.steer",
     "turn.interrupt",
     "approval.respond",
+    "user_input.respond",
+    "tool.call.dynamic",
     "mcp.warmup",
     "mcp.list",
     "mcp.login",
@@ -70,10 +72,12 @@ const RUNTIME_METHOD_KEYS: &[&str] = &[
 ];
 
 fn default_runtime_capabilities() -> HashMap<String, bool> {
-    RUNTIME_METHOD_KEYS
+    let mut methods: HashMap<String, bool> = RUNTIME_METHOD_KEYS
         .iter()
         .map(|method| ((*method).to_string(), true))
-        .collect()
+        .collect();
+    methods.insert("tool.call.dynamic".to_string(), false);
+    methods
 }
 
 fn normalize_account_rate_capabilities(capabilities: &mut HashMap<String, bool>) {
@@ -96,7 +100,8 @@ fn merge_runtime_capabilities(result: &serde_json::Value, capabilities: &mut Has
             if !capabilities.contains_key(method) {
                 continue;
             }
-            capabilities.insert(method.clone(), supported.as_bool().unwrap_or(true));
+            let fallback = capabilities.get(method).copied().unwrap_or(true);
+            capabilities.insert(method.clone(), supported.as_bool().unwrap_or(fallback));
         }
     }
 
@@ -646,10 +651,4 @@ pub(crate) async fn codex_mcp_reload_impl(
     let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
     Ok(parse_mcp_reload_bridge_result(&result, elapsed_ms))
 }
-
-
-
-
-
-
 

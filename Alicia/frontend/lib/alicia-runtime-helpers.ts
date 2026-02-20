@@ -1,5 +1,6 @@
 import {
   type AliciaState,
+  type FileChange,
   type McpServer,
   type ReasoningEffort,
   type Session,
@@ -39,6 +40,27 @@ export interface ApprovalRequestState {
   grantRoot: string
   commandActions: unknown[]
   proposedExecpolicyAmendment: string[]
+}
+
+export interface UserInputQuestionOptionState {
+  label: string
+  description: string | null
+}
+
+export interface UserInputQuestionState {
+  id: string
+  header: string | null
+  question: string
+  options: UserInputQuestionOptionState[]
+}
+
+export interface UserInputRequestState {
+  actionId: string
+  threadId: string
+  turnId: string
+  itemId: string
+  questions: UserInputQuestionState[]
+  timeoutMs: number | null
 }
 
 export interface TurnPlanStepState {
@@ -105,9 +127,11 @@ function syncAccountRateMethodCapabilities(
 }
 
 export function createDefaultRuntimeMethodCapabilities(): RuntimeMethodCapabilities {
-  return Object.fromEntries(
+  const capabilities = Object.fromEntries(
     RUNTIME_METHODS.map((method) => [method, true]),
   ) as RuntimeMethodCapabilities
+  capabilities["tool.call.dynamic"] = false
+  return capabilities
 }
 
 export function normalizeRuntimeMethodCapabilities(
@@ -703,6 +727,28 @@ export function normalizePlanStepStatus(value: unknown): "pending" | "inProgress
   return "pending"
 }
 
+export function mapDiffFilesToFileChanges(files: DiffFileView[]): FileChange[] {
+  if (files.length === 0) {
+    return []
+  }
+
+  return files.map((file) => {
+    const hasAdditions = file.lines.some((line) => line.type === "add")
+    const hasRemovals = file.lines.some((line) => line.type === "remove")
+
+    if (hasAdditions && hasRemovals) {
+      return { name: file.filename, status: "modified" as const }
+    }
+    if (hasAdditions) {
+      return { name: file.filename, status: "added" as const }
+    }
+    if (hasRemovals) {
+      return { name: file.filename, status: "deleted" as const }
+    }
+    return { name: file.filename, status: "modified" as const }
+  })
+}
+
 export function parseUnifiedDiffFiles(diff: string): DiffFileView[] {
   const trimmed = diff.trim()
   if (!trimmed) {
@@ -825,6 +871,8 @@ export function mergeTerminalBuffer(previous: string, chunk: string): string {
   const max = 400_000
   return next.length <= max ? next : next.slice(next.length - max)
 }
+
+
 
 
 

@@ -2,9 +2,13 @@ import { useMemo, type RefObject } from "react"
 
 import { CommandInput } from "@/components/alicia/command-input"
 import { ApprovalRequest } from "@/components/alicia/approval-request"
+import { UserInputRequest } from "@/components/alicia/user-input-request"
 import { DiffViewer } from "@/components/alicia/diff-viewer"
 import { TerminalMessage } from "@/components/alicia/terminal-message"
-import { type ApprovalDecision } from "@/lib/tauri-bridge"
+import {
+  type ApprovalDecision,
+  type RuntimeMethodCapabilities,
+} from "@/lib/tauri-bridge"
 import {
   encodeAgentSpawnerPayload,
   mergeAgentSpawnerPayloads,
@@ -20,6 +24,7 @@ import {
   type Message,
   type RuntimeState,
   type TurnPlanState,
+  type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
 
 interface ConversationPaneProps {
@@ -29,7 +34,9 @@ interface ConversationPaneProps {
   isThinking: boolean
   pendingImages: string[]
   pendingMentions: string[]
+  runtimeCapabilities: RuntimeMethodCapabilities
   pendingApprovals: ApprovalRequestState[]
+  pendingUserInput: UserInputRequestState | null
   turnDiffFiles: DiffFileView[]
   turnPlan: TurnPlanState | null
   runtimeState: RuntimeState["state"]
@@ -44,6 +51,11 @@ interface ConversationPaneProps {
     actionId: string,
     decision: ApprovalDecision,
   ) => Promise<void>
+  onUserInputDecision: (response: {
+    actionId: string
+    decision: "submit" | "cancel"
+    answers?: Record<string, { answers: string[] }>
+  }) => Promise<void>
 }
 
 function approvalRisk(
@@ -107,7 +119,9 @@ export function ConversationPane({
   isThinking,
   pendingImages,
   pendingMentions,
+  runtimeCapabilities,
   pendingApprovals,
+  pendingUserInput,
   turnDiffFiles,
   turnPlan,
   runtimeState,
@@ -119,6 +133,7 @@ export function ConversationPane({
   onRemoveImage,
   onRemoveMention,
   onApprovalDecision,
+  onUserInputDecision,
 }: ConversationPaneProps) {
   const groupedMessages = useMemo(() => {
     const grouped: Message[] = []
@@ -244,6 +259,25 @@ export function ConversationPane({
           />
         ))}
 
+        {pendingUserInput && (
+          <UserInputRequest
+            request={pendingUserInput}
+            onSubmit={async (actionId, answers) => {
+              await onUserInputDecision({
+                actionId,
+                decision: "submit",
+                answers,
+              })
+            }}
+            onCancel={async (actionId) => {
+              await onUserInputDecision({
+                actionId,
+                decision: "cancel",
+              })
+            }}
+          />
+        )}
+
         {isThinking && <TerminalMessage type="agent" content="" thinking />}
       </div>
 
@@ -256,6 +290,7 @@ export function ConversationPane({
         onRemoveMention={onRemoveMention}
         pendingImages={pendingImages}
         pendingMentions={pendingMentions}
+        runtimeCapabilities={runtimeCapabilities}
         disabled={runtimeState === "starting" || runtimeState === "stopping"}
       />
     </div>

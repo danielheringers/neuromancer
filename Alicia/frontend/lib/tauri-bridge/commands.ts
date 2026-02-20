@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 
 import type {
   CodexApprovalRespondRequest,
+  CodexUserInputRespondRequest,
+  CodexUserInputRespondResponse,
   CodexHelpSnapshot,
   CodexModelListResponse,
   CodexThreadArchiveRequest,
@@ -163,6 +165,12 @@ export async function codexApprovalRespond(
   await invoke('codex_approval_respond', { request })
 }
 
+export async function codexUserInputRespond(
+  request: CodexUserInputRespondRequest,
+): Promise<CodexUserInputRespondResponse> {
+  return invoke<CodexUserInputRespondResponse>('codex_user_input_respond', { request })
+}
+
 export async function sendCodexInput(text: string): Promise<void> {
   await invoke('send_codex_input', { text })
 }
@@ -283,6 +291,9 @@ export async function codexHelpSnapshot(): Promise<CodexHelpSnapshot> {
 export async function resizeCodexPty(rows: number, cols: number): Promise<void> {
   await invoke('resize_codex_pty', { rows, cols })
 }
+
+
+
 
 
 

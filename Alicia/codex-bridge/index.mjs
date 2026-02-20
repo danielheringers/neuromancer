@@ -27,6 +27,7 @@ const BRIDGE_RUNTIME_METHODS = Object.freeze([
   "turn.steer",
   "turn.interrupt",
   "approval.respond",
+  "user_input.respond",
   "mcp.warmup",
   "mcp.list",
   "mcp.login",
@@ -41,13 +42,18 @@ const BRIDGE_RUNTIME_METHODS = Object.freeze([
   "config.set",
 ]);
 
+const RUNTIME_CAPABILITY_DEFAULTS = Object.freeze({
+  ...Object.fromEntries(BRIDGE_RUNTIME_METHODS.map((method) => [method, true])),
+  "tool.call.dynamic": false,
+});
+
 const RUNTIME_METHOD_ALIASES = Object.freeze({
   "account.rate_limits.read": ["account.rateLimits.read"],
   "account.rateLimits.read": ["account.rate_limits.read"],
 });
 
 function createDefaultRuntimeCapabilities() {
-  return Object.fromEntries(BRIDGE_RUNTIME_METHODS.map((method) => [method, true]));
+  return { ...RUNTIME_CAPABILITY_DEFAULTS };
 }
 
 function parseRuntimeMethodsFlag(rawValue) {
@@ -58,7 +64,7 @@ function parseRuntimeMethodsFlag(rawValue) {
 
   for (const token of rawValue.split(/[\s,;]+/)) {
     const method = token.trim();
-    if (!method || !BRIDGE_RUNTIME_METHODS.includes(method)) {
+    if (!method || !Object.prototype.hasOwnProperty.call(RUNTIME_CAPABILITY_DEFAULTS, method)) {
       continue;
     }
     methods.add(method);
@@ -352,6 +358,8 @@ function createRuntime(child) {
     rawCollabCalls: new Map(),
     completedCollabCallIds: new Set(),
     pendingApprovals: new Map(),
+    pendingUserInputs: new Map(),
+    nextUserInputId: 1,
   };
 }
 
@@ -1252,6 +1260,11 @@ function rejectPendingRequests(runtime, message) {
     runtime.pendingApprovals.delete(actionId);
     pendingApproval.reject(new Error(message));
   }
+
+  for (const [actionId, pendingUserInput] of runtime.pendingUserInputs) {
+    runtime.pendingUserInputs.delete(actionId);
+    pendingUserInput.reject(new Error(message), "error");
+  }
 }
 
 function asPlainObject(value) {
@@ -1272,6 +1285,12 @@ function makeApprovalActionId(runtime) {
   const value = runtime.nextApprovalId;
   runtime.nextApprovalId += 1;
   return `approval-${value}`;
+}
+
+function makeUserInputActionId(runtime) {
+  const value = runtime.nextUserInputId;
+  runtime.nextUserInputId += 1;
+  return `user-input-${value}`;
 }
 
 function approvalDecisionName(responsePayload) {
@@ -1472,6 +1491,116 @@ function resolveApprovalResponse(runtime, params = {}) {
   };
 }
 
+function requestUserInput(runtime, requestId, params, timeoutMs = 900_000) {
+  const actionId = makeUserInputActionId(runtime);
+  const threadId = String(params.threadId || params.thread_id || "");
+  const turnId = String(params.turnId || params.turn_id || "");
+  const itemId = String(params.itemId || params.item_id || "");
+  const questions = Array.isArray(params.questions) ? params.questions : [];
+
+  writeEvent({
+    type: "user_input.requested",
+    action_id: actionId,
+    thread_id: threadId,
+    turn_id: turnId,
+    item_id: itemId,
+    questions,
+    timeout_ms: timeoutMs,
+  });
+
+  return new Promise((resolve, reject) => {
+    let completed = false;
+
+    const fail = (error, outcome = "error") => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      clearTimeout(timeout);
+      runtime.pendingUserInputs.delete(actionId);
+      writeEvent({
+        type: "user_input.resolved",
+        action_id: actionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        item_id: itemId,
+        outcome,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      reject(error);
+    };
+
+    const timeout = setTimeout(() => {
+      const error = new Error("user input request timed out");
+      fail(error, "timed_out");
+    }, timeoutMs);
+
+    const resolveInput = (response, outcome = "submitted") => {
+      if (completed) {
+        return;
+      }
+      completed = true;
+      clearTimeout(timeout);
+      runtime.pendingUserInputs.delete(actionId);
+      writeEvent({
+        type: "user_input.resolved",
+        action_id: actionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        item_id: itemId,
+        outcome,
+      });
+      resolve({
+        actionId,
+        requestId,
+        response,
+      });
+    };
+
+    runtime.pendingUserInputs.set(actionId, {
+      actionId,
+      requestId,
+      threadId,
+      turnId,
+      itemId,
+      timeout,
+      resolve: resolveInput,
+      reject: fail,
+    });
+  });
+}
+
+function resolveUserInputResponse(runtime, params = {}) {
+  const actionId = typeof params.actionId === "string"
+    ? params.actionId.trim()
+    : typeof params.action_id === "string"
+      ? params.action_id.trim()
+      : "";
+
+  if (!actionId) {
+    throw new Error("user input actionId is required");
+  }
+
+  const pendingUserInput = runtime.pendingUserInputs.get(actionId);
+  if (!pendingUserInput) {
+    throw new Error("user input action not found: " + actionId);
+  }
+
+  const decision = typeof params.decision === "string" ? params.decision.trim() : "";
+
+  if (decision === "submit") {
+    const answers = asPlainObject(params.answers) ? params.answers : {};
+    pendingUserInput.resolve({ answers }, "submitted");
+    return { ok: true, actionId, decision: "submit", outcome: "submitted" };
+  }
+
+  if (decision === "cancel") {
+    pendingUserInput.reject(new Error("user input cancelled by user"), "cancelled");
+    return { ok: true, actionId, decision: "cancel", outcome: "cancelled" };
+  }
+
+  throw new Error("user input decision must be submit or cancel");
+}
 async function handleServerRequest(runtime, message) {
   const method = String(message.method || "");
   const params = asPlainObject(message.params) ? message.params : {};
@@ -1493,16 +1622,8 @@ async function handleServerRequest(runtime, message) {
     }
 
     if (method === "item/tool/requestUserInput") {
-      const answers = {};
-      const questions = Array.isArray(params.questions) ? params.questions : [];
-      for (const question of questions) {
-        const id = String(question?.id || "");
-        if (!id) continue;
-        const options = Array.isArray(question.options) ? question.options : [];
-        const firstLabel = typeof options[0]?.label === "string" ? options[0].label : "";
-        answers[id] = { answers: firstLabel ? [firstLabel] : [] };
-      }
-      sendRuntimeResponse(runtime, message.id, { answers });
+      const userInput = await requestUserInput(runtime, message.id, params);
+      sendRuntimeResponse(runtime, message.id, userInput.response);
       return;
     }
 
@@ -1515,6 +1636,9 @@ async function handleServerRequest(runtime, message) {
           },
         ],
         success: false,
+        error: {
+          code: "unsupported_dynamic_tool_call",
+        },
       });
       return;
     }
@@ -2085,6 +2209,7 @@ async function shutdownAppServer() {
     // best effort
   }
 
+  rejectPendingRequests(runtime, "app-server shutdown");
   runtime.closed = true;
   try {
     runtime.child.kill();
@@ -3911,6 +4036,16 @@ async function handleApprovalRespond(params = {}) {
   return resolveApprovalResponse(runtime, requestParams);
 }
 
+async function handleUserInputRespond(params = {}) {
+  const runtime = state.appServer;
+  if (!runtime || runtime.closed) {
+    throw new Error("app-server is not running");
+  }
+
+  const requestParams = asPlainObject(params) ? params : {};
+  return resolveUserInputResponse(runtime, requestParams);
+}
+
 async function dispatchRequest(method, params) {
   if (
     method !== "capabilities.get" &&
@@ -3959,6 +4094,8 @@ async function dispatchRequest(method, params) {
         return handleTurnInterrupt(params);
       case "approval.respond":
         return handleApprovalRespond(params);
+      case "user_input.respond":
+        return handleUserInputRespond(params);
       case "mcp.warmup":
         return handleMcpWarmup();
       case "mcp.list":

@@ -3,6 +3,7 @@
 import { ArrowUp, Paperclip, ImagePlus, AtSign, X } from "lucide-react"
 import { useState, useRef, useEffect, useCallback } from "react"
 import { CommandPalette } from "./command-palette"
+import type { RuntimeMethodCapabilities } from "@/lib/tauri-bridge"
 
 interface CommandInputProps {
   onSubmit: (value: string) => Promise<void> | void
@@ -13,6 +14,7 @@ interface CommandInputProps {
   onRemoveMention?: (index: number) => void
   pendingImages?: string[]
   pendingMentions?: string[]
+  runtimeCapabilities: RuntimeMethodCapabilities
   disabled?: boolean
 }
 
@@ -31,6 +33,7 @@ export function CommandInput({
   onRemoveMention,
   pendingImages = [],
   pendingMentions = [],
+  runtimeCapabilities,
   disabled,
 }: CommandInputProps) {
   const [value, setValue] = useState("")
@@ -135,6 +138,7 @@ export function CommandInput({
             setValue("")
           }}
           position={getPalettePosition()}
+          runtimeCapabilities={runtimeCapabilities}
         />
       )}
 

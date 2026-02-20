@@ -9,14 +9,17 @@ import {
 import {
   PLANNED_SLASH_COMMANDS,
   SUPPORTED_SLASH_COMMANDS,
+  resolveSlashCommandSupport,
   type SlashCommand,
 } from "@/lib/alicia-types"
+import type { RuntimeMethodCapabilities } from "@/lib/tauri-bridge"
 
 interface CommandPaletteProps {
   filter: string
   onSelect: (command: string) => void
   onClose: () => void
   position: { bottom: number; left: number }
+  runtimeCapabilities: RuntimeMethodCapabilities
 }
 
 const categoryLabels: Record<SlashCommand["category"], string> = {
@@ -69,7 +72,13 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   ...PLANNED_SLASH_COMMANDS,
 ]
 
-export function CommandPalette({ filter, onSelect, onClose, position }: CommandPaletteProps) {
+export function CommandPalette({
+  filter,
+  onSelect,
+  onClose,
+  position,
+  runtimeCapabilities,
+}: CommandPaletteProps) {
   const [selectedIndex, setSelectedIndex] = useState(0)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -98,6 +107,15 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
 
   const flatCommands = useMemo(() => grouped.flatMap((group) => group.commands), [grouped])
 
+  const commandSupport = useMemo(() => {
+    return new Map(
+      filtered.map((command) => [
+        command.command,
+        resolveSlashCommandSupport(command, runtimeCapabilities),
+      ]),
+    )
+  }, [filtered, runtimeCapabilities])
+
   useEffect(() => {
     setSelectedIndex(0)
   }, [filter])
@@ -113,7 +131,9 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
       } else if (e.key === "Enter" && flatCommands[selectedIndex]) {
         e.preventDefault()
         const selected = flatCommands[selectedIndex]
-        if (selected.support === "supported") {
+        const supportState =
+          commandSupport.get(selected.command) ?? selected.support
+        if (supportState === "supported") {
           onSelect(selected.command)
         }
       } else if (e.key === "Escape") {
@@ -124,7 +144,7 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
 
     window.addEventListener("keydown", handler)
     return () => window.removeEventListener("keydown", handler)
-  }, [flatCommands, selectedIndex, onSelect, onClose])
+  }, [commandSupport, flatCommands, selectedIndex, onSelect, onClose])
 
   useEffect(() => {
     const el = listRef.current?.querySelector(`[data-index="${selectedIndex}"]`)
@@ -133,8 +153,13 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
 
   if (flatCommands.length === 0) return null
 
-  const supportedCount = filtered.filter((command) => command.support === "supported").length
-  const plannedCount = filtered.length - supportedCount
+  const supportedCount = filtered.filter(
+    (command) => (commandSupport.get(command.command) ?? command.support) === "supported",
+  ).length
+  const plannedCount = filtered.filter(
+    (command) => (commandSupport.get(command.command) ?? command.support) === "planned",
+  ).length
+  const unavailableCount = filtered.length - supportedCount - plannedCount
 
   let globalIndex = 0
 
@@ -155,16 +180,18 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
               const idx = globalIndex++
               const Icon = commandIcons[cmd.command] || TerminalIcon
               const isSelected = idx === selectedIndex
-              const isPlanned = cmd.support === "planned"
+              const supportState = commandSupport.get(cmd.command) ?? cmd.support
+              const isPlanned = supportState === "planned"
+              const isUnavailable = supportState === "unsupported"
 
               return (
                 <button
                   key={cmd.command}
                   data-index={idx}
                   type="button"
-                  disabled={isPlanned}
+                  disabled={isPlanned || isUnavailable}
                   onClick={() => {
-                    if (!isPlanned) {
+                    if (!isPlanned && !isUnavailable) {
                       onSelect(cmd.command)
                     }
                   }}
@@ -172,19 +199,23 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
                   className={`flex items-center gap-2.5 w-full px-2.5 py-2 rounded text-left transition-colors ${
                     isSelected
                       ? "bg-selection text-terminal-fg"
-                      : isPlanned
+                      : isPlanned || isUnavailable
                         ? "text-muted-foreground/35"
                         : "text-muted-foreground hover:bg-[#b9bcc01c]"
                   }`}
                 >
                   <Icon
                     className={`w-3.5 h-3.5 shrink-0 ${
-                      isPlanned ? "text-muted-foreground/35" : "text-terminal-purple"
+                      isPlanned || isUnavailable
+                        ? "text-muted-foreground/35"
+                        : "text-terminal-purple"
                     }`}
                   />
                   <span
                     className={`text-xs font-mono ${
-                      isPlanned ? "text-muted-foreground/35" : "text-terminal-green"
+                      isPlanned || isUnavailable
+                        ? "text-muted-foreground/35"
+                        : "text-terminal-green"
                     }`}
                   >
                     {cmd.command}
@@ -196,10 +227,12 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
                     className={`text-[9px] px-1 py-0.5 rounded border uppercase tracking-wider ${
                       isPlanned
                         ? "text-terminal-gold/70 border-terminal-gold/25"
-                        : "text-terminal-green/80 border-terminal-green/20"
+                        : isUnavailable
+                          ? "text-terminal-red/70 border-terminal-red/25"
+                          : "text-terminal-green/80 border-terminal-green/20"
                     }`}
                   >
-                    {cmd.support}
+                    {supportState}
                   </span>
                 </button>
               )
@@ -210,6 +243,7 @@ export function CommandPalette({ filter, onSelect, onClose, position }: CommandP
       <div className="px-3 py-1.5 border-t border-panel-border bg-background/30 flex items-center gap-3 text-[10px] text-muted-foreground/40">
         <span>{supportedCount} supported</span>
         <span>{plannedCount} planned</span>
+        <span>{unavailableCount} unavailable</span>
         <span className="ml-auto flex items-center gap-2">
           <kbd className="px-1 py-0.5 rounded bg-background/50 border border-panel-border">{"↑↓"}</kbd>
           navigate

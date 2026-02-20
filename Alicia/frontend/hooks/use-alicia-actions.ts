@@ -7,6 +7,8 @@ import {
 } from "react"
 import {
   APPROVAL_PRESETS,
+  getSlashCommandDefinition,
+  resolveSlashCommandSupport,
   type AliciaState,
   type ApprovalPreset,
   type ReasoningEffort,
@@ -21,6 +23,7 @@ import {
   type RuntimeState,
   type TurnDiffState,
   type TurnPlanState,
+  type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
 import {
   codexAccountLogout,
@@ -57,6 +60,7 @@ interface UseAliciaActionsParams {
   setPendingMentions: Dispatch<SetStateAction<string[]>>
   setMessages: Dispatch<SetStateAction<Message[]>>
   setPendingApprovals: Dispatch<SetStateAction<ApprovalRequestState[]>>
+  setPendingUserInput: Dispatch<SetStateAction<UserInputRequestState | null>>
   setTurnDiff: Dispatch<SetStateAction<TurnDiffState | null>>
   setTurnPlan: Dispatch<SetStateAction<TurnPlanState | null>>
   setIsThinking: Dispatch<SetStateAction<boolean>>
@@ -192,6 +196,7 @@ export function useAliciaActions({
   setPendingMentions,
   setMessages,
   setPendingApprovals,
+  setPendingUserInput,
   setTurnDiff,
   setTurnPlan,
   setIsThinking,
@@ -270,7 +275,6 @@ export function useAliciaActions({
     [
       addMessage,
       ensureBridgeSession,
-      markUnsupportedRuntimeMethod,
       pendingImages,
       pendingMentions,
       setPendingImages,
@@ -283,12 +287,47 @@ export function useAliciaActions({
   const handleSlashCommand = useCallback(
     async (command: string) => {
       const { name, args } = parseSlashCommandInput(command)
+      const normalizedName = name.trim().toLowerCase()
+      const slashDefinition = getSlashCommandDefinition(normalizedName)
 
-      if (name === "/model" || name === "/models") {
+      if (!slashDefinition) {
+        const rawCommand = command.trim().split(/\s+/)[0] ?? command.trim()
+        addMessage(
+          "system",
+          "[slash] unsupported command: " +
+            (rawCommand || normalizedName || command.trim()),
+        )
+        return
+      }
+
+      const slashSupport = resolveSlashCommandSupport(
+        slashDefinition,
+        aliciaState.runtimeCapabilities,
+      )
+
+      if (slashSupport === "planned") {
+        addMessage(
+          "system",
+          "[slash] " + slashDefinition.command + " is planned and not available yet",
+        )
+        return
+      }
+
+      if (slashSupport === "unsupported") {
+        addMessage(
+          "system",
+          "[slash] " +
+            slashDefinition.command +
+            " is not supported by current runtime capabilities",
+        )
+        return
+      }
+
+      if (normalizedName === "/model" || normalizedName === "/models") {
         await openModelPanel(true)
         return
       }
-      if (name === "/permissions" || name === "/approvals") {
+      if (normalizedName === "/permissions" || normalizedName === "/approvals") {
         try {
           const config = await codexConfigGet()
           runtimeConfigRef.current = config
@@ -298,30 +337,30 @@ export function useAliciaActions({
         setAliciaState((prev) => ({ ...prev, activePanel: "permissions" }))
         return
       }
-      if (name === "/mcp") {
+      if (normalizedName === "/mcp") {
         setAliciaState((prev) => ({ ...prev, activePanel: "mcp" }))
         await refreshMcpServers()
         return
       }
-      if (name === "/apps") {
+      if (normalizedName === "/apps") {
         setAliciaState((prev) => ({ ...prev, activePanel: "apps" }))
         await refreshAppsAndAuth({ throwOnError: false })
         return
       }
-      if (name === "/resume") {
+      if (normalizedName === "/resume") {
         openSessionPanel("resume")
         return
       }
-      if (name === "/fork") {
+      if (normalizedName === "/fork") {
         openSessionPanel("fork")
         return
       }
-      if (name === "/new") {
+      if (normalizedName === "/new") {
         threadIdRef.current = null
         await ensureBridgeSession(true)
         return
       }
-      if (name === "/status") {
+      if (normalizedName === "/status") {
         if (!(await ensureBridgeSession(false))) {
           return
         }
@@ -332,7 +371,7 @@ export function useAliciaActions({
         }
         return
       }
-      if (name === "/review") {
+      if (normalizedName === "/review") {
         if (!(await ensureBridgeSession(false))) {
           return
         }
@@ -346,7 +385,10 @@ export function useAliciaActions({
         }
 
         if (!supportsRuntimeMethod("review.start")) {
-          await handleSubmit(command)
+          addMessage(
+            "system",
+            "[slash] /review is not supported by current runtime (missing review.start)",
+          )
           return
         }
 
@@ -376,14 +418,17 @@ export function useAliciaActions({
           setIsThinking(false)
           if (isRuntimeCommandUnavailable(error)) {
             markUnsupportedRuntimeMethod("review.start")
-            await handleSubmit(command)
+            addMessage(
+              "system",
+              "[slash] /review is not supported by current runtime (missing review.start)",
+            )
             return
           }
           addMessage("system", `[review] failed: ${String(error)}`)
         }
         return
       }
-      if (name === "/agent") {
+      if (normalizedName === "/agent") {
         if (!(await ensureBridgeSession(false))) {
           return
         }
@@ -588,7 +633,7 @@ export function useAliciaActions({
         addMessage("system", `[agent] active=${activeLabel} total=${records.length}`)
         return
       }
-      if (name === "/logout") {
+      if (normalizedName === "/logout") {
         if (!(await ensureBridgeSession(false))) {
           return
         }
@@ -626,7 +671,7 @@ export function useAliciaActions({
         }
         return
       }
-      if (name === "/quit" || name === "/exit") {
+      if (normalizedName === "/quit" || normalizedName === "/exit") {
         await codexBridgeStop()
         setRuntime((prev) => ({
           ...prev,
@@ -636,12 +681,12 @@ export function useAliciaActions({
         }))
         return
       }
-      await handleSubmit(command)
+      addMessage("system", "[slash] unsupported command: " + slashDefinition.command)
     },
     [
       addMessage,
+      aliciaState.runtimeCapabilities,
       ensureBridgeSession,
-      handleSubmit,
       markUnsupportedRuntimeMethod,
       openModelPanel,
       openSessionPanel,
@@ -816,6 +861,7 @@ export function useAliciaActions({
         setMessages(historyMessages)
         setIsThinking(false)
         setPendingApprovals([])
+        setPendingUserInput(null)
         setTurnDiff(null)
         setTurnPlan(null)
         setAliciaState((prev) => ({ ...prev, activePanel: null }))
@@ -843,6 +889,7 @@ export function useAliciaActions({
       setIsThinking,
       setMessages,
       setPendingApprovals,
+      setPendingUserInput,
       setTurnDiff,
       setTurnPlan,
       supportsRuntimeMethod,
@@ -859,4 +906,10 @@ export function useAliciaActions({
     sessionActionPending,
   }
 }
+
+
+
+
+
+
 

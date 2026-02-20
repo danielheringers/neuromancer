@@ -55,6 +55,8 @@ export const RUNTIME_METHODS = [
   'turn.steer',
   'turn.interrupt',
   'approval.respond',
+  'user_input.respond',
+  'tool.call.dynamic',
   'mcp.warmup',
   'mcp.list',
   'mcp.login',
@@ -486,6 +488,24 @@ export interface CodexApprovalRespondRequest {
   execpolicyAmendment?: string[]
 }
 
+export interface CodexUserInputRespondRequest {
+  actionId: string
+  decision: "submit" | "cancel"
+  answers?: Record<string, { answers: string[] }>
+}
+
+export interface CodexUserInputRespondResponse {
+  ok: boolean
+  actionId: string
+  decision: "submit" | "cancel"
+}
+
+export interface CodexUserInputOption {
+  id?: string
+  label: string
+  description?: string | null
+}
+
 export interface ApprovalRequest {
   actionId: string
   kind: "command_execution" | "file_change"
@@ -608,6 +628,35 @@ export interface ApprovalResolvedRuntimeEvent extends RuntimeEventEnvelopeBase {
   action_id?: string
 }
 
+export interface UserInputRequestedRuntimeEvent extends RuntimeEventEnvelopeBase {
+  type: "user_input.requested"
+  action_id?: string
+  thread_id?: string
+  turn_id?: string
+  item_id?: string
+  questions?: Array<{
+    id?: string
+    question?: string
+    prompt?: string
+    header?: string
+    options?: Array<{
+      label?: string
+      description?: string
+    }>
+  }>
+  timeout_ms?: number
+}
+
+export interface UserInputResolvedRuntimeEvent extends RuntimeEventEnvelopeBase {
+  type: "user_input.resolved"
+  action_id?: string
+  thread_id?: string
+  turn_id?: string
+  item_id?: string
+  outcome?: string
+  error?: string
+}
+
 export interface McpOauthLoginCompletedRuntimeEvent extends RuntimeEventEnvelopeBase {
   type: "mcp.oauth_login.completed"
   name?: string
@@ -630,6 +679,8 @@ export type CodexRuntimeTimelineEvent =
   | TurnPlanUpdatedRuntimeEvent
   | ApprovalRequestedRuntimeEvent
   | ApprovalResolvedRuntimeEvent
+  | UserInputRequestedRuntimeEvent
+  | UserInputResolvedRuntimeEvent
   | McpOauthLoginCompletedRuntimeEvent
   | ItemRuntimeEvent
   | RuntimeEventEnvelopeBase
@@ -671,6 +722,8 @@ export type CodexRuntimeEvent =
   | { type: 'stderr'; payload: StreamEventPayload }
   | { type: 'lifecycle'; payload: LifecycleEventPayload }
   | { type: 'event'; payload: CodexStructuredEventPayload }
+
+
 
 
 

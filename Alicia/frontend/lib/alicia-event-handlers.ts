@@ -19,6 +19,8 @@ import {
   type TerminalTab,
   type TurnDiffState,
   type TurnPlanState,
+  type UserInputQuestionState,
+  type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
 
 type AddMessage = (type: Message["type"], content: string) => void
@@ -28,6 +30,7 @@ interface CodexEventHandlerDeps {
   setRuntime: Dispatch<SetStateAction<RuntimeState>>
   setIsThinking: Dispatch<SetStateAction<boolean>>
   setPendingApprovals: Dispatch<SetStateAction<ApprovalRequestState[]>>
+  setPendingUserInput: Dispatch<SetStateAction<UserInputRequestState | null>>
   setTurnDiff: Dispatch<SetStateAction<TurnDiffState | null>>
   setTurnPlan: Dispatch<SetStateAction<TurnPlanState | null>>
   seenEventSeqRef: MutableRefObject<Set<number>>
@@ -40,6 +43,7 @@ export function createCodexEventHandler({
   setRuntime,
   setIsThinking,
   setPendingApprovals,
+  setPendingUserInput,
   setTurnDiff,
   setTurnPlan,
   seenEventSeqRef,
@@ -62,6 +66,7 @@ export function createCodexEventHandler({
         setRuntime((prev) => ({ ...prev, state: "error" }))
         setIsThinking(false)
         setPendingApprovals([])
+        setPendingUserInput(null)
         setTurnDiff(null)
         streamedAgentTextRef.current.clear()
         addMessage("system", event.payload.message ?? "runtime error")
@@ -70,6 +75,7 @@ export function createCodexEventHandler({
         setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
         setIsThinking(false)
         setPendingApprovals([])
+        setPendingUserInput(null)
         setTurnDiff(null)
         setTurnPlan(null)
         streamedAgentTextRef.current.clear()
@@ -296,6 +302,122 @@ export function createCodexEventHandler({
           previous.filter((entry) => entry.actionId !== actionId),
         )
       }
+      return
+    }
+
+    if (eventType === "user_input.requested") {
+      const actionId = String(payload.action_id ?? payload.actionId ?? "").trim()
+      if (!actionId) {
+        reportContractViolation(
+          "user-input-requested-missing-action-id",
+          "received user_input.requested without action_id",
+        )
+        return
+      }
+
+      const rawQuestions = Array.isArray(payload.questions) ? payload.questions : []
+      const questions: UserInputQuestionState[] = rawQuestions
+        .map((entry, index) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null
+          }
+
+          const record = entry as Record<string, unknown>
+          const id = String(record.id ?? record.question_id ?? `q${index + 1}`).trim()
+          const question = String(record.question ?? record.prompt ?? "").trim()
+          if (!id || !question) {
+            return null
+          }
+
+          const rawOptions = Array.isArray(record.options) ? record.options : []
+          const options = rawOptions
+            .map((option) => {
+              if (!option || typeof option !== "object" || Array.isArray(option)) {
+                return null
+              }
+
+              const optionRecord = option as Record<string, unknown>
+              const label = String(optionRecord.label ?? "").trim()
+              if (!label) {
+                return null
+              }
+
+              return {
+                label,
+                description:
+                  typeof optionRecord.description === "string" &&
+                    optionRecord.description.trim().length > 0
+                    ? optionRecord.description.trim()
+                    : null,
+              }
+            })
+            .filter((option): option is NonNullable<typeof option> => option !== null)
+
+          if (options.length === 0) {
+            return null
+          }
+
+          return {
+            id,
+            header:
+              typeof record.header === "string" && record.header.trim().length > 0
+                ? record.header.trim()
+                : null,
+            question,
+            options,
+          }
+        })
+        .filter((entry): entry is UserInputQuestionState => entry !== null)
+
+      if (questions.length === 0) {
+        reportContractViolation(
+          `user-input-requested-empty-questions:${actionId}`,
+          "received user_input.requested without valid questions",
+        )
+        return
+      }
+
+      const timeoutCandidate = Number(payload.timeout_ms ?? payload.timeoutMs)
+      setPendingUserInput({
+        actionId,
+        threadId: String(payload.thread_id ?? payload.threadId ?? "").trim(),
+        turnId: String(payload.turn_id ?? payload.turnId ?? "").trim(),
+        itemId: String(payload.item_id ?? payload.itemId ?? "").trim(),
+        questions,
+        timeoutMs:
+          Number.isFinite(timeoutCandidate) && timeoutCandidate > 0
+            ? timeoutCandidate
+            : null,
+      })
+      return
+    }
+
+    if (eventType === "user_input.resolved") {
+      const actionId = String(payload.action_id ?? payload.actionId ?? "").trim()
+      const outcome = String(payload.outcome ?? "").trim()
+      const error =
+        typeof payload.error === "string" && payload.error.trim().length > 0
+          ? payload.error.trim()
+          : null
+
+      if (outcome === "error" || outcome === "timed_out" || outcome === "cancelled") {
+        addMessage(
+          "system",
+          `[user input] ${outcome}${error ? `: ${error}` : ""}`,
+        )
+      }
+
+      if (!actionId) {
+        setPendingUserInput(null)
+        return
+      }
+
+      setPendingUserInput((previous) => {
+        if (!previous || previous.actionId === actionId) {
+          return null
+        }
+        return previous
+      })
       return
     }
 
