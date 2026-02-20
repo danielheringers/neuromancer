@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Test alicia-core
         run: cargo test -p codex-alicia-core
@@ -79,7 +79,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Scenario policy read_write_with_approval
         run: cargo test -p codex-alicia-core read_write_with_approval_profile_matches_contract -- --exact
@@ -118,7 +118,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.100.0
 
       - name: E2E happy path
         run: cargo test -p codex-alicia-ui e2e_happy_path_approval_execution_and_audit -- --exact
