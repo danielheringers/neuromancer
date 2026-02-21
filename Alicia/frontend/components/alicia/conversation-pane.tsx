@@ -19,10 +19,13 @@ import {
   parseUsageSystemMessage,
 } from "@/lib/runtime-statusline"
 import {
+  parseDiffSystemMessage,
+  parseUnifiedDiffFiles,
   type ApprovalRequestState,
   type DiffFileView,
   type Message,
   type RuntimeState,
+  type TurnDiffState,
   type TurnPlanState,
   type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
@@ -37,6 +40,7 @@ interface ConversationPaneProps {
   runtimeCapabilities: RuntimeMethodCapabilities
   pendingApprovals: ApprovalRequestState[]
   pendingUserInput: UserInputRequestState | null
+  turnDiff: TurnDiffState | null
   turnDiffFiles: DiffFileView[]
   turnPlan: TurnPlanState | null
   runtimeState: RuntimeState["state"]
@@ -122,6 +126,7 @@ export function ConversationPane({
   runtimeCapabilities,
   pendingApprovals,
   pendingUserInput,
+  turnDiff,
   turnDiffFiles,
   turnPlan,
   runtimeState,
@@ -190,6 +195,53 @@ export function ConversationPane({
     return grouped
   }, [messages])
 
+  const resolvedDiffsByMessageId = useMemo(() => {
+    const map = new Map<
+      number,
+      { title?: string; emptyMessage?: string; files: DiffFileView[] }
+    >()
+
+    const currentThreadId = turnDiff?.threadId.trim() ?? ""
+    const currentTurnId = turnDiff?.turnId.trim() ?? ""
+
+    for (const message of groupedMessages) {
+      if (message.type !== "system") {
+        continue
+      }
+
+      const diffPayload = parseDiffSystemMessage(message.content)
+      if (!diffPayload) {
+        continue
+      }
+
+      if (diffPayload.version === 1) {
+        map.set(message.id, {
+          title: diffPayload.title,
+          emptyMessage: diffPayload.emptyMessage,
+          files: parseUnifiedDiffFiles(diffPayload.diff),
+        })
+        continue
+      }
+
+      const payloadThreadId = diffPayload.threadId?.trim() ?? ""
+      const payloadTurnId = diffPayload.turnId?.trim() ?? ""
+      const threadMatches =
+        payloadThreadId.length === 0 ||
+        (currentThreadId.length > 0 && payloadThreadId === currentThreadId)
+      const turnMatches =
+        payloadTurnId.length === 0 ||
+        (currentTurnId.length > 0 && payloadTurnId === currentTurnId)
+
+      map.set(message.id, {
+        title: diffPayload.title,
+        emptyMessage: diffPayload.emptyMessage,
+        files: threadMatches && turnMatches ? turnDiffFiles : [],
+      })
+    }
+
+    return map
+  }, [groupedMessages, turnDiff, turnDiffFiles])
+
   return (
     <div className="h-full flex flex-col min-h-0">
       <div className="px-4 py-2 border-b border-panel-border text-xs text-muted-foreground">
@@ -202,6 +254,7 @@ export function ConversationPane({
             type={message.type}
             content={message.content}
             timestamp={message.timestamp}
+            resolvedDiff={resolvedDiffsByMessageId.get(message.id) ?? null}
           />
         ))}
 

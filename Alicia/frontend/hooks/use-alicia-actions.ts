@@ -16,6 +16,7 @@ import {
 import {
   isRuntimeCommandUnavailable,
   isRuntimeMethodSupported,
+  encodeDiffSystemMessage,
   mapThreadTurnsToMessages,
   markRuntimeMethodUnsupported,
   type ApprovalRequestState,
@@ -63,6 +64,7 @@ interface UseAliciaActionsParams {
   setPendingUserInput: Dispatch<SetStateAction<UserInputRequestState | null>>
   setTurnDiff: Dispatch<SetStateAction<TurnDiffState | null>>
   setTurnPlan: Dispatch<SetStateAction<TurnPlanState | null>>
+  turnDiff: TurnDiffState | null
   setIsThinking: Dispatch<SetStateAction<boolean>>
   threadIdRef: MutableRefObject<string | null>
   openModelPanel: (notifyOnError?: boolean) => Promise<void>
@@ -199,6 +201,7 @@ export function useAliciaActions({
   setPendingUserInput,
   setTurnDiff,
   setTurnPlan,
+  turnDiff,
   setIsThinking,
   threadIdRef,
   openModelPanel,
@@ -360,6 +363,21 @@ export function useAliciaActions({
         await ensureBridgeSession(true)
         return
       }
+      if (normalizedName === "/diff") {
+        addMessage(
+          "system",
+          encodeDiffSystemMessage({
+            version: 2,
+            title: "Current turn diff",
+            threadId: turnDiff?.threadId,
+            turnId: turnDiff?.turnId,
+            emptyMessage:
+              "No diff available yet. Execute a turn with file changes and run /diff again.",
+          }),
+        )
+        return
+      }
+
       if (normalizedName === "/status") {
         if (!(await ensureBridgeSession(false))) {
           return
@@ -698,6 +716,7 @@ export function useAliciaActions({
       setRuntime,
       supportsRuntimeMethod,
       threadIdRef,
+      turnDiff,
     ],
   )
 
@@ -906,10 +925,3 @@ export function useAliciaActions({
     sessionActionPending,
   }
 }
-
-
-
-
-
-
-

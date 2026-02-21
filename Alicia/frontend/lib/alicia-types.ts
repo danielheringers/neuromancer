@@ -152,6 +152,7 @@ export const SUPPORTED_SLASH_COMMANDS: SlashCommand[] = [
   { command: "/fork", label: "Fork", description: "Fork current or previous session", category: "session", support: "supported" },
   { command: "/agent", label: "Agent", description: "Switch agent mode", category: "agent", support: "supported" },
   { command: "/review", label: "Review", description: "Request code review", category: "agent", support: "supported" },
+  { command: "/diff", label: "Diff", description: "Show current changes diff", category: "agent", support: "supported" },
   { command: "/mcp", label: "MCP", description: "View MCP server status and tools", category: "debug", support: "supported" },
   { command: "/apps", label: "Apps", description: "Manage connected apps", category: "debug", support: "supported" },
   { command: "/status", label: "Status", description: "Show system status", category: "debug", support: "supported" },
@@ -169,7 +170,6 @@ export const PLANNED_SLASH_COMMANDS: SlashCommand[] = [
   { command: "/compact", label: "Compact", description: "Compact conversation history", category: "session", support: "planned" },
   { command: "/plan", label: "Plan", description: "Ask agent to create a plan", category: "agent", support: "planned" },
   { command: "/collab", label: "Collab", description: "Collaborative mode with agent", category: "agent", support: "planned" },
-  { command: "/diff", label: "Diff", description: "Show current changes diff", category: "agent", support: "planned" },
   { command: "/mention", label: "Mention", description: "Mention a file or symbol", category: "agent", support: "planned" },
   { command: "/skills", label: "Skills", description: "List available skills", category: "agent", support: "planned" },
   { command: "/init", label: "Init", description: "Initialize project context", category: "agent", support: "planned" },
@@ -240,7 +240,3 @@ export interface AliciaState {
   fileChanges: FileChange[]
   activePanel: "model" | "permissions" | "mcp" | "sessions" | "apps" | null
 }
-
-
-
-

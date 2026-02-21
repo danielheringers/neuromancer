@@ -856,6 +856,90 @@ export function parseUnifiedDiffFiles(diff: string): DiffFileView[] {
   return files.filter((file) => file.lines.length > 0)
 }
 
+const DIFF_SYSTEM_MESSAGE_PREFIX = "[alicia.diff]"
+
+export interface InlineDiffSystemMessagePayload {
+  version: 1
+  title?: string
+  diff: string
+  emptyMessage?: string
+}
+
+export interface ReferenceDiffSystemMessagePayload {
+  version: 2
+  title?: string
+  threadId?: string
+  turnId?: string
+  emptyMessage?: string
+}
+
+export type DiffSystemMessagePayload =
+  | InlineDiffSystemMessagePayload
+  | ReferenceDiffSystemMessagePayload
+
+export function encodeDiffSystemMessage(payload: DiffSystemMessagePayload): string {
+  return `${DIFF_SYSTEM_MESSAGE_PREFIX}${JSON.stringify(payload)}`
+}
+
+export function parseDiffSystemMessage(
+  content: string,
+): DiffSystemMessagePayload | null {
+  if (!content.startsWith(DIFF_SYSTEM_MESSAGE_PREFIX)) {
+    return null
+  }
+
+  const rawJson = content.slice(DIFF_SYSTEM_MESSAGE_PREFIX.length).trim()
+  if (!rawJson) {
+    return null
+  }
+
+  try {
+    const parsed = JSON.parse(rawJson) as Record<string, unknown>
+    const title =
+      typeof parsed.title === "string" && parsed.title.trim().length > 0
+        ? parsed.title.trim()
+        : undefined
+    const emptyMessage =
+      typeof parsed.emptyMessage === "string" &&
+      parsed.emptyMessage.trim().length > 0
+        ? parsed.emptyMessage.trim()
+        : undefined
+
+    if (parsed.version === 1) {
+      if (typeof parsed.diff !== "string") {
+        return null
+      }
+
+      return {
+        version: 1,
+        title,
+        diff: parsed.diff,
+        emptyMessage,
+      }
+    }
+
+    if (parsed.version === 2) {
+      return {
+        version: 2,
+        title,
+        threadId:
+          typeof parsed.threadId === "string" && parsed.threadId.trim().length > 0
+            ? parsed.threadId.trim()
+            : undefined,
+        turnId:
+          typeof parsed.turnId === "string" && parsed.turnId.trim().length > 0
+            ? parsed.turnId.trim()
+            : undefined,
+        emptyMessage,
+      }
+    }
+
+    return null
+  } catch {
+    return null
+  }
+}
+
 export function itemIdentity(item: Record<string, unknown>): string | null {
   if (typeof item.id === "string" && item.id.trim().length > 0) {
     return item.id
@@ -871,11 +955,4 @@ export function mergeTerminalBuffer(previous: string, chunk: string): string {
   const max = 400_000
   return next.length <= max ? next : next.slice(next.length - max)
 }
-
-
-
-
-
-
-
 

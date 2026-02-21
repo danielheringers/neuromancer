@@ -3,7 +3,9 @@
 import { Bot, User, ChevronRight, Check, FileEdit, Search, Terminal, Copy, CheckCheck, FileCode2 } from "lucide-react"
 import { useState } from "react"
 import { parseAgentSpawnerPayload } from "@/lib/agent-spawner-events"
+import { type DiffFileView } from "@/lib/alicia-runtime-helpers"
 import { AgentSpawner } from "./agent-spawner"
+import { DiffViewer } from "./diff-viewer"
 import { StatusSnapshotCard, parseStatusSnapshot } from "./status-snapshot-card"
 
 type MessageType = "user" | "agent" | "system" | "tool"
@@ -27,6 +29,11 @@ interface TerminalMessageProps {
   toolCalls?: ToolCall[]
   codeBlocks?: CodeBlock[]
   thinking?: boolean
+  resolvedDiff?: {
+    title?: string
+    emptyMessage?: string
+    files: DiffFileView[]
+  } | null
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -170,11 +177,11 @@ export function TerminalMessage({
   toolCalls,
   codeBlocks,
   thinking,
+  resolvedDiff,
 }: TerminalMessageProps) {
   const statusSnapshot = type === "system" ? parseStatusSnapshot(content) : null
   const agentSpawnerPayload =
     type === "system" ? parseAgentSpawnerPayload(content) : null
-
   return (
     <div className={`group flex gap-3 px-5 py-3 ${type === "user" ? "bg-line-highlight/50" : ""} hover:bg-line-highlight/30 transition-colors`}>
       {/* Avatar */}
@@ -230,6 +237,27 @@ export function TerminalMessage({
                 waiting={agentSpawnerPayload.waiting}
                 timestamp={timestamp}
               />
+            ) : resolvedDiff ? (
+              <div className="space-y-2">
+                {resolvedDiff.title && (
+                  <div className="text-sm text-terminal-fg/90 leading-relaxed">
+                    {resolvedDiff.title}
+                  </div>
+                )}
+                {resolvedDiff.files.length > 0 ? (
+                  resolvedDiff.files.map((file, index) => (
+                    <DiffViewer
+                      key={`${file.filename}-${index}`}
+                      filename={file.filename}
+                      lines={file.lines}
+                    />
+                  ))
+                ) : (
+                  <div className="text-sm text-muted-foreground leading-relaxed">
+                    {resolvedDiff.emptyMessage ?? "No diff available right now."}
+                  </div>
+                )}
+              </div>
             ) : (
               <div className="text-sm text-terminal-fg/90 leading-relaxed whitespace-pre-wrap">
                 {content}
@@ -277,6 +305,7 @@ export function TerminalMessage({
 export function FileCode2Icon(props: React.SVGProps<SVGSVGElement>) {
   return <FileCode2 {...props} />
 }
+
 
 
 

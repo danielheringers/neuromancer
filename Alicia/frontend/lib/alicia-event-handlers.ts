@@ -156,6 +156,7 @@ export function createCodexEventHandler({
       if (turnThreadId.trim().length > 0) {
         threadIdRef.current = turnThreadId
       }
+      setTurnDiff(null)
       setIsThinking(true)
       return
     }
@@ -217,9 +218,20 @@ export function createCodexEventHandler({
     }
 
     if (eventType === "turn.diff.updated") {
+      const incomingThreadId = String(payload.thread_id ?? "").trim()
+      const activeThreadId = threadIdRef.current?.trim() ?? ""
+
+      if (
+        incomingThreadId.length > 0 &&
+        activeThreadId.length > 0 &&
+        incomingThreadId !== activeThreadId
+      ) {
+        return
+      }
+
       setTurnDiff({
-        threadId: String(payload.thread_id ?? ""),
-        turnId: String(payload.turn_id ?? ""),
+        threadId: incomingThreadId,
+        turnId: String(payload.turn_id ?? "").trim(),
         diff: String(payload.diff ?? ""),
       })
       return
@@ -504,5 +516,6 @@ export function createTerminalEventHandler<TWriter extends TerminalOutputWriter>
     )
   }
 }
+
 
 

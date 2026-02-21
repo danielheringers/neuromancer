@@ -415,6 +415,7 @@ export default function AliciaTerminal() {
     setPendingUserInput,
     setTurnDiff,
     setTurnPlan,
+    turnDiff,
     setIsThinking,
     threadIdRef,
     openModelPanel,
@@ -596,6 +597,7 @@ export default function AliciaTerminal() {
                 runtimeCapabilities={aliciaState.runtimeCapabilities}
                 pendingApprovals={pendingApprovals}
                 pendingUserInput={pendingUserInput}
+                turnDiff={turnDiff}
                 turnDiffFiles={turnDiffFiles}
                 turnPlan={turnPlan}
                 runtimeState={runtime.state}
@@ -728,10 +730,5 @@ export default function AliciaTerminal() {
     </div>
   )
 }
-
-
-
-
-
 
 
