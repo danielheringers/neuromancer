@@ -107,6 +107,44 @@ export interface RunCodexCommandResponse {
   status: number
   success: boolean
 }
+export type WorkspaceChangeStatus =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "copied"
+  | "unmerged"
+  | "untracked"
+  | "unknown"
+
+export interface WorkspaceChangeRecord {
+  path: string
+  status: WorkspaceChangeStatus
+  fromPath?: string
+}
+
+export interface WorkspaceChangesResponse {
+  files: WorkspaceChangeRecord[]
+}
+
+export interface GitCommitApprovedReviewRequest {
+  paths: string[]
+  message: string
+  cwd?: string
+}
+
+export interface GitStepResult {
+  stdout: string
+  stderr: string
+  status: number
+  success: boolean
+}
+
+export interface GitCommitApprovedReviewResponse {
+  success: boolean
+  add: GitStepResult
+  commit: GitStepResult
+}
 
 export interface McpStartupWarmupResponse {
   readyServers: string[]
@@ -722,11 +760,4 @@ export type CodexRuntimeEvent =
   | { type: 'stderr'; payload: StreamEventPayload }
   | { type: 'lifecycle'; payload: LifecycleEventPayload }
   | { type: 'event'; payload: CodexStructuredEventPayload }
-
-
-
-
-
-
-
 

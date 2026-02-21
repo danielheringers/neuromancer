@@ -13,11 +13,18 @@ interface DiffViewerProps {
   lines: DiffLine[]
   onApprove?: () => void
   onReject?: () => void
+  className?: string
 }
 
-export function DiffViewer({ filename, lines, onApprove, onReject }: DiffViewerProps) {
+export function DiffViewer({
+  filename,
+  lines,
+  onApprove,
+  onReject,
+  className,
+}: DiffViewerProps) {
   return (
-    <div className="rounded-md border border-panel-border overflow-hidden my-2">
+    <div className={`rounded-md border border-panel-border overflow-hidden my-2 ${className ?? ""}`}>
       <div className="flex items-center justify-between px-3 py-1.5 bg-panel-bg border-b border-panel-border">
         <div className="flex items-center gap-2">
           <span className="text-xs text-terminal-cyan">{filename}</span>

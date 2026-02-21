@@ -23,7 +23,11 @@ import {
   type UserInputRequestState,
 } from "@/lib/alicia-runtime-helpers"
 
-type AddMessage = (type: Message["type"], content: string) => void
+type AddMessage = (
+  type: Message["type"],
+  content: string,
+  channel?: Message["channel"],
+) => void
 
 interface CodexEventHandlerDeps {
   addMessage: AddMessage
@@ -36,6 +40,8 @@ interface CodexEventHandlerDeps {
   seenEventSeqRef: MutableRefObject<Set<number>>
   streamedAgentTextRef: MutableRefObject<Map<string, string>>
   threadIdRef: MutableRefObject<string | null>
+  reviewRoutingRef: MutableRefObject<boolean>
+  onRefreshWorkspaceChanges?: () => void
 }
 
 export function createCodexEventHandler({
@@ -49,27 +55,50 @@ export function createCodexEventHandler({
   seenEventSeqRef,
   streamedAgentTextRef,
   threadIdRef,
+  reviewRoutingRef,
+  onRefreshWorkspaceChanges,
 }: CodexEventHandlerDeps) {
   const reportedContractViolations = new Set<string>()
+  let reviewModeActive = false
+
+  const isReviewChannelActive = () =>
+    reviewModeActive || reviewRoutingRef.current
+
+  const messageChannel = (): Message["channel"] =>
+    isReviewChannelActive() ? "review" : "chat"
+
+  const pushMessage = (type: Message["type"], content: string) => {
+    addMessage(type, content, messageChannel())
+  }
 
   const reportContractViolation = (key: string, message: string) => {
     if (reportedContractViolations.has(key)) {
       return
     }
     reportedContractViolations.add(key)
-    addMessage("system", `[contract] ${message}`)
+    pushMessage("system", `[contract] ${message}`)
   }
 
+  const finalizeTurn = () => {
+    if (isReviewChannelActive()) {
+      reviewModeActive = false
+      reviewRoutingRef.current = false
+    }
+    onRefreshWorkspaceChanges?.()
+  }
   return (event: CodexRuntimeEvent) => {
     if (event.type === "lifecycle") {
       if (event.payload.status === "error") {
+        const currentChannel = messageChannel()
         setRuntime((prev) => ({ ...prev, state: "error" }))
         setIsThinking(false)
         setPendingApprovals([])
         setPendingUserInput(null)
         setTurnDiff(null)
         streamedAgentTextRef.current.clear()
-        addMessage("system", event.payload.message ?? "runtime error")
+        addMessage("system", event.payload.message ?? "runtime error", currentChannel)
+        reviewModeActive = false
+        reviewRoutingRef.current = false
       }
       if (event.payload.status === "stopped") {
         setRuntime((prev) => ({ ...prev, state: "idle", sessionId: null, pid: null }))
@@ -79,17 +108,19 @@ export function createCodexEventHandler({
         setTurnDiff(null)
         setTurnPlan(null)
         streamedAgentTextRef.current.clear()
+        reviewModeActive = false
+        reviewRoutingRef.current = false
       }
       return
     }
 
     if (event.type === "stdout" && event.payload.chunk.trim()) {
-      addMessage("system", event.payload.chunk)
+      pushMessage("system", event.payload.chunk)
       return
     }
 
     if (event.type === "stderr" && event.payload.chunk.trim()) {
-      addMessage("system", event.payload.chunk)
+      pushMessage("system", event.payload.chunk)
       return
     }
 
@@ -148,7 +179,7 @@ export function createCodexEventHandler({
       if (codexThreadId.trim().length > 0) {
         threadIdRef.current = codexThreadId
       }
-      addMessage("system", `[thread] started ${codexThreadId}`)
+      pushMessage("system", `[thread] started ${codexThreadId}`)
       return
     }
     if (eventType === "turn.started") {
@@ -157,19 +188,24 @@ export function createCodexEventHandler({
         threadIdRef.current = turnThreadId
       }
       setTurnDiff(null)
+      if (reviewRoutingRef.current) {
+        reviewModeActive = true
+      }
       setIsThinking(true)
       return
     }
     if (eventType === "turn.completed") {
       setIsThinking(false)
       streamedAgentTextRef.current.clear()
+      finalizeTurn()
       return
     }
     if (eventType === "turn.failed") {
       setIsThinking(false)
       streamedAgentTextRef.current.clear()
       const error = payload.error as Record<string, unknown> | undefined
-      addMessage("system", `[turn failed] ${String(error?.message ?? "unknown")}`)
+      pushMessage("system", `[turn failed] ${String(error?.message ?? "unknown")}`)
+      finalizeTurn()
       return
     }
 
@@ -182,12 +218,12 @@ export function createCodexEventHandler({
           : null
 
       if (success) {
-        addMessage(
+        pushMessage(
           "system",
           name ? `[mcp] oauth login completed for ${name}` : "[mcp] oauth login completed",
         )
       } else {
-        addMessage(
+        pushMessage(
           "system",
           name
             ? `[mcp] oauth login failed for ${name}: ${error ?? "unknown error"}`
@@ -209,7 +245,7 @@ export function createCodexEventHandler({
         Number.isFinite(totalTokens) &&
         totalTokens > 0
       ) {
-        addMessage(
+        pushMessage(
           "system",
           `[usage] total=${totalTokens} input=${input} output=${output}`,
         )
@@ -413,7 +449,7 @@ export function createCodexEventHandler({
           : null
 
       if (outcome === "error" || outcome === "timed_out" || outcome === "cancelled") {
-        addMessage(
+        pushMessage(
           "system",
           `[user input] ${outcome}${error ? `: ${error}` : ""}`,
         )
@@ -459,23 +495,37 @@ export function createCodexEventHandler({
           }
           const finalText = completedText.trim().length > 0 ? completedText : bufferedText
           if (finalText.trim().length > 0) {
-            addMessage("agent", finalText)
+            pushMessage("agent", finalText)
           }
         }
         return
       }
 
-      const shouldRenderOnStart =
+      const enteredReviewMode =
         eventType === "item.started" &&
         (itemType === "entered_review_mode" || itemType === "enteredReviewMode")
 
-      if (eventType !== "item.completed" && !shouldRenderOnStart) {
+      if (enteredReviewMode) {
+        reviewModeActive = true
+        reviewRoutingRef.current = true
+      }
+
+      if (eventType !== "item.completed" && !enteredReviewMode) {
         return
       }
 
       const content = formatStructuredItem(item)
       if (content) {
-        addMessage("system", content)
+        pushMessage("system", content)
+      }
+
+      const exitedReviewMode =
+        eventType === "item.completed" &&
+        (itemType === "exited_review_mode" || itemType === "exitedReviewMode")
+
+      if (exitedReviewMode) {
+        reviewModeActive = false
+        reviewRoutingRef.current = false
       }
     }
   }
@@ -516,6 +566,4 @@ export function createTerminalEventHandler<TWriter extends TerminalOutputWriter>
     )
   }
 }
-
-
 

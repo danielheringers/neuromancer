@@ -1,9 +1,9 @@
 "use client"
 
-import { Bot, User, ChevronRight, Check, FileEdit, Search, Terminal, Copy, CheckCheck, FileCode2 } from "lucide-react"
-import { useState } from "react"
+import { Bot, User, Check, FileEdit, Search, Terminal, Copy, CheckCheck, FileCode2 } from "lucide-react"
+import { useMemo, useState } from "react"
 import { parseAgentSpawnerPayload } from "@/lib/agent-spawner-events"
-import { type DiffFileView } from "@/lib/alicia-runtime-helpers"
+import { parseAgentDiffMarkdownSegments, type DiffFileView } from "@/lib/alicia-runtime-helpers"
 import { AgentSpawner } from "./agent-spawner"
 import { DiffViewer } from "./diff-viewer"
 import { StatusSnapshotCard, parseStatusSnapshot } from "./status-snapshot-card"
@@ -55,54 +55,7 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-function SyntaxHighlight({ code, language }: { code: string; language: string }) {
-  // Simple syntax highlighting based on common patterns
-  const highlightLine = (line: string) => {
-    const tokens: { text: string; color: string }[] = []
-    let remaining = line
-
-    // Comments
-    if (remaining.trimStart().startsWith("//") || remaining.trimStart().startsWith("#")) {
-      return [{ text: remaining, color: "text-terminal-comment" }]
-    }
-
-    // Simple token-based highlighting
-    const patterns: [RegExp, string][] = [
-      [/^(\s*)(pub|fn|let|mut|use|mod|struct|impl|enum|if|else|for|while|return|async|await|const|type|interface|export|import|from|class|def|self)\b/, "text-terminal-blue"],
-      [/^(\s*)(true|false|None|null|undefined|nil)\b/, "text-terminal-pink"],
-      [/"[^"]*"/, "text-terminal-gold"],
-      [/'[^']*'/, "text-terminal-gold"],
-      [/`[^`]*`/, "text-terminal-gold"],
-      [/\b(\d+\.?\d*)\b/, "text-terminal-pink"],
-    ]
-
-    // For simplicity, do a line-level approach
-    let hasMatch = false
-    for (const [pattern, color] of patterns) {
-      const match = remaining.match(pattern)
-      if (match) {
-        hasMatch = true
-        break
-      }
-    }
-
-    if (!hasMatch) {
-      return [{ text: remaining, color: "text-terminal-fg" }]
-    }
-
-    // Highlight keywords inline
-    const keywords = /\b(pub|fn|let|mut|use|mod|struct|impl|enum|if|else|for|while|return|async|await|const|type|interface|export|import|from|class|def|self)\b/g
-    const strings = /("[^"]*"|'[^']*'|`[^`]*`)/g
-    const numbers = /\b(\d+\.?\d*)\b/g
-    const functions = /\b([a-z_][a-z0-9_]*)\s*\(/gi
-
-    let result = remaining
-    // We'll return the raw text with span-level coloring done via dangerouslySetInnerHTML
-    // Actually, let's just return segments for safety
-
-    return [{ text: remaining, color: "text-terminal-fg" }]
-  }
-
+function SyntaxHighlight({ code }: { code: string }) {
   const lines = code.split("\n")
 
   return (
@@ -182,6 +135,10 @@ export function TerminalMessage({
   const statusSnapshot = type === "system" ? parseStatusSnapshot(content) : null
   const agentSpawnerPayload =
     type === "system" ? parseAgentSpawnerPayload(content) : null
+  const parsedAgentSegments = useMemo(
+    () => (type === "agent" && !resolvedDiff ? parseAgentDiffMarkdownSegments(content) : null),
+    [type, content, resolvedDiff],
+  )
   return (
     <div className={`group flex gap-3 px-5 py-3 ${type === "user" ? "bg-line-highlight/50" : ""} hover:bg-line-highlight/30 transition-colors`}>
       {/* Avatar */}
@@ -258,6 +215,26 @@ export function TerminalMessage({
                   </div>
                 )}
               </div>
+            ) : parsedAgentSegments ? (
+              <div className="text-sm text-terminal-fg/90 leading-relaxed">
+                {parsedAgentSegments.map((segment, index) =>
+                  segment.kind === "text" ? (
+                    <span key={`text-${index}`} className="whitespace-pre-wrap">
+                      {segment.content}
+                    </span>
+                  ) : (
+                    <div key={`diff-${index}`}>
+                      {segment.files.map((file, fileIndex) => (
+                        <DiffViewer
+                          key={`${file.filename}-${index}-${fileIndex}`}
+                          filename={file.filename}
+                          lines={file.lines}
+                        />
+                      ))}
+                    </div>
+                  ),
+                )}
+              </div>
             ) : (
               <div className="text-sm text-terminal-fg/90 leading-relaxed whitespace-pre-wrap">
                 {content}
@@ -289,7 +266,7 @@ export function TerminalMessage({
                       <CopyButton text={block.content} />
                     </div>
                     <div className="p-3 bg-terminal-bg overflow-x-auto">
-                      <SyntaxHighlight code={block.content} language={block.language} />
+                      <SyntaxHighlight code={block.content} />
                     </div>
                   </div>
                 ))}
@@ -305,6 +282,9 @@ export function TerminalMessage({
 export function FileCode2Icon(props: React.SVGProps<SVGSVGElement>) {
   return <FileCode2 {...props} />
 }
+
+
+
 
 
 

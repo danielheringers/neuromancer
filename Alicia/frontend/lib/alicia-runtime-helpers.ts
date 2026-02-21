@@ -19,8 +19,11 @@ import {
   encodeAgentSpawnerPayload,
 } from "@/lib/agent-spawner-events"
 
+export type MessageChannel = "chat" | "review"
+
 export interface Message {
   id: number
+  channel: MessageChannel
   type: "user" | "agent" | "system"
   content: string
   timestamp: string
@@ -306,6 +309,7 @@ export function mapThreadTurnsToMessages(turns: CodexThreadTurn[]): Message[] {
       }
       mapped.push({
         id: nextId,
+        channel: "chat",
         type: role,
         content,
         timestamp: timestampNow(),
@@ -854,6 +858,76 @@ export function parseUnifiedDiffFiles(diff: string): DiffFileView[] {
   }
 
   return files.filter((file) => file.lines.length > 0)
+}
+
+export interface ParsedAgentTextSegment {
+  kind: "text"
+  content: string
+}
+
+export interface ParsedAgentDiffSegment {
+  kind: "diff"
+  raw: string
+  files: DiffFileView[]
+}
+
+export type ParsedAgentMessageSegment =
+  | ParsedAgentTextSegment
+  | ParsedAgentDiffSegment
+export function parseAgentDiffMarkdownSegments(
+  content: string,
+): ParsedAgentMessageSegment[] {
+  if (!content) {
+    return [{ kind: "text", content: "" }]
+  }
+
+  const segments: ParsedAgentMessageSegment[] = []
+  const blockPattern =
+    /```[ \t]*(diff|patch)\b[^\r\n]*\r?\n([\s\S]*?)\r?\n```[ \t]*(?=\r?\n|$)/gi
+  let cursor = 0
+
+  for (const match of content.matchAll(blockPattern)) {
+    const blockStart = match.index ?? -1
+    if (blockStart < 0) {
+      continue
+    }
+
+    const fullBlock = match[0] ?? ""
+    const diffSource = match[2] ?? ""
+    const blockEnd = blockStart + fullBlock.length
+
+    if (blockStart > cursor) {
+      segments.push({
+        kind: "text",
+        content: content.slice(cursor, blockStart),
+      })
+    }
+
+    const files = parseUnifiedDiffFiles(diffSource)
+    if (files.length > 0) {
+      segments.push({
+        kind: "diff",
+        raw: fullBlock,
+        files,
+      })
+    } else {
+      segments.push({
+        kind: "text",
+        content: fullBlock,
+      })
+    }
+
+    cursor = blockEnd
+  }
+
+  if (cursor < content.length) {
+    segments.push({
+      kind: "text",
+      content: content.slice(cursor),
+    })
+  }
+
+  return segments.length > 0 ? segments : [{ kind: "text", content }]
 }
 
 const DIFF_SYSTEM_MESSAGE_PREFIX = "[alicia.diff]"

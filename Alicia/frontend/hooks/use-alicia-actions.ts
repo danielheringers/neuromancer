@@ -20,6 +20,7 @@ import {
   mapThreadTurnsToMessages,
   markRuntimeMethodUnsupported,
   type ApprovalRequestState,
+  type MessageChannel,
   type Message,
   type RuntimeState,
   type TurnDiffState,
@@ -52,7 +53,11 @@ import {
 } from "@/lib/tauri-bridge"
 
 interface UseAliciaActionsParams {
-  addMessage: (type: Message["type"], content: string) => void
+  addMessage: (
+    type: Message["type"],
+    content: string,
+    channel?: MessageChannel,
+  ) => void
   aliciaState: AliciaState
   ensureBridgeSession: (forceNew?: boolean) => Promise<boolean>
   pendingImages: string[]
@@ -83,6 +88,8 @@ interface UseAliciaActionsParams {
   setRuntime: Dispatch<SetStateAction<RuntimeState>>
   runtimeConfigRef: MutableRefObject<RuntimeCodexConfig | null>
   availableModels: CodexModel[]
+  reviewRoutingRef: MutableRefObject<boolean>
+  refreshWorkspaceChanges: () => Promise<void>
 }
 
 interface ParsedSlashCommand {
@@ -213,6 +220,8 @@ export function useAliciaActions({
   setRuntime,
   runtimeConfigRef,
   availableModels,
+  reviewRoutingRef,
+  refreshWorkspaceChanges,
 }: UseAliciaActionsParams) {
   const [sessionActionPending, setSessionActionPending] = useState<{
     sessionId: string
@@ -390,15 +399,20 @@ export function useAliciaActions({
         return
       }
       if (normalizedName === "/review") {
+        setAliciaState((prev) => ({ ...prev, activePanel: "review" }))
+        await refreshWorkspaceChanges()
+
         if (!(await ensureBridgeSession(false))) {
           return
         }
+
+        reviewRoutingRef.current = false
 
         let parsedReview: ParsedReviewSlash
         try {
           parsedReview = parseReviewSlashArgs(args)
         } catch (error) {
-          addMessage("system", `[review] ${String(error)}`)
+          addMessage("system", `[review] ${String(error)}`, "review")
           return
         }
 
@@ -406,10 +420,12 @@ export function useAliciaActions({
           addMessage(
             "system",
             "[slash] /review is not supported by current runtime (missing review.start)",
+            "review",
           )
           return
         }
 
+        reviewRoutingRef.current = true
         setIsThinking(true)
         try {
           const started = await codexReviewStart({
@@ -434,15 +450,19 @@ export function useAliciaActions({
           })
         } catch (error) {
           setIsThinking(false)
+          reviewRoutingRef.current = false
           if (isRuntimeCommandUnavailable(error)) {
             markUnsupportedRuntimeMethod("review.start")
             addMessage(
               "system",
               "[slash] /review is not supported by current runtime (missing review.start)",
+              "review",
             )
             return
           }
-          addMessage("system", `[review] failed: ${String(error)}`)
+          addMessage("system", `[review] failed: ${String(error)}`, "review")
+        } finally {
+          await refreshWorkspaceChanges()
         }
         return
       }
@@ -717,6 +737,9 @@ export function useAliciaActions({
       supportsRuntimeMethod,
       threadIdRef,
       turnDiff,
+      reviewRoutingRef,
+      refreshWorkspaceChanges,
+      runtimeConfigRef,
     ],
   )
 
@@ -878,6 +901,7 @@ export function useAliciaActions({
         }
 
         setMessages(historyMessages)
+        reviewRoutingRef.current = false
         setIsThinking(false)
         setPendingApprovals([])
         setPendingUserInput(null)
@@ -913,6 +937,7 @@ export function useAliciaActions({
       setTurnPlan,
       supportsRuntimeMethod,
       threadIdRef,
+      reviewRoutingRef,
     ],
   )
 
@@ -925,3 +950,4 @@ export function useAliciaActions({
     sessionActionPending,
   }
 }
+

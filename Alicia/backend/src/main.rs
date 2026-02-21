@@ -195,6 +195,53 @@ struct RunCodexCommandResponse {
     success: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitApprovedReviewRequest {
+    paths: Vec<String>,
+    message: String,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommandExecutionResult {
+    stdout: String,
+    stderr: String,
+    status: i32,
+    success: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCommitApprovedReviewResponse {
+    success: bool,
+    add: GitCommandExecutionResult,
+    commit: GitCommandExecutionResult,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorkspaceChangesRequest {
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorkspaceChange {
+    path: String,
+    status: String,
+    code: String,
+    from_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorkspaceChangesResponse {
+    cwd: String,
+    total: usize,
+    files: Vec<GitWorkspaceChange>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -824,6 +871,40 @@ fn terminal_kill(
 fn run_codex_command(args: Vec<String>, cwd: Option<String>) -> Result<RunCodexCommandResponse, String> {
     crate::command_runtime::run_codex_command_impl(args, cwd)
 }
+
+#[tauri::command]
+fn git_commit_approved_review(
+    state: State<'_, AppState>,
+    mut request: GitCommitApprovedReviewRequest,
+) -> Result<GitCommitApprovedReviewResponse, String> {
+    let active_cwd = {
+        let active = lock_active_session(state.inner())?;
+        active.as_ref().map(|session| session.cwd.to_string_lossy().to_string())
+    };
+
+    let Some(cwd) = active_cwd else {
+        return Err("git_commit_approved_review requires an active codex session".to_string());
+    };
+
+    request.cwd = Some(cwd);
+
+    crate::command_runtime::git_commit_approved_review_impl(request)
+}
+
+#[tauri::command]
+fn git_workspace_changes(
+    state: State<'_, AppState>,
+    request: Option<GitWorkspaceChangesRequest>,
+) -> Result<GitWorkspaceChangesResponse, String> {
+    {
+        let active = lock_active_session(state.inner())?;
+        if active.is_none() {
+            return Err("git_workspace_changes requires an active codex session".to_string());
+        }
+    }
+
+    crate::command_runtime::git_workspace_changes_impl(state, request.unwrap_or_default())
+}
 #[tauri::command]
 fn codex_models_list(state: State<'_, AppState>) -> Result<CodexModelListResponse, String> {
     crate::command_runtime::codex_models_list_impl(state)
@@ -957,6 +1038,8 @@ fn main() {
             terminal_resize,
             terminal_kill,
             run_codex_command,
+            git_commit_approved_review,
+            git_workspace_changes,
             codex_models_list,
             codex_app_list,
             codex_account_read,
@@ -974,4 +1057,5 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
 

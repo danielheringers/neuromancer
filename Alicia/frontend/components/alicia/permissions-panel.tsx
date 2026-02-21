@@ -1,6 +1,6 @@
 "use client"
 
-import { X, Shield, ShieldCheck, ShieldAlert, ShieldOff, Check, AlertTriangle } from "lucide-react"
+import { X, Shield, ShieldCheck, ShieldOff, Check, AlertTriangle } from "lucide-react"
 import { APPROVAL_PRESETS, type ApprovalPreset, type SandboxMode } from "@/lib/alicia-types"
 
 interface PermissionsPanelProps {

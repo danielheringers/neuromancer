@@ -11,6 +11,7 @@ import { PermissionsPanel } from "@/components/alicia/permissions-panel"
 import { McpPanel } from "@/components/alicia/mcp-panel"
 import { AppsPanel } from "@/components/alicia/apps-panel"
 import { SessionPicker } from "@/components/alicia/session-picker"
+import { ReviewMode } from "@/components/alicia/review-mode"
 import { TerminalPane } from "@/components/alicia/terminal-pane"
 import { type AliciaState } from "@/lib/alicia-types"
 import {
@@ -20,6 +21,8 @@ import {
   isTauriRuntime,
   pickImageFile,
   pickMentionFile,
+  gitCommitApprovedReview,
+  codexWorkspaceChanges,
   terminalResize,
   terminalWrite,
   type ApprovalDecision,
@@ -31,7 +34,9 @@ import {
   mapDiffFilesToFileChanges,
   parseUnifiedDiffFiles,
   type ApprovalRequestState,
+  type DiffFileView,
   type Message,
+  type MessageChannel,
   readModelsCache,
   type RuntimeState,
   type TerminalTab,
@@ -71,6 +76,7 @@ export default function AliciaTerminal() {
   )
   const [bootLogs, setBootLogs] = useState<string[]>([])
   const [messages, setMessages] = useState<Message[]>([])
+  const [reviewMessages, setReviewMessages] = useState<Message[]>([])
   const [isThinking, setIsThinking] = useState(false)
   const [pendingApprovals, setPendingApprovals] = useState<ApprovalRequestState[]>([])
   const [pendingUserInput, setPendingUserInput] = useState<UserInputRequestState | null>(null)
@@ -106,6 +112,8 @@ export default function AliciaTerminal() {
   const terminalUnlistenRef = useRef<(() => void) | null>(null)
   const runtimeConfigRef = useRef<RuntimeCodexConfig | null>(null)
   const threadIdRef = useRef<string | null>(null)
+  const reviewMessagesBySessionRef = useRef<Map<string, Message[]>>(new Map())
+  const activeReviewSessionKeyRef = useRef<string | null>(null)
   const terminalBuffersRef = useRef<Map<number, string>>(new Map())
   const activeTerminalRef = useRef<number | null>(null)
   const xtermRef = useRef<import("xterm").Terminal | null>(null)
@@ -114,6 +122,8 @@ export default function AliciaTerminal() {
   const streamedAgentTextRef = useRef<Map<string, string>>(new Map())
   const bootstrappedRef = useRef(false)
   const autoTerminalCreatedRef = useRef(false)
+  const reviewRoutingRef = useRef(false)
+  const turnDiffFilesRef = useRef<DiffFileView[]>([])
 
   useEffect(() => {
     const cached = readModelsCache()
@@ -131,18 +141,25 @@ export default function AliciaTerminal() {
   }, [])
 
   const addMessage = useCallback(
-    (type: Message["type"], content: string) => {
+    (
+      type: Message["type"],
+      content: string,
+      channel: MessageChannel = "chat",
+    ) => {
       if (!content.trim()) {
         return
       }
 
       const timestamp = timestampNow()
-      setMessages((prev) => {
+      const setTargetMessages = channel === "review" ? setReviewMessages : setMessages
+
+      setTargetMessages((prev) => {
         if (type !== "system" || prev.length === 0) {
           return [
             ...prev,
             {
               id: nextMessageId(),
+              channel,
               type,
               content,
               timestamp,
@@ -157,6 +174,7 @@ export default function AliciaTerminal() {
             ...prev,
             {
               id: nextMessageId(),
+              channel,
               type,
               content,
               timestamp,
@@ -170,6 +188,7 @@ export default function AliciaTerminal() {
             ...prev,
             {
               id: nextMessageId(),
+              channel,
               type,
               content,
               timestamp,
@@ -200,13 +219,116 @@ export default function AliciaTerminal() {
     () => parseUnifiedDiffFiles(turnDiff?.diff ?? ""),
     [turnDiff],
   )
+  const activeSessionId = useMemo(
+    () => aliciaState.sessions.find((session) => session.active)?.id ?? null,
+    [aliciaState.sessions],
+  )
+  const activeReviewSessionKey = activeSessionId ?? threadIdRef.current ?? "__sessionless__"
 
   useEffect(() => {
-    setAliciaState((previous) => ({
-      ...previous,
-      fileChanges: mapDiffFilesToFileChanges(turnDiffFiles),
-    }))
-  }, [turnDiffFiles])
+    if (activeReviewSessionKeyRef.current === null) {
+      activeReviewSessionKeyRef.current = activeReviewSessionKey
+      const initialMessages =
+        reviewMessagesBySessionRef.current.get(activeReviewSessionKey) ?? []
+      setReviewMessages(initialMessages)
+      return
+    }
+
+    if (activeReviewSessionKeyRef.current === activeReviewSessionKey) {
+      return
+    }
+
+    const previousKey = activeReviewSessionKeyRef.current
+    if (previousKey) {
+      reviewMessagesBySessionRef.current.set(previousKey, reviewMessages)
+    }
+
+    activeReviewSessionKeyRef.current = activeReviewSessionKey
+    const nextMessages =
+      reviewMessagesBySessionRef.current.get(activeReviewSessionKey) ?? []
+    setReviewMessages(nextMessages)
+  }, [activeReviewSessionKey, reviewMessages])
+
+  useEffect(() => {
+    reviewMessagesBySessionRef.current.set(activeReviewSessionKey, reviewMessages)
+  }, [activeReviewSessionKey, reviewMessages])
+
+  const refreshWorkspaceChanges = useCallback(async () => {
+    const normalizeStatus = (value: unknown): AliciaState["fileChanges"][number]["status"] => {
+      const status = String(value ?? "").trim().toLowerCase()
+      if (status === "added" || status === "a" || status === "new") return "added"
+      if (status === "deleted" || status === "d" || status === "removed" || status === "missing") {
+        return "deleted"
+      }
+      if (status === "renamed" || status === "r") return "renamed"
+      if (status === "copied" || status === "c") return "copied"
+      if (status === "untracked" || status === "??") return "untracked"
+      if (status === "unmerged" || status === "u" || status === "uu") return "unmerged"
+      return "modified"
+    }
+
+    try {
+      const response = await codexWorkspaceChanges()
+      const filesSource = Array.isArray((response as { files?: unknown[] }).files)
+        ? (response as { files: unknown[] }).files
+        : []
+
+      const fileChanges = filesSource
+        .map((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            return null
+          }
+
+          const record = entry as Record<string, unknown>
+          const name =
+            (typeof record.path === "string" && record.path.trim()) ||
+            (typeof record.name === "string" && record.name.trim()) ||
+            ""
+
+          if (!name) {
+            return null
+          }
+
+          const fromPath =
+            typeof record.fromPath === "string" && record.fromPath.trim()
+              ? record.fromPath.trim()
+              : undefined
+
+          if (fromPath) {
+            return {
+              name,
+              status: normalizeStatus(record.status),
+              fromPath,
+            }
+          }
+
+          return {
+            name,
+            status: normalizeStatus(record.status),
+          }
+        })
+        .filter(
+          (entry): entry is AliciaState["fileChanges"][number] => entry !== null,
+        )
+
+      setAliciaState((previous) => ({
+        ...previous,
+        fileChanges,
+      }))
+      return
+    } catch {
+      const fallback = mapDiffFilesToFileChanges(turnDiffFilesRef.current)
+      setAliciaState((previous) => ({
+        ...previous,
+        fileChanges: fallback,
+      }))
+    }
+  }, [])
+
+  useEffect(() => {
+    turnDiffFilesRef.current = turnDiffFiles
+    void refreshWorkspaceChanges()
+  }, [turnDiffFiles, refreshWorkspaceChanges])
 
   const statusSignals = useMemo(() => {
     let usage: UsageStats | null = null
@@ -357,8 +479,12 @@ export default function AliciaTerminal() {
         seenEventSeqRef,
         streamedAgentTextRef,
         threadIdRef,
+        reviewRoutingRef,
+        onRefreshWorkspaceChanges: () => {
+          void refreshWorkspaceChanges()
+        },
       }),
-    [addMessage],
+    [addMessage, refreshWorkspaceChanges],
   )
 
   const handleTerminalEvent = useMemo(
@@ -427,6 +553,8 @@ export default function AliciaTerminal() {
     setRuntime,
     runtimeConfigRef,
     availableModels,
+    reviewRoutingRef,
+    refreshWorkspaceChanges,
   })
 
   const handleTerminalResize = useCallback(
@@ -498,7 +626,98 @@ export default function AliciaTerminal() {
     },
     [addMessage],
   )
+  const handleCommitApprovedReview = useCallback(
+    async (payload: {
+      approvedPaths: string[]
+      message: string
+      comments: Record<string, string>
+    }) => {
+      const approvedPaths = payload.approvedPaths
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0)
 
+      if (approvedPaths.length === 0) {
+        addMessage("system", "[review] no approved files selected for commit", "review")
+        return
+      }
+
+      const changeByPath = new Map(
+        aliciaState.fileChanges.map((entry) => [entry.name, entry]),
+      )
+      const workspaceConflicts = aliciaState.fileChanges
+        .filter((entry) => entry.status === "unmerged")
+        .map((entry) => entry.name)
+      if (workspaceConflicts.length > 0) {
+        addMessage(
+          "system",
+          `[review] resolve conflicts before commit: ${workspaceConflicts.join(", ")}`,
+          "review",
+        )
+        return
+      }
+
+      const expandedPaths = Array.from(
+        new Set(
+          approvedPaths.flatMap((path) => {
+            const change = changeByPath.get(path)
+            if (
+              change &&
+              (change.status === "renamed" || change.status === "copied") &&
+              typeof change.fromPath === "string" &&
+              change.fromPath.trim().length > 0
+            ) {
+              return [path, change.fromPath.trim()]
+            }
+            return [path]
+          }),
+        ),
+      )
+
+      const commitMessage = payload.message.trim()
+      if (!commitMessage) {
+        addMessage("system", "[review] commit message is required", "review")
+        return
+      }
+
+      const reviewNotes = approvedPaths
+        .map((path) => {
+          const note = payload.comments[path]?.trim()
+          return note ? `${path}: ${note}` : null
+        })
+        .filter((entry): entry is string => Boolean(entry))
+      const activeSessionCwd =
+        aliciaState.sessions.find((session) => session.active)?.cwd?.trim() || null
+
+      try {
+        const response = await gitCommitApprovedReview({
+          paths: expandedPaths,
+          message: commitMessage,
+          cwd: activeSessionCwd ?? undefined,
+        })
+
+        if (!response.success) {
+          const addError = response.add.stderr.trim()
+          const commitError = response.commit.stderr.trim()
+          const failure = addError || commitError || "git add/commit failed"
+          throw new Error(failure)
+        }
+
+        addMessage(
+          "system",
+          `[review] committed ${approvedPaths.length} approved file(s): ${approvedPaths.join(", ")}`,
+          "review",
+        )
+        if (reviewNotes.length > 0) {
+          addMessage("system", `[review] notes\n${reviewNotes.join("\n")}`, "review")
+        }
+      } catch (error) {
+        addMessage("system", `[review] commit failed: ${String(error)}`, "review")
+      } finally {
+        await refreshWorkspaceChanges()
+      }
+    },
+    [addMessage, aliciaState.fileChanges, aliciaState.sessions, refreshWorkspaceChanges],
+  )
   if (initializing) {
     return (
       <div className="h-screen w-screen flex items-center justify-center bg-background p-4">
@@ -553,14 +772,18 @@ export default function AliciaTerminal() {
             }}
             onStartSession={() => {
               threadIdRef.current = null
+              reviewRoutingRef.current = false
+              setMessages([])
               setPendingApprovals([])
               setPendingUserInput(null)
               setTurnDiff(null)
               setTurnPlan(null)
               void ensureBridgeSession(true)
+              void refreshWorkspaceChanges()
             }}
             onStopSession={() => {
               void codexBridgeStop()
+              reviewRoutingRef.current = false
               setPendingApprovals([])
               setPendingUserInput(null)
               setTurnDiff(null)
@@ -580,6 +803,10 @@ export default function AliciaTerminal() {
             }}
             onSelectSession={(sessionId) => {
               void handleSessionSelect(sessionId, "switch")
+            }}
+            onStartReview={() => {
+              setAliciaState((prev) => ({ ...prev, activePanel: "review" }))
+              void refreshWorkspaceChanges()
             }}
           />
         </ResizablePanel>
@@ -709,6 +936,21 @@ export default function AliciaTerminal() {
           onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
         />
       )}
+      {aliciaState.activePanel === "review" && (
+        <ReviewMode
+          fileChanges={aliciaState.fileChanges}
+          turnDiffFiles={turnDiffFiles}
+          pendingApprovals={pendingApprovals}
+          reviewMessages={reviewMessages}
+          isReviewThinking={isThinking && reviewRoutingRef.current}
+          onRunReview={() => {
+            void refreshWorkspaceChanges()
+            void handleSlashCommand("/review")
+          }}
+          onCommitApproved={handleCommitApprovedReview}
+          onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
+        />
+      )}
       {aliciaState.activePanel === "sessions" && (
         <SessionPicker
           sessions={aliciaState.sessions}
@@ -718,11 +960,14 @@ export default function AliciaTerminal() {
           onSelect={handleSessionSelect}
           onNewSession={() => {
             threadIdRef.current = null
+            reviewRoutingRef.current = false
+            setMessages([])
             setPendingApprovals([])
             setPendingUserInput(null)
             setTurnDiff(null)
             setTurnPlan(null)
             void ensureBridgeSession(true)
+            void refreshWorkspaceChanges()
           }}
           onClose={() => setAliciaState((prev) => ({ ...prev, activePanel: null }))}
         />
@@ -730,5 +975,7 @@ export default function AliciaTerminal() {
     </div>
   )
 }
+
+
 
 

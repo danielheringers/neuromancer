@@ -43,6 +43,7 @@ interface SidebarProps {
   onResumeSession: () => void
   onForkSession: () => void
   onSelectSession: (sessionId: string) => void
+  onStartReview: () => void
 }
 
 interface SessionDayGroup {
@@ -75,12 +76,20 @@ const statusColor = {
   modified: "text-terminal-blue",
   added: "text-terminal-green",
   deleted: "text-terminal-red",
+  renamed: "text-terminal-cyan",
+  copied: "text-terminal-cyan",
+  untracked: "text-terminal-gold",
+  unmerged: "text-terminal-red",
 }
 
 const statusLabel = {
   modified: "M",
   added: "A",
   deleted: "D",
+  renamed: "R",
+  copied: "C",
+  untracked: "U",
+  unmerged: "!",
 }
 
 function authModeSummary(mode: AliciaState["account"]["authMode"]): string {
@@ -221,6 +230,7 @@ export function Sidebar({
   onResumeSession,
   onForkSession,
   onSelectSession,
+  onStartReview,
 }: SidebarProps) {
   const ApprovalIcon = approvalIcons[state.approvalPreset]
   const connectedMcps = state.mcpServers.filter(
@@ -231,6 +241,7 @@ export function Sidebar({
     0,
   )
   const isRunning = runtimeState === "running" || runtimeState === "starting"
+  const isReviewActive = state.activePanel === "review"
 
   const groupedSessions = useMemo(() => buildSessionGroups(state.sessions), [state.sessions])
   const [collapsedYears, setCollapsedYears] = useState<Set<string>>(() => new Set())
@@ -529,28 +540,44 @@ export function Sidebar({
         </div>
 
         <div className="p-3 border-t border-panel-border shrink-0">
-          <div className="flex items-center gap-2 px-1 mb-2">
-            <FileCode2 className="w-3.5 h-3.5 text-muted-foreground" />
-            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Changes
-            </span>
-            <span className="ml-auto text-[10px] bg-terminal-blue/20 text-terminal-blue px-1.5 py-0.5 rounded">
-              {state.fileChanges.length}
-            </span>
-          </div>
-          <div className="flex flex-col gap-0.5">
-            {state.fileChanges.map((file) => (
-              <div
-                key={file.name}
-                className="flex items-center gap-2 px-2 py-1 rounded text-xs hover:bg-[#b9bcc01c] transition-colors cursor-pointer"
+          <button
+            onClick={onStartReview}
+            className={`w-full rounded transition-colors ${
+              isReviewActive ? "bg-terminal-blue/10 border border-terminal-blue/25" : "hover:bg-[#b9bcc01c]"
+            }`}
+          >
+            <div className="flex items-center gap-2 px-2 py-1.5 mb-1">
+              <FileCode2 className={`w-3.5 h-3.5 ${isReviewActive ? "text-terminal-blue" : "text-muted-foreground"}`} />
+              <span
+                className={`text-xs font-medium uppercase tracking-wider ${
+                  isReviewActive ? "text-terminal-blue" : "text-muted-foreground"
+                }`}
               >
-                <span className={`text-[10px] font-bold w-3 ${statusColor[file.status]}`}>
-                  {statusLabel[file.status]}
+                REVIEW
+              </span>
+              <span className="ml-auto text-[10px] bg-terminal-blue/20 text-terminal-blue px-1.5 py-0.5 rounded">
+                {state.fileChanges.length}
+              </span>
+            </div>
+            <div className="flex flex-col gap-0.5 px-2 pb-2">
+              {state.fileChanges.slice(0, 6).map((file) => (
+                <div
+                  key={file.name}
+                  className="flex items-center gap-2 px-2 py-1 rounded text-xs text-left"
+                >
+                  <span className={`text-[10px] font-bold w-3 ${statusColor[file.status]}`}>
+                    {statusLabel[file.status]}
+                  </span>
+                  <span className="text-muted-foreground truncate">{file.name}</span>
+                </div>
+              ))}
+              {state.fileChanges.length === 0 && (
+                <span className="px-2 py-1 text-xs text-muted-foreground/60 text-left">
+                  No pending changes
                 </span>
-                <span className="text-muted-foreground truncate">{file.name}</span>
-              </div>
-            ))}
-          </div>
+              )}
+            </div>
+          </button>
         </div>
 
         <div className="p-3 border-t border-panel-border shrink-0">
@@ -589,7 +616,4 @@ export function Sidebar({
     </div>
   )
 }
-
-
-
 

@@ -139,6 +139,32 @@ function formatElapsed(seconds: number): string {
   return `${minutes}:${String(remaining).padStart(2, "0")}`
 }
 
+function SessionElapsed({
+  running,
+  sessionId,
+}: {
+  running: boolean
+  sessionId: number | null
+}) {
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
+
+  useEffect(() => {
+    if (!running) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      setElapsedSeconds((previous) => previous + 1)
+    }, 1000)
+
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [running, sessionId])
+
+  return <span className="tabular-nums">{formatElapsed(elapsedSeconds)}</span>
+}
+
 function authModeLabel(mode: AliciaState["account"]["authMode"]): string {
   if (mode === "chatgpt") return "chatgpt"
   if (mode === "api_key") return "api-key"
@@ -174,25 +200,7 @@ export function StatusBar({
   const connectedMcps = state.mcpServers.filter((server) => server.status === "connected")
   const totalTools = state.mcpServers.reduce((sum, server) => sum + server.tools.length, 0)
 
-  const [elapsedSeconds, setElapsedSeconds] = useState(0)
-
-  useEffect(() => {
-    setElapsedSeconds(0)
-  }, [runtime.sessionId])
-
-  useEffect(() => {
-    if (runtime.state !== "running") {
-      return
-    }
-
-    const interval = window.setInterval(() => {
-      setElapsedSeconds((previous) => previous + 1)
-    }, 1000)
-
-    return () => {
-      window.clearInterval(interval)
-    }
-  }, [runtime.state, runtime.sessionId])
+  const elapsedKey = `${runtime.sessionId ?? "none"}:${runtime.state === "running" ? "running" : "idle"}`
 
   const reasoningLabel = useMemo(() => {
     if (!isThinking) {
@@ -327,7 +335,11 @@ export function StatusBar({
 
         <div className="hidden lg:flex items-center gap-1 px-1.5 py-0.5">
           <Clock className="w-2.5 h-2.5" />
-          <span className="tabular-nums">{formatElapsed(elapsedSeconds)}</span>
+          <SessionElapsed
+            key={elapsedKey}
+            running={runtime.state === "running"}
+            sessionId={runtime.sessionId}
+          />
         </div>
 
         <Separator />

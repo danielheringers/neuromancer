@@ -43,6 +43,9 @@ import type {
   AccountLogoutResponse,
   AccountRateLimitsReadResponse,
   RunCodexCommandResponse,
+  WorkspaceChangesResponse,
+  GitCommitApprovedReviewRequest,
+  GitCommitApprovedReviewResponse,
   RuntimeCodexConfig,
   RuntimeStatusResponse,
   RuntimeCapabilitiesResponse,
@@ -198,6 +201,18 @@ export async function runCodexCommand(
   return invoke<RunCodexCommandResponse>('run_codex_command', { args, cwd })
 }
 
+
+export async function codexWorkspaceChanges(): Promise<WorkspaceChangesResponse> {
+  return invoke<WorkspaceChangesResponse>("git_workspace_changes")
+}
+export async function gitCommitApprovedReview(
+  request: GitCommitApprovedReviewRequest,
+): Promise<GitCommitApprovedReviewResponse> {
+  return invoke<GitCommitApprovedReviewResponse>('git_commit_approved_review', {
+    request,
+  })
+}
+
 export async function codexModelsList(): Promise<CodexModelListResponse> {
   return invoke<CodexModelListResponse>('codex_models_list')
 }
@@ -291,11 +306,4 @@ export async function codexHelpSnapshot(): Promise<CodexHelpSnapshot> {
 export async function resizeCodexPty(rows: number, cols: number): Promise<void> {
   await invoke('resize_codex_pty', { rows, cols })
 }
-
-
-
-
-
-
-
 

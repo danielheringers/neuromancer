@@ -222,7 +222,15 @@ export function resolveSlashCommandSupport(
 
 export interface FileChange {
   name: string
-  status: "modified" | "added" | "deleted"
+  status:
+    | "modified"
+    | "added"
+    | "deleted"
+    | "renamed"
+    | "copied"
+    | "untracked"
+    | "unmerged"
+  fromPath?: string
 }
 
 export interface AliciaState {
@@ -238,5 +246,13 @@ export interface AliciaState {
   rateLimitsByLimitId: Record<string, AccountRateLimitSnapshot>
   sessions: Session[]
   fileChanges: FileChange[]
-  activePanel: "model" | "permissions" | "mcp" | "sessions" | "apps" | null
+  activePanel:
+    | "model"
+    | "permissions"
+    | "mcp"
+    | "sessions"
+    | "apps"
+    | "review"
+    | null
 }
+

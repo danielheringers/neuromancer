@@ -1,6 +1,6 @@
 "use client"
 
-import { Circle, Minus, Square, X } from "lucide-react"
+import { Circle } from "lucide-react"
 
 interface TitleBarProps {
   connected: boolean

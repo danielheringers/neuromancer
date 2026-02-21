@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 
 import { type ReasoningEffort } from "@/lib/alicia-types"
 import { type CodexModel } from "@/lib/tauri-bridge"
@@ -54,19 +54,6 @@ export function ModelPicker({
       models[0] ||
       null
     )
-  }, [currentModel, models, selectedModelId])
-
-  useEffect(() => {
-    if (selectedModelId || models.length === 0) {
-      return
-    }
-    const initialId =
-      models.find((model) => model.id === currentModel)?.id ||
-      models.find((model) => model.isDefault)?.id ||
-      models[0]?.id
-    if (initialId) {
-      setSelectedModelId(initialId)
-    }
   }, [currentModel, models, selectedModelId])
 
   const handleModelSelect = (model: CodexModel) => {
